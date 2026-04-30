@@ -1,0 +1,23 @@
+# WiFi
+CONFIG_WIFI_SSID="your_ssid"
+CONFIG_WIFI_PASSWORD="your_password"
+
+# Device identity & secret  (must match backend DB record)
+CONFIG_DEVICE_ID="dev-005"
+CONFIG_DEVICE_SECRET="your_device_secret"
+
+# MQTT broker
+CONFIG_MQTT_BROKER_URI="mqtts://your-emqx-host:8883"
+
+# TLS: skip cert check (dev only)
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
+# Enable MQTT 5.0 (required for User Properties)
+CONFIG_MQTT_PROTOCOL_5=y
+
+# MQTT task stack
+CONFIG_MQTT_TASK_STACK_SIZE=6144
+
+# Logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
