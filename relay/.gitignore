@@ -7,4 +7,5 @@ components/esp_mqtt/
 # IDF build artifacts
 build/
 sdkconfig
-Kconfig.projbuild
+sdkconfig.old
+dependencies.lock

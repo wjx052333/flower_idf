@@ -41,7 +41,7 @@
 #include "mqtt_client.h"
 #include "mqtt5_client.h"
 
-#include "mbedtls/md.h"
+#include "psa/crypto.h"
 
 #include "pb_encode.h"
 #include "pb_decode.h"
@@ -105,14 +105,19 @@ static void calc_signature(int64_t ts_ms, const char *device_id,
     snprintf(plaintext, sizeof(plaintext),
              "clientId%stimestamp%lld", device_id, (long long)ts_ms);
 
+    /* HMAC-SHA256 via PSA Crypto API (ESP-IDF v6 / mbedTLS 4.x) */
     uint8_t hmac[32];
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-    mbedtls_md_hmac_starts(&ctx, (const uint8_t *)secret, strlen(secret));
-    mbedtls_md_hmac_update(&ctx, (const uint8_t *)plaintext, strlen(plaintext));
-    mbedtls_md_hmac_finish(&ctx, hmac);
-    mbedtls_md_free(&ctx);
+    size_t hmac_len;
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
+    psa_key_id_t key_id = PSA_KEY_ID_NULL;
+    psa_import_key(&attr, (const uint8_t *)secret, strlen(secret), &key_id);
+    psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                    (const uint8_t *)plaintext, strlen(plaintext),
+                    hmac, sizeof(hmac), &hmac_len);
+    psa_destroy_key(key_id);
 
     for (int i = 0; i < 32; i++)
         snprintf(out + i * 2, 3, "%02x", hmac[i]);
@@ -464,6 +469,9 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    /* PSA Crypto — must be called before any psa_* API */
+    ESP_ERROR_CHECK(psa_crypto_init());
+
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
@@ -532,10 +540,10 @@ void app_main(void)
     wifi_init_sta();
 
     /* NTP (UTC+8) — needed for HMAC timestamp */
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_setservername(1, "time.nist.gov");
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.nist.gov");
+    esp_sntp_init();
 
     ESP_LOGI(TAG, "Waiting for NTP sync...");
     time_t now = 0;
