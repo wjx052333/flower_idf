@@ -50,6 +50,7 @@ typedef struct flower_command {
 /* 上行：指令结果
  device_id not included — it is conveyed by the MQTT topic */
 typedef struct flower_command_response {
+    flower_command_role_t role; /* mirrors Command.role */
     pb_size_t which_payload;
     union {
         flower_relay_control_resp_t relay_control;
@@ -76,6 +77,7 @@ extern "C" {
 
 #define flower_command_t_role_ENUMTYPE flower_command_role_t
 
+#define flower_command_response_t_role_ENUMTYPE flower_command_role_t
 
 
 /* Initializer values for message structs */
@@ -83,28 +85,29 @@ extern "C" {
 #define FLOWER_RELAY_CONTROL_INIT_DEFAULT        {0, 0}
 #define FLOWER_RELAY_CONTROL_RESP_INIT_DEFAULT   {_FLOWER_CMD_RESULT_MIN, ""}
 #define FLOWER_COMMAND_INIT_DEFAULT              {_FLOWER_COMMAND_ROLE_MIN, 0, {FLOWER_RELAY_CONTROL_INIT_DEFAULT}}
-#define FLOWER_COMMAND_RESPONSE_INIT_DEFAULT     {0, {FLOWER_RELAY_CONTROL_RESP_INIT_DEFAULT}}
+#define FLOWER_COMMAND_RESPONSE_INIT_DEFAULT     {_FLOWER_COMMAND_ROLE_MIN, 0, {FLOWER_RELAY_CONTROL_RESP_INIT_DEFAULT}}
 #define FLOWER_STATUS_REPORT_INIT_ZERO           {0, 0}
 #define FLOWER_RELAY_CONTROL_INIT_ZERO           {0, 0}
 #define FLOWER_RELAY_CONTROL_RESP_INIT_ZERO      {_FLOWER_CMD_RESULT_MIN, ""}
 #define FLOWER_COMMAND_INIT_ZERO                 {_FLOWER_COMMAND_ROLE_MIN, 0, {FLOWER_RELAY_CONTROL_INIT_ZERO}}
-#define FLOWER_COMMAND_RESPONSE_INIT_ZERO        {0, {FLOWER_RELAY_CONTROL_RESP_INIT_ZERO}}
+#define FLOWER_COMMAND_RESPONSE_INIT_ZERO        {_FLOWER_COMMAND_ROLE_MIN, 0, {FLOWER_RELAY_CONTROL_RESP_INIT_ZERO}}
 
 /* Field tags (for use in manual encoding/decoding) */
-#define FLOWER_STATUS_REPORT_SIGNAL_DBM_TAG      4
-#define FLOWER_STATUS_REPORT_TIMESTAMP_TAG       6
+#define FLOWER_STATUS_REPORT_SIGNAL_DBM_TAG      1
+#define FLOWER_STATUS_REPORT_TIMESTAMP_TAG       2
 #define FLOWER_RELAY_CONTROL_ON_TAG              1
 #define FLOWER_RELAY_CONTROL_DURATION_MS_TAG     2
 #define FLOWER_RELAY_CONTROL_RESP_RESULT_TAG     1
 #define FLOWER_RELAY_CONTROL_RESP_REASON_TAG     2
-#define FLOWER_COMMAND_ROLE_TAG                  6
-#define FLOWER_COMMAND_RELAY_CONTROL_TAG         10
-#define FLOWER_COMMAND_RESPONSE_RELAY_CONTROL_TAG 11
+#define FLOWER_COMMAND_ROLE_TAG                  1
+#define FLOWER_COMMAND_RELAY_CONTROL_TAG         2
+#define FLOWER_COMMAND_RESPONSE_ROLE_TAG         1
+#define FLOWER_COMMAND_RESPONSE_RELAY_CONTROL_TAG 2
 
 /* Struct field encoding specification for nanopb */
 #define FLOWER_STATUS_REPORT_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, INT32,    signal_dbm,        4) \
-X(a, STATIC,   SINGULAR, INT64,    timestamp,         6)
+X(a, STATIC,   SINGULAR, INT32,    signal_dbm,        1) \
+X(a, STATIC,   SINGULAR, INT64,    timestamp,         2)
 #define FLOWER_STATUS_REPORT_CALLBACK NULL
 #define FLOWER_STATUS_REPORT_DEFAULT NULL
 
@@ -121,14 +124,15 @@ X(a, STATIC,   SINGULAR, STRING,   reason,            2)
 #define FLOWER_RELAY_CONTROL_RESP_DEFAULT NULL
 
 #define FLOWER_COMMAND_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, UENUM,    role,              6) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,relay_control,payload.relay_control),  10)
+X(a, STATIC,   SINGULAR, UENUM,    role,              1) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,relay_control,payload.relay_control),   2)
 #define FLOWER_COMMAND_CALLBACK NULL
 #define FLOWER_COMMAND_DEFAULT NULL
 #define flower_command_t_payload_relay_control_MSGTYPE flower_relay_control_t
 
 #define FLOWER_COMMAND_RESPONSE_FIELDLIST(X, a) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,relay_control,payload.relay_control),  11)
+X(a, STATIC,   SINGULAR, UENUM,    role,              1) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,relay_control,payload.relay_control),   2)
 #define FLOWER_COMMAND_RESPONSE_CALLBACK NULL
 #define FLOWER_COMMAND_RESPONSE_DEFAULT NULL
 #define flower_command_response_t_payload_relay_control_MSGTYPE flower_relay_control_resp_t
@@ -147,7 +151,7 @@ extern const pb_msgdesc_t flower_command_response_t_msg;
 #define FLOWER_COMMAND_RESPONSE_FIELDS &flower_command_response_t_msg
 
 /* Maximum encoded size of messages (where known) */
-#define FLOWER_COMMAND_RESPONSE_SIZE             69
+#define FLOWER_COMMAND_RESPONSE_SIZE             71
 #define FLOWER_COMMAND_SIZE                      12
 #define FLOWER_FLOWER_PB_H_MAX_SIZE              FLOWER_COMMAND_RESPONSE_SIZE
 #define FLOWER_RELAY_CONTROL_RESP_SIZE           67
