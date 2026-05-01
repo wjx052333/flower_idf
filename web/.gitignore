@@ -1,6 +1,6 @@
 # Proto generated files (regenerate with gen_proto.sh)
-device_pb2.py
-device_proto.json
+flower_pb2.py
+flower_proto.json
 
 # JS vendor libs (download with gen_proto.sh)
 protobuf.min.js

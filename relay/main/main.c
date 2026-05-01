@@ -46,7 +46,7 @@
 
 #include "pb_encode.h"
 #include "pb_decode.h"
-#include "proto/device.pb.h"
+#include "proto/flower.pb.h"
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
@@ -117,9 +117,9 @@ static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
 
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
 
-/* Static to avoid large stack allocation (device_command_response_t ≈ 6 KB) */
-static device_command_t          s_cmd;
-static device_command_response_t s_resp;
+/* Static to avoid large stack allocation */
+static flower_command_t          s_cmd;
+static flower_command_response_t s_resp;
 
 /* ── ADC ─────────────────────────────────────────────────────────────────── */
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
@@ -177,7 +177,7 @@ static void publish_cmd_resp(void)
 {
     uint8_t buf[128];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    if (!pb_encode(&stream, &device_command_response_t_msg, &s_resp)) {
+    if (!pb_encode(&stream, &flower_command_response_t_msg, &s_resp)) {
         ESP_LOGE(TAG, "resp encode: %s", PB_GET_ERROR(&stream));
         return;
     }
@@ -188,54 +188,15 @@ static void publish_cmd_resp(void)
 static void send_relay_resp(bool success)
 {
     memset(&s_resp, 0, sizeof(s_resp));
-    strncpy(s_resp.device_id, g_device_id, sizeof(s_resp.device_id) - 1);
-    s_resp.which_payload = DEVICE_COMMAND_RESPONSE_RELAY_CONTROL_TAG;
+    s_resp.which_payload = FLOWER_COMMAND_RESPONSE_RELAY_CONTROL_TAG;
     s_resp.payload.relay_control.result =
-        success ? DEVICE_CMD_RESULT_CMD_RESULT_OK
-                : DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
+        success ? FLOWER_CMD_RESULT_OK : FLOWER_CMD_RESULT_BUSY;
     publish_cmd_resp();
 }
 
 static void send_unsupported_resp(pb_size_t which_cmd)
 {
-    memset(&s_resp, 0, sizeof(s_resp));
-    strncpy(s_resp.device_id, g_device_id, sizeof(s_resp.device_id) - 1);
-
-    switch (which_cmd) {
-    case DEVICE_COMMAND_JOIN_ROOM_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_JOIN_ROOM_TAG;
-        s_resp.payload.join_room.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    case DEVICE_COMMAND_LEAVE_ROOM_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_LEAVE_ROOM_TAG;
-        s_resp.payload.leave_room.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    case DEVICE_COMMAND_UPLOAD_LOGS_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_UPLOAD_LOGS_TAG;
-        s_resp.payload.upload_logs.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    case DEVICE_COMMAND_OPEN_LIGHT_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_OPEN_LIGHT_TAG;
-        s_resp.payload.open_light.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    case DEVICE_COMMAND_CLOSE_LIGHT_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_CLOSE_LIGHT_TAG;
-        s_resp.payload.close_light.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    case DEVICE_COMMAND_TAKE_PHOTO_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_TAKE_PHOTO_TAG;
-        s_resp.payload.take_photo.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    case DEVICE_COMMAND_REBOOT_TAG:
-        s_resp.which_payload = DEVICE_COMMAND_RESPONSE_REBOOT_TAG;
-        s_resp.payload.reboot.result = DEVICE_CMD_RESULT_CMD_RESULT_BUSY;
-        break;
-    default:
-        ESP_LOGW(TAG, "Unknown cmd tag=%d, no response", (int)which_cmd);
-        return;
-    }
-    ESP_LOGW(TAG, "Unsupported cmd tag=%d, sending BUSY", (int)which_cmd);
-    publish_cmd_resp();
+    ESP_LOGW(TAG, "Unknown cmd tag=%d, no response", (int)which_cmd);
 }
 
 /* ── MQTT message handler ────────────────────────────────────────────────── */
@@ -243,17 +204,17 @@ static void handle_mqtt_data(const char *data, int data_len)
 {
     memset(&s_cmd, 0, sizeof(s_cmd));
     pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)data, data_len);
-    if (!pb_decode(&stream, &device_command_t_msg, &s_cmd)) {
+    if (!pb_decode(&stream, &flower_command_t_msg, &s_cmd)) {
         ESP_LOGE(TAG, "Command decode: %s", PB_GET_ERROR(&stream));
         return;
     }
 
-    if (s_cmd.which_payload != DEVICE_COMMAND_RELAY_CONTROL_TAG) {
+    if (s_cmd.which_payload != FLOWER_COMMAND_RELAY_CONTROL_TAG) {
         send_unsupported_resp(s_cmd.which_payload);
         return;
     }
 
-    device_relay_control_t *rc = &s_cmd.payload.relay_control;
+    flower_relay_control_t *rc = &s_cmd.payload.relay_control;
     if (rc->on) {
         if (s_relay_on) {
             ESP_LOGW(TAG, "Relay already ON, ignoring command");
@@ -287,13 +248,13 @@ static void publish_status_report(void)
 
     time_t now; time(&now);
 
-    device_status_report_t sr = DEVICE_STATUS_REPORT_INIT_ZERO;
+    flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
     sr.signal_dbm = (int32_t)raw;
     sr.timestamp  = (int64_t)now * 1000;
 
-    uint8_t buf[DEVICE_STATUS_REPORT_SIZE];
+    uint8_t buf[FLOWER_STATUS_REPORT_SIZE];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    if (!pb_encode(&stream, &device_status_report_t_msg, &sr)) {
+    if (!pb_encode(&stream, &flower_status_report_t_msg, &sr)) {
         ESP_LOGE(TAG, "Status encode: %s", PB_GET_ERROR(&stream));
         return;
     }

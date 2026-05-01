@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup_proto.sh — fetch nanopb, set up IDF component, generate device.pb.h/c
+# setup_proto.sh — fetch nanopb, set up IDF component, generate flower.pb.h/c
 # Run once before `idf.py build`. Safe to re-run (idempotent).
 set -euo pipefail
 
@@ -10,8 +10,8 @@ NANOPB_VERSION="0.4.9"
 NANOPB_CACHE="$SCRIPT_DIR/.nanopb"
 NANOPB_COMP="$SCRIPT_DIR/components/nanopb"
 PROTO_OUT="$SCRIPT_DIR/main/proto"
-PROTO_DIR="$REPO_ROOT/protocol/ovo_iot_protocol/iot/protocol"
-PROTO_SRC="$PROTO_DIR/device.proto"
+PROTO_DIR="$REPO_ROOT/protocol"
+PROTO_SRC="$PROTO_DIR/flower.proto"
 
 # ── Dependency checks ────────────────────────────────────────────────────────
 for cmd in git python3 protoc; do
@@ -19,8 +19,7 @@ for cmd in git python3 protoc; do
 done
 
 if [ ! -f "$PROTO_SRC" ]; then
-    echo "ERROR: proto submodule not found at $PROTO_SRC"
-    echo "Run: git submodule update --init protocol/ovo_iot_protocol"
+    echo "ERROR: flower.proto not found at $PROTO_SRC"
     exit 1
 fi
 
@@ -55,8 +54,8 @@ cat > "$NANOPB_COMP/CMakeLists.txt" <<'EOF'
 idf_component_register(SRC_DIRS ./src INCLUDE_DIRS ./include)
 EOF
 
-# ── 3. Generate device.pb.h / device.pb.c ────────────────────────────────────
-echo "[3/3] Generating nanopb bindings for device.proto..."
+# ── 3. Generate flower.pb.h / flower.pb.c ────────────────────────────────────
+echo "[3/3] Generating nanopb bindings for flower.proto..."
 mkdir -p "$PROTO_OUT"
 
 protoc \
@@ -69,5 +68,5 @@ protoc \
 
 echo "Done."
 echo "  components/nanopb/   — IDF nanopb component"
-echo "  main/proto/device.pb.h"
-echo "  main/proto/device.pb.c"
+echo "  main/proto/flower.pb.h"
+echo "  main/proto/flower.pb.c"

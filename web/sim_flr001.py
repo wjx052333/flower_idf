@@ -9,6 +9,10 @@ Usage:
   DEVICE_ID      设备 ID（默认 flr001）
   DEVICE_SECRET  设备密钥（默认 init.sql 中的值）
   MQTT_BROKER    Broker URL（默认 mqtt://10.6.64.55:1883）
+
+生成 flower_pb2.py（需要 protoc）：
+  protoc --python_out=. flower.proto
+  （flower.proto 位于 protocol/ 目录）
 """
 
 import argparse
@@ -24,7 +28,7 @@ import paho.mqtt.client as mqtt
 from paho.mqtt.properties import Properties
 from paho.mqtt.packettypes import PacketTypes
 
-from device_pb2 import (
+from flower_pb2 import (
     StatusReport,
     Command,
     CommandResponse,
@@ -77,7 +81,6 @@ def on_message(client, userdata, msg):
     print(f"[CMD] received '{which}'", flush=True)
 
     resp = CommandResponse()
-    resp.device_id = DEVICE_ID
 
     if which == "relay_control":
         rc_msg = cmd.relay_control
