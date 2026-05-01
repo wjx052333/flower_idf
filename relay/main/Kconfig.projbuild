@@ -8,14 +8,6 @@ config WIFI_PASSWORD
     string "WiFi Password"
     default ""
 
-config DEVICE_ID
-    string "Device ID"
-    default "dev-005"
-
-config DEVICE_SECRET
-    string "Device Secret (HMAC-SHA256 key)"
-    default ""
-
 config MQTT_BROKER_URI
     string "MQTT Broker URI"
     default ""

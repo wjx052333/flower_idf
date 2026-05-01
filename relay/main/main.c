@@ -54,19 +54,18 @@
 #ifndef CONFIG_WIFI_PASSWORD
 #define CONFIG_WIFI_PASSWORD  "your_password"
 #endif
-#ifndef CONFIG_DEVICE_ID
-#define CONFIG_DEVICE_ID      "dev-005"
-#endif
-#ifndef CONFIG_DEVICE_SECRET
-#define CONFIG_DEVICE_SECRET  "your_device_secret"
-#endif
 #ifndef CONFIG_MQTT_BROKER_URI
 #define CONFIG_MQTT_BROKER_URI "mqtts://your-emqx-host:8883"
 #endif
 
-#define TOPIC_CMD      "flower/" CONFIG_DEVICE_ID "/down/cmd"
-#define TOPIC_HB       "flower/" CONFIG_DEVICE_ID "/up/heartbeat"
-#define TOPIC_CMD_RESP "flower/" CONFIG_DEVICE_ID "/up/cmd_response"
+/* Device identity — loaded at runtime from fctry NVS partition */
+static char g_device_id[64];
+static char g_device_secret[128];
+
+/* MQTT topics — built at runtime after device identity is loaded */
+static char s_topic_cmd[96];
+static char s_topic_hb[96];
+static char s_topic_cmd_resp[96];
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
 #define BUTTON_PIN  9
@@ -79,6 +78,29 @@
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
 
 #define TAG "Flower"
+
+/* ── Device identity ─────────────────────────────────────────────────────── */
+static void device_identity_init(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition("fctry", "identity", NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "fctry partition open failed (%s), identity unavailable",
+                 esp_err_to_name(err));
+        goto build_topics;
+    }
+    size_t len = sizeof(g_device_id);
+    nvs_get_str(h, "device_id",     g_device_id,     &len);
+    len = sizeof(g_device_secret);
+    nvs_get_str(h, "device_secret", g_device_secret, &len);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Device identity loaded from fctry: id=%s", g_device_id);
+
+build_topics:
+    snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",      g_device_id);
+    snprintf(s_topic_hb,       sizeof(s_topic_hb),       "flower/%s/up/heartbeat",  g_device_id);
+    snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
+}
 
 /* ── State ───────────────────────────────────────────────────────────────── */
 static EventGroupHandle_t       s_wifi_event_group;
@@ -133,14 +155,14 @@ static void publish_cmd_resp(void)
         ESP_LOGE(TAG, "resp encode: %s", PB_GET_ERROR(&stream));
         return;
     }
-    esp_mqtt_client_publish(s_mqtt_client, TOPIC_CMD_RESP,
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_cmd_resp,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
 }
 
 static void send_relay_resp(bool success)
 {
     memset(&s_resp, 0, sizeof(s_resp));
-    strncpy(s_resp.device_id, CONFIG_DEVICE_ID, sizeof(s_resp.device_id) - 1);
+    strncpy(s_resp.device_id, g_device_id, sizeof(s_resp.device_id) - 1);
     s_resp.which_payload = DEVICE_COMMAND_RESPONSE_RELAY_CONTROL_TAG;
     s_resp.payload.relay_control.result =
         success ? DEVICE_CMD_RESULT_CMD_RESULT_OK
@@ -151,7 +173,7 @@ static void send_relay_resp(bool success)
 static void send_unsupported_resp(pb_size_t which_cmd)
 {
     memset(&s_resp, 0, sizeof(s_resp));
-    strncpy(s_resp.device_id, CONFIG_DEVICE_ID, sizeof(s_resp.device_id) - 1);
+    strncpy(s_resp.device_id, g_device_id, sizeof(s_resp.device_id) - 1);
 
     switch (which_cmd) {
     case DEVICE_COMMAND_JOIN_ROOM_TAG:
@@ -207,6 +229,11 @@ static void handle_mqtt_data(const char *data, int data_len)
 
     device_relay_control_t *rc = &s_cmd.payload.relay_control;
     if (rc->on) {
+        if (s_relay_on) {
+            ESP_LOGW(TAG, "Relay already ON, ignoring command");
+            send_relay_resp(false);
+            return;
+        }
         gpio_set_level(RELAY_PIN, 0);
         s_relay_on_us = esp_timer_get_time();
         if (rc->duration_ms > 0) {
@@ -231,7 +258,7 @@ static void publish_heartbeat(void)
     time_t now; time(&now);
 
     device_heartbeat_t hb = DEVICE_HEARTBEAT_INIT_ZERO;
-    strncpy(hb.device_id, CONFIG_DEVICE_ID, sizeof(hb.device_id) - 1);
+    strncpy(hb.device_id, g_device_id, sizeof(hb.device_id) - 1);
     hb.timestamp = (int64_t)now * 1000;
 
     uint8_t buf[64];
@@ -240,7 +267,7 @@ static void publish_heartbeat(void)
         ESP_LOGE(TAG, "Heartbeat encode: %s", PB_GET_ERROR(&stream));
         return;
     }
-    esp_mqtt_client_publish(s_mqtt_client, TOPIC_HB,
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_hb,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
     ESP_LOGI(TAG, "Heartbeat published");
 }
@@ -274,8 +301,8 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     switch (event->event_id) {
     case MQTT_EVENT_CONNECTED:
         s_mqtt_connected = true;
-        esp_mqtt_client_subscribe(s_mqtt_client, TOPIC_CMD, 1);
-        ESP_LOGI(TAG, "MQTT connected, sub: %s", TOPIC_CMD);
+        esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd, 1);
+        ESP_LOGI(TAG, "MQTT connected, sub: %s", s_topic_cmd);
         publish_heartbeat();
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -304,13 +331,13 @@ static void mqtt_start(void)
     time_t now; time(&now);
     int64_t ts_ms = (int64_t)now * 1000;
     snprintf(s_mqtt_username, sizeof(s_mqtt_username),
-             "%s|%lld", CONFIG_DEVICE_ID, (long long)ts_ms);
-    calc_signature(ts_ms, CONFIG_DEVICE_ID, CONFIG_DEVICE_SECRET, s_mqtt_password);
+             "%s|%lld", g_device_id, (long long)ts_ms);
+    calc_signature(ts_ms, g_device_id, g_device_secret, s_mqtt_password);
 
     esp_mqtt_client_config_t mqtt_cfg = {};
     mqtt_cfg.broker.address.uri                            = CONFIG_MQTT_BROKER_URI;
     mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
-    mqtt_cfg.credentials.client_id                         = CONFIG_DEVICE_ID;
+    mqtt_cfg.credentials.client_id                         = g_device_id;
     mqtt_cfg.credentials.username                          = s_mqtt_username;
     mqtt_cfg.credentials.authentication.password           = s_mqtt_password;
     mqtt_cfg.session.keepalive                             = 60;
@@ -472,6 +499,10 @@ void app_main(void)
     /* PSA Crypto — must be called before any psa_* API */
     ESP_ERROR_CHECK(psa_crypto_init());
 
+    /* Factory partition — device identity (id + secret) */
+    nvs_flash_init_partition("fctry");
+    device_identity_init();
+
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
@@ -562,7 +593,7 @@ void app_main(void)
 
     /* Idle — all work is event/timer-driven */
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(30000));
         ESP_LOGI(TAG, "Uptime: %lld s", esp_timer_get_time() / 1000000LL);
     }
 }

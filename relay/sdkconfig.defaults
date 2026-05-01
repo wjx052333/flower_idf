@@ -1,13 +1,13 @@
-# WiFi
-CONFIG_WIFI_SSID="your_ssid"
-CONFIG_WIFI_PASSWORD="your_password"
+# Partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# Device identity & secret  (must match backend DB record)
-CONFIG_DEVICE_ID="dev-005"
-CONFIG_DEVICE_SECRET="your_device_secret"
+# WiFi
+CONFIG_WIFI_SSID="CU_home"
+CONFIG_WIFI_PASSWORD="wastemytimehome123456789"
 
 # MQTT broker
-CONFIG_MQTT_BROKER_URI="mqtts://your-emqx-host:8883"
+CONFIG_MQTT_BROKER_URI="mqtts://58.87.80.78:8883"
 
 # TLS: skip cert check (dev only)
 CONFIG_ESP_TLS_INSECURE=y
