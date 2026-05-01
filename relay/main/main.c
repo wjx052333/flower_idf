@@ -35,6 +35,7 @@
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
 
 #include "esp_http_server.h"
 
@@ -66,13 +67,16 @@ static char g_device_secret[128];
 static char s_topic_cmd[96];
 static char s_topic_hb[96];
 static char s_topic_cmd_resp[96];
+static char s_topic_status[96];
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
 #define BUTTON_PIN  9
 #define RELAY_PIN   4
 #define LED_PIN     3
+#define ADC_PIN     ADC_CHANNEL_0   /* GPIO0 = ADC1 CH0 */
 
 #define HEARTBEAT_INTERVAL_MS     30000
+#define STATUS_INTERVAL_MS        30000
 #define RELAY_DEFAULT_DURATION_MS 10000
 #define BREATH_PERIOD_MS          3000
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
@@ -97,9 +101,10 @@ static void device_identity_init(void)
     ESP_LOGI(TAG, "Device identity loaded from fctry: id=%s", g_device_id);
 
 build_topics:
-    snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",      g_device_id);
-    snprintf(s_topic_hb,       sizeof(s_topic_hb),       "flower/%s/up/heartbeat",  g_device_id);
+    snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
+    snprintf(s_topic_hb,       sizeof(s_topic_hb),       "flower/%s/up/heartbeat",    g_device_id);
     snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
+    snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
 }
 
 /* ── State ───────────────────────────────────────────────────────────────── */
@@ -118,6 +123,30 @@ static volatile bool            s_last_btn       = true; /* HIGH = not pressed *
 /* Static to avoid large stack allocation (device_command_response_t ≈ 6 KB) */
 static device_command_t          s_cmd;
 static device_command_response_t s_resp;
+
+/* ── ADC ─────────────────────────────────────────────────────────────────── */
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+
+static void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten    = ADC_ATTEN_DB_12,   /* 0 ~ 3.3 V */
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN, &chan_cfg));
+}
+
+static int adc_read_raw(void)
+{
+    int raw = 0;
+    adc_oneshot_read(s_adc_handle, ADC_PIN, &raw);
+    return raw;
+}
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
 static void calc_signature(int64_t ts_ms, const char *device_id,
@@ -272,9 +301,32 @@ static void publish_heartbeat(void)
     ESP_LOGI(TAG, "Heartbeat published");
 }
 
+static void publish_status_report(void)
+{
+    int raw = adc_read_raw();
+    ESP_LOGI(TAG, "ADC IO0 raw=%d", raw);
+
+    if (!s_mqtt_connected) return;
+
+    device_status_report_t sr = DEVICE_STATUS_REPORT_INIT_ZERO;
+    strncpy(sr.device_id, g_device_id, sizeof(sr.device_id) - 1);
+    sr.signal_dbm = (int32_t)raw;
+
+    uint8_t buf[DEVICE_STATUS_REPORT_SIZE];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, &device_status_report_t_msg, &sr)) {
+        ESP_LOGE(TAG, "Status encode: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
+                            (const char *)buf, (int)stream.bytes_written, 1, 0);
+    ESP_LOGI(TAG, "Status published (signal_dbm=%d)", raw);
+}
+
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
 static esp_timer_handle_t s_reconnect_timer = NULL;
 static esp_timer_handle_t s_heartbeat_timer = NULL;
+static esp_timer_handle_t s_status_timer    = NULL;
 
 static void mqtt_start(void);
 
@@ -292,6 +344,11 @@ static void heartbeat_timer_cb(void *arg)
 {
     if (s_mqtt_connected)
         publish_heartbeat();
+}
+
+static void status_timer_cb(void *arg)
+{
+    publish_status_report();
 }
 
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
@@ -503,6 +560,9 @@ void app_main(void)
     nvs_flash_init_partition("fctry");
     device_identity_init();
 
+    /* ADC: IO0 */
+    adc_init();
+
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
@@ -558,6 +618,17 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&hb_args, &s_heartbeat_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(s_heartbeat_timer,
                         (uint64_t)HEARTBEAT_INTERVAL_MS * 1000ULL));
+
+    /* Status timer: 30 s — ADC read + status report */
+    esp_timer_create_args_t st_args = {
+        .callback              = status_timer_cb,
+        .dispatch_method       = ESP_TIMER_TASK,
+        .name                  = "status",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&st_args, &s_status_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_status_timer,
+                        (uint64_t)STATUS_INTERVAL_MS * 1000ULL));
 
     /* Reconnect timer: one-shot, started on MQTT_EVENT_DISCONNECTED */
     esp_timer_create_args_t rc_args = {
