@@ -94,12 +94,12 @@
 <script src="mqtt.min.js"></script>
 <script>
 // ── Load proto descriptor ─────────────────────────────────────────────────────
-let Heartbeat = null;
-let Command   = null;
+let StatusReport = null;
+let Command      = null;
 
 protobuf.load('device_proto.json').then(root => {
-  Heartbeat = root.lookupType('device.Heartbeat');
-  Command   = root.lookupType('device.Command');
+  StatusReport = root.lookupType('device.StatusReport');
+  Command      = root.lookupType('device.Command');
 }).catch(e => console.error('Failed to load device_proto.json:', e));
 </script>
 <script>
@@ -228,9 +228,9 @@ function connectMqtt() {
 
   mqttClient.on('connect', () => {
     document.getElementById('mqtt-status').textContent = '已连接 ✓';
-    // 订阅所有绑定设备的心跳
+    // 订阅所有绑定设备的状态上报
     myDevices.forEach(d => {
-      mqttClient.subscribe(`flower/${d.device_id}/up/heartbeat`, { qos: 1 });
+      mqttClient.subscribe(`flower/${d.device_id}/up/status`, { qos: 1 });
     });
   });
 
@@ -243,18 +243,18 @@ function connectMqtt() {
   });
 
   mqttClient.on('message', (topic, payload) => {
-    // topic: flower/{device_id}/up/heartbeat
+    // topic: flower/{device_id}/up/status
     const parts = topic.split('/');
-    if (parts.length < 4 || parts[2] !== 'up' || parts[3] !== 'heartbeat') return;
+    if (parts.length < 4 || parts[2] !== 'up' || parts[3] !== 'status') return;
     const deviceId = parts[1];
     try {
-      if (!Heartbeat) return;
-      const hb = Heartbeat.decode(payload);
+      if (!StatusReport) return;
+      const sr = StatusReport.decode(payload);
       // timestamp is a Long; convert to JS number (ms)
-      const ts = typeof hb.timestamp === 'object' ? hb.timestamp.toNumber() : Number(hb.timestamp);
-      heartbeats[deviceId] = { device_id: hb.deviceId || deviceId, timestamp: ts, received_at: Date.now() };
+      const ts = typeof sr.timestamp === 'object' ? sr.timestamp.toNumber() : Number(sr.timestamp);
+      heartbeats[deviceId] = { device_id: sr.deviceId || deviceId, timestamp: ts, received_at: Date.now() };
       updateCard(deviceId);
-    } catch(e) { console.warn('heartbeat decode error', e); }
+    } catch(e) { console.warn('status report decode error', e); }
   });
 }
 

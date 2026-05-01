@@ -5,13 +5,13 @@
  *   1. WiFi STA + NTP time sync
  *   2. HMAC-SHA256 MQTT credentials (clientId{id}timestamp{ms})
  *   3. MQTT 5.0 with User Property {"project","flower"} on CONNECT
- *   4. nanopb: receives relay_control commands; sends heartbeat + cmd_response
+ *   4. nanopb: receives relay_control commands; sends status_report + cmd_response
  *   5. GPIO: relay (pin 4, active-low), button (pin 9), breathing LED (pin 3)
  *   6. HTTP server: GET /change_relay1[?duration=ms]
  *
  * Topics:
  *   sub  flower/{DEVICE_ID}/down/command
- *   pub  flower/{DEVICE_ID}/up/heartbeat
+ *   pub  flower/{DEVICE_ID}/up/status
  *   pub  flower/{DEVICE_ID}/up/command_response
  */
 
@@ -65,7 +65,6 @@ static char g_device_secret[128];
 
 /* MQTT topics — built at runtime after device identity is loaded */
 static char s_topic_cmd[96];
-static char s_topic_hb[96];
 static char s_topic_cmd_resp[96];
 static char s_topic_status[96];
 
@@ -75,7 +74,6 @@ static char s_topic_status[96];
 #define LED_PIN     3
 #define ADC_PIN     ADC_CHANNEL_0   /* GPIO0 = ADC1 CH0 */
 
-#define HEARTBEAT_INTERVAL_MS     30000
 #define STATUS_INTERVAL_MS        30000
 #define RELAY_DEFAULT_DURATION_MS 10000
 #define BREATH_PERIOD_MS          3000
@@ -102,7 +100,6 @@ static void device_identity_init(void)
 
 build_topics:
     snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
-    snprintf(s_topic_hb,       sizeof(s_topic_hb),       "flower/%s/up/heartbeat",    g_device_id);
     snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
     snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
 }
@@ -281,26 +278,6 @@ static void handle_mqtt_data(const char *data, int data_len)
              rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
 }
 
-/* ── Heartbeat ───────────────────────────────────────────────────────────── */
-static void publish_heartbeat(void)
-{
-    time_t now; time(&now);
-
-    device_heartbeat_t hb = DEVICE_HEARTBEAT_INIT_ZERO;
-    strncpy(hb.device_id, g_device_id, sizeof(hb.device_id) - 1);
-    hb.timestamp = (int64_t)now * 1000;
-
-    uint8_t buf[64];
-    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    if (!pb_encode(&stream, &device_heartbeat_t_msg, &hb)) {
-        ESP_LOGE(TAG, "Heartbeat encode: %s", PB_GET_ERROR(&stream));
-        return;
-    }
-    esp_mqtt_client_publish(s_mqtt_client, s_topic_hb,
-                            (const char *)buf, (int)stream.bytes_written, 1, 0);
-    ESP_LOGI(TAG, "Heartbeat published");
-}
-
 static void publish_status_report(void)
 {
     int raw = adc_read_raw();
@@ -308,9 +285,11 @@ static void publish_status_report(void)
 
     if (!s_mqtt_connected) return;
 
+    time_t now; time(&now);
+
     device_status_report_t sr = DEVICE_STATUS_REPORT_INIT_ZERO;
-    strncpy(sr.device_id, g_device_id, sizeof(sr.device_id) - 1);
     sr.signal_dbm = (int32_t)raw;
+    sr.timestamp  = (int64_t)now * 1000;
 
     uint8_t buf[DEVICE_STATUS_REPORT_SIZE];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
@@ -325,7 +304,6 @@ static void publish_status_report(void)
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
 static esp_timer_handle_t s_reconnect_timer = NULL;
-static esp_timer_handle_t s_heartbeat_timer = NULL;
 static esp_timer_handle_t s_status_timer    = NULL;
 
 static void mqtt_start(void);
@@ -338,12 +316,6 @@ static void reconnect_timer_cb(void *arg)
         s_mqtt_client = NULL;
     }
     mqtt_start();
-}
-
-static void heartbeat_timer_cb(void *arg)
-{
-    if (s_mqtt_connected)
-        publish_heartbeat();
 }
 
 static void status_timer_cb(void *arg)
@@ -360,7 +332,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         s_mqtt_connected = true;
         esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd, 1);
         ESP_LOGI(TAG, "MQTT connected, sub: %s", s_topic_cmd);
-        publish_heartbeat();
+        publish_status_report();
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_mqtt_connected = false;
@@ -607,17 +579,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&app_args, &s_app_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(s_app_timer,
                         (uint64_t)APP_TIMER_INTERVAL_MS * 1000ULL));
-
-    /* Heartbeat timer: 30 s */
-    esp_timer_create_args_t hb_args = {
-        .callback              = heartbeat_timer_cb,
-        .dispatch_method       = ESP_TIMER_TASK,
-        .name                  = "heartbeat",
-        .skip_unhandled_events = true,
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&hb_args, &s_heartbeat_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_heartbeat_timer,
-                        (uint64_t)HEARTBEAT_INTERVAL_MS * 1000ULL));
 
     /* Status timer: 30 s — ADC read + status report */
     esp_timer_create_args_t st_args = {

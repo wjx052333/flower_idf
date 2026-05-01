@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sim_flr001.py — 模拟 flr001 设备上线，每 30 秒发送心跳，接收并响应 relay_control 命令。
+sim_flr001.py — 模拟 flr001 设备上线，每 30 秒发送 StatusReport，接收并响应 relay_control 命令。
 
 Usage:
   python3 sim_flr001.py [--broker mqtt://HOST:1883] [--insecure]
@@ -25,7 +25,7 @@ from paho.mqtt.properties import Properties
 from paho.mqtt.packettypes import PacketTypes
 
 from device_pb2 import (
-    Heartbeat,
+    StatusReport,
     Command,
     CommandResponse,
     CommandRole,
@@ -35,11 +35,11 @@ DEVICE_ID     = os.environ.get("DEVICE_ID",     "flr001")
 DEVICE_SECRET = os.environ.get("DEVICE_SECRET",
     "37e73a61317f6ca96f054ff7025c18ac67d0ccf636f376c78bb800fd9e8d2eb3")
 
-TOPIC_CMD  = f"flower/{DEVICE_ID}/down/cmd"
-TOPIC_HB   = f"flower/{DEVICE_ID}/up/heartbeat"
-TOPIC_RESP = f"flower/{DEVICE_ID}/up/cmd_response"
+TOPIC_CMD    = f"flower/{DEVICE_ID}/down/cmd"
+TOPIC_STATUS = f"flower/{DEVICE_ID}/up/status"
+TOPIC_RESP   = f"flower/{DEVICE_ID}/up/cmd_response"
 
-HEARTBEAT_INTERVAL = 30  # seconds
+STATUS_INTERVAL = 30  # seconds
 
 
 def calc_signature(device_id: str, secret: str, ts_ms: int) -> str:
@@ -47,12 +47,11 @@ def calc_signature(device_id: str, secret: str, ts_ms: int) -> str:
     return _hmac.new(secret.encode(), plaintext.encode(), hashlib.sha256).hexdigest()
 
 
-def publish_heartbeat(client: mqtt.Client) -> None:
-    hb = Heartbeat()
-    hb.device_id = DEVICE_ID
-    hb.timestamp = int(time.time() * 1000)
-    client.publish(TOPIC_HB, hb.SerializeToString(), qos=1)
-    print(f"[HB] device_id={DEVICE_ID} timestamp={hb.timestamp}", flush=True)
+def publish_status_report(client: mqtt.Client) -> None:
+    sr = StatusReport()
+    sr.timestamp = int(time.time() * 1000)
+    client.publish(TOPIC_STATUS, sr.SerializeToString(), qos=1)
+    print(f"[SR] timestamp={sr.timestamp}", flush=True)
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
@@ -61,7 +60,7 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     if rc == 0:
         print(f"[MQTT] connected as {DEVICE_ID}", flush=True)
         client.subscribe(TOPIC_CMD, qos=1)
-        publish_heartbeat(client)
+        publish_status_report(client)
     else:
         print(f"[MQTT] connect failed rc={rc}", flush=True)
 
@@ -147,14 +146,14 @@ def main() -> None:
     print(f"[SIM] connecting to {host}:{port} as {DEVICE_ID}", flush=True)
     client.connect(host, port, keepalive=60, properties=connect_props)
 
-    # Periodic heartbeat thread
-    def _hb_loop():
+    # Periodic status report thread
+    def _sr_loop():
         while True:
-            time.sleep(HEARTBEAT_INTERVAL)
+            time.sleep(STATUS_INTERVAL)
             if client.is_connected():
-                publish_heartbeat(client)
+                publish_status_report(client)
 
-    threading.Thread(target=_hb_loop, daemon=True).start()
+    threading.Thread(target=_sr_loop, daemon=True).start()
 
     print(f"[SIM] running — Ctrl+C to stop", flush=True)
     try:

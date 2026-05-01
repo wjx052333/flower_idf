@@ -12,9 +12,6 @@ PB_BIND(DEVICE_VIDEO_MSG, device_video_msg_t, AUTO)
 PB_BIND(DEVICE_EVENT_MSG, device_event_msg_t, AUTO)
 
 
-PB_BIND(DEVICE_HEARTBEAT, device_heartbeat_t, AUTO)
-
-
 PB_BIND(DEVICE_STATUS_REPORT, device_status_report_t, AUTO)
 
 

@@ -68,19 +68,13 @@ typedef struct device_event_msg {
     device_video_msg_t video;
 } device_event_msg_t;
 
-/* 上行：心跳 */
-typedef struct device_heartbeat {
-    char device_id[32];
-    int64_t timestamp;
-} device_heartbeat_t;
-
-/* 上行：状态上报 */
+/* 上行：状态上报（兼作周期心跳） */
 typedef struct device_status_report {
-    char device_id[32];
     bool streaming;
     char room_id[32];
     int32_t signal_dbm;
-    int64_t last_event_time; /* start_time of most recent completed recording (unix sec); 0 = none */
+    int64_t last_event_time;
+    int64_t timestamp;
 } device_status_report_t;
 
 typedef struct device_upload_logs {
@@ -331,8 +325,7 @@ extern "C" {
 /* Initializer values for message structs */
 #define DEVICE_VIDEO_MSG_INIT_DEFAULT            {0, 0, 0, 0}
 #define DEVICE_EVENT_MSG_INIT_DEFAULT            {_DEVICE_EVENT_TYPE_MIN, 0, false, DEVICE_VIDEO_MSG_INIT_DEFAULT}
-#define DEVICE_HEARTBEAT_INIT_DEFAULT            {"", 0}
-#define DEVICE_STATUS_REPORT_INIT_DEFAULT        {"", 0, "", 0, 0}
+#define DEVICE_STATUS_REPORT_INIT_DEFAULT        {0, "", 0, 0, 0}
 #define DEVICE_UPLOAD_LOGS_INIT_DEFAULT          {""}
 #define DEVICE_JOIN_ROOM_INIT_DEFAULT            {"", "", ""}
 #define DEVICE_LEAVE_ROOM_INIT_DEFAULT           {""}
@@ -362,8 +355,7 @@ extern "C" {
 #define DEVICE_AGENT_RESPONSE_INIT_DEFAULT       {0, {DEVICE_CHAT_RESPONSE_INIT_DEFAULT}}
 #define DEVICE_VIDEO_MSG_INIT_ZERO               {0, 0, 0, 0}
 #define DEVICE_EVENT_MSG_INIT_ZERO               {_DEVICE_EVENT_TYPE_MIN, 0, false, DEVICE_VIDEO_MSG_INIT_ZERO}
-#define DEVICE_HEARTBEAT_INIT_ZERO               {"", 0}
-#define DEVICE_STATUS_REPORT_INIT_ZERO           {"", 0, "", 0, 0}
+#define DEVICE_STATUS_REPORT_INIT_ZERO           {0, "", 0, 0, 0}
 #define DEVICE_UPLOAD_LOGS_INIT_ZERO             {""}
 #define DEVICE_JOIN_ROOM_INIT_ZERO               {"", "", ""}
 #define DEVICE_LEAVE_ROOM_INIT_ZERO              {""}
@@ -400,13 +392,11 @@ extern "C" {
 #define DEVICE_EVENT_MSG_TYPE_TAG                1
 #define DEVICE_EVENT_MSG_TIMESTAMP_TAG           2
 #define DEVICE_EVENT_MSG_VIDEO_TAG               3
-#define DEVICE_HEARTBEAT_DEVICE_ID_TAG           1
-#define DEVICE_HEARTBEAT_TIMESTAMP_TAG           2
-#define DEVICE_STATUS_REPORT_DEVICE_ID_TAG       1
 #define DEVICE_STATUS_REPORT_STREAMING_TAG       2
 #define DEVICE_STATUS_REPORT_ROOM_ID_TAG         3
 #define DEVICE_STATUS_REPORT_SIGNAL_DBM_TAG      4
 #define DEVICE_STATUS_REPORT_LAST_EVENT_TIME_TAG 5
+#define DEVICE_STATUS_REPORT_TIMESTAMP_TAG       6
 #define DEVICE_UPLOAD_LOGS_UPLOAD_URL_TAG        1
 #define DEVICE_JOIN_ROOM_ROOM_ID_TAG             1
 #define DEVICE_JOIN_ROOM_LIVEKIT_URL_TAG         2
@@ -488,18 +478,12 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  video,             3)
 #define DEVICE_EVENT_MSG_DEFAULT NULL
 #define device_event_msg_t_video_MSGTYPE device_video_msg_t
 
-#define DEVICE_HEARTBEAT_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, STRING,   device_id,         1) \
-X(a, STATIC,   SINGULAR, INT64,    timestamp,         2)
-#define DEVICE_HEARTBEAT_CALLBACK NULL
-#define DEVICE_HEARTBEAT_DEFAULT NULL
-
 #define DEVICE_STATUS_REPORT_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, STRING,   device_id,         1) \
 X(a, STATIC,   SINGULAR, BOOL,     streaming,         2) \
 X(a, STATIC,   SINGULAR, STRING,   room_id,           3) \
 X(a, STATIC,   SINGULAR, INT32,    signal_dbm,        4) \
-X(a, STATIC,   SINGULAR, INT64,    last_event_time,   5)
+X(a, STATIC,   SINGULAR, INT64,    last_event_time,   5) \
+X(a, STATIC,   SINGULAR, INT64,    timestamp,         6)
 #define DEVICE_STATUS_REPORT_CALLBACK NULL
 #define DEVICE_STATUS_REPORT_DEFAULT NULL
 
@@ -703,7 +687,6 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,cron,payload.cron),   3)
 
 extern const pb_msgdesc_t device_video_msg_t_msg;
 extern const pb_msgdesc_t device_event_msg_t_msg;
-extern const pb_msgdesc_t device_heartbeat_t_msg;
 extern const pb_msgdesc_t device_status_report_t_msg;
 extern const pb_msgdesc_t device_upload_logs_t_msg;
 extern const pb_msgdesc_t device_join_room_t_msg;
@@ -736,7 +719,6 @@ extern const pb_msgdesc_t device_agent_response_t_msg;
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define DEVICE_VIDEO_MSG_FIELDS &device_video_msg_t_msg
 #define DEVICE_EVENT_MSG_FIELDS &device_event_msg_t_msg
-#define DEVICE_HEARTBEAT_FIELDS &device_heartbeat_t_msg
 #define DEVICE_STATUS_REPORT_FIELDS &device_status_report_t_msg
 #define DEVICE_UPLOAD_LOGS_FIELDS &device_upload_logs_t_msg
 #define DEVICE_JOIN_ROOM_FIELDS &device_join_room_t_msg
@@ -783,7 +765,6 @@ extern const pb_msgdesc_t device_agent_response_t_msg;
 #define DEVICE_CRON_RESPONSE_SIZE                2
 #define DEVICE_DEVICE_PB_H_MAX_SIZE              DEVICE_QUERY_EVENT_RESP_SIZE
 #define DEVICE_EVENT_MSG_SIZE                    53
-#define DEVICE_HEARTBEAT_SIZE                    44
 #define DEVICE_JOIN_ROOM_RESP_SIZE               67
 #define DEVICE_JOIN_ROOM_SIZE                    868
 #define DEVICE_LEAVE_ROOM_RESP_SIZE              67
@@ -794,7 +775,7 @@ extern const pb_msgdesc_t device_agent_response_t_msg;
 #define DEVICE_QUERY_EVENT_SIZE                  33
 #define DEVICE_REBOOT_SIZE                       0
 #define DEVICE_RELAY_CONTROL_SIZE                8
-#define DEVICE_STATUS_REPORT_SIZE                90
+#define DEVICE_STATUS_REPORT_SIZE                68
 #define DEVICE_TAKE_PHOTO_SIZE                   0
 #define DEVICE_UPLOAD_LOGS_RESP_SIZE             67
 #define DEVICE_UPLOAD_LOGS_SIZE                  514
