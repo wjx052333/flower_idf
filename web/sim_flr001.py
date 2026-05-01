@@ -21,6 +21,8 @@ import threading
 import time
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.properties import Properties
+from paho.mqtt.packettypes import PacketTypes
 
 from device_pb2 import (
     Heartbeat,
@@ -137,8 +139,13 @@ def main() -> None:
             ctx.verify_mode    = ssl.CERT_NONE
         client.tls_set_context(ctx)
 
+    # Pass project="flower" as MQTT5 User Property so the backend can correctly
+    # set the topic prefix for APP client authorization.
+    connect_props = Properties(PacketTypes.CONNECT)
+    connect_props.UserProperty = [("project", "flower")]
+
     print(f"[SIM] connecting to {host}:{port} as {DEVICE_ID}", flush=True)
-    client.connect(host, port, keepalive=60)
+    client.connect(host, port, keepalive=60, properties=connect_props)
 
     # Periodic heartbeat thread
     def _hb_loop():
