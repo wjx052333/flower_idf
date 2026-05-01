@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flower 设备控制台</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f0f4f8; margin: 0; color: #1a2332; }
+  header { background: #1a2332; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  header h1 { margin: 0; font-size: 1.2rem; font-weight: 600; }
+  .badge { background: #38b2ac; color: #fff; font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; }
+  main { max-width: 1000px; margin: 32px auto; padding: 0 16px; }
+
+  /* Login */
+  #login-card { background: #fff; border-radius: 12px; padding: 32px; max-width: 400px; margin: 60px auto; box-shadow: 0 2px 12px #0001; }
+  #login-card h2 { margin: 0 0 24px; font-size: 1.1rem; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 5px; color: #4a5568; }
+  .field input { width: 100%; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px; font-size: 0.95rem; outline: none; }
+  .field input:focus { border-color: #4299e1; }
+  .btn { display: inline-block; padding: 9px 20px; border-radius: 8px; font-size: 0.9rem; font-weight: 500; cursor: pointer; border: none; }
+  .btn-primary { background: #4299e1; color: #fff; width: 100%; margin-top: 4px; }
+  .btn-success { background: #48bb78; color: #fff; }
+  .btn-danger  { background: #fc8181; color: #fff; }
+  .btn-sm { padding: 5px 12px; font-size: 0.82rem; }
+  #login-err { color: #e53e3e; font-size: 0.85rem; margin-top: 10px; min-height: 18px; }
+
+  /* Dashboard */
+  #dashboard { display: none; }
+  .section-title { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #718096; margin: 20px 0 12px; }
+  .devices-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+  .device-card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 6px #0001; }
+  .dev-id { font-size: 0.9rem; font-weight: 700; color: #2d3748; }
+  .dev-name { font-size: 0.78rem; color: #a0aec0; margin-top: 2px; }
+  .hb-info { margin: 12px 0; font-size: 0.82rem; color: #4a5568; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-online { background: #48bb78; }
+  .dot-offline { background: #cbd5e0; }
+  .hb-ts { color: #718096; font-size: 0.77rem; margin-top: 3px; }
+  .relay-panel { border-top: 1px solid #f0f4f8; padding-top: 14px; }
+  .relay-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .relay-row label { font-size: 0.8rem; color: #718096; }
+  .relay-row input[type=number] { width: 90px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 5px 8px; font-size: 0.85rem; }
+  .relay-row input[type=number]:focus { outline: none; border-color: #4299e1; }
+  .relay-resp { font-size: 0.75rem; min-height: 16px; }
+
+  /* Topbar */
+  #topbar { background: #edf2f7; border-radius: 10px; padding: 10px 16px; font-size: 0.82rem; color: #4a5568; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; }
+  #mqtt-status { font-weight: 600; }
+  #logout-btn { margin-left: auto; background: none; border: 1px solid #cbd5e0; color: #718096; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
+
+  /* Status toast */
+  #toast { position: fixed; bottom: 16px; right: 20px; background: #2d3748; color: #e2e8f0; font-size: 0.78rem; padding: 6px 14px; border-radius: 999px; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🌸 Flower 设备控制台</h1>
+  <span class="badge" id="user-badge" style="display:none"></span>
+</header>
+
+<main>
+  <div id="login-card">
+    <h2>登录</h2>
+    <div id="cert-tip" style="background:#7d5a00;color:#ffe;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:0.88rem;line-height:1.6">
+      <strong>首次使用：</strong>请先打开以下链接，在安全警告页选择「继续访问（不安全）」：<br>
+      <a id="cert-link-backend" href="#" target="_blank" style="color:#ffe;font-weight:bold">后端 (8080)</a>
+      &nbsp;&nbsp;
+      <a id="cert-link-emqx" href="#" target="_blank" style="color:#ffe;font-weight:bold">EMQX WSS (8084)</a>
+    </div>
+    <div class="field"><label>用户名</label><input id="inp-user" value="floweruser0"></div>
+    <div class="field"><label>密码</label><input id="inp-pass" type="password" value="Test1234!"></div>
+    <div class="field"><label>Backend URL</label><input id="inp-backend" value=""></div>
+    <button class="btn btn-primary" id="login-btn">登录</button>
+    <div id="login-err"></div>
+  </div>
+
+  <div id="dashboard">
+    <div id="topbar">
+      <span>MQTT：</span><span id="mqtt-status">连接中…</span>
+      <button id="logout-btn">退出</button>
+    </div>
+    <div class="section-title">绑定设备</div>
+    <div class="devices-grid" id="devices-grid"></div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script src="protobuf.min.js"></script>
+<script src="mqtt.min.js"></script>
+<script>
+// ── Load proto descriptor ─────────────────────────────────────────────────────
+let Heartbeat = null;
+let Command   = null;
+
+protobuf.load('device_proto.json').then(root => {
+  Heartbeat = root.lookupType('device.Heartbeat');
+  Command   = root.lookupType('device.Command');
+}).catch(e => console.error('Failed to load device_proto.json:', e));
+</script>
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let backendUrl  = '';
+let accessToken = '';
+let userSub     = '';
+let myDevices   = [];
+let mqttClient  = null;
+const heartbeats = {};   // device_id → {timestamp, received_at}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function toast(msg, ms = 2500) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), ms);
+}
+
+function _hex8() {
+  return Math.random().toString(16).slice(2, 10);
+}
+
+// JWT payload decode (no verify — browser doesn't need to)
+function jwtSub(token) {
+  try {
+    return JSON.parse(atob(token.split('.')[1])).sub || '';
+  } catch { return ''; }
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+function updateCertLinks() {
+  const raw = document.getElementById('inp-backend').value.trim();
+  let host = window.location.hostname;
+  try { host = new URL(raw).hostname; } catch(e) {}
+  document.getElementById('cert-link-backend').href = raw || ('https://' + host + ':8080');
+  document.getElementById('cert-link-emqx').href    = 'https://' + host + ':8084';
+}
+
+const _defaultBackend = window.location.protocol + '//' + window.location.hostname + ':8080';
+document.getElementById('inp-user').value    = localStorage.getItem('flower_user')    || 'floweruser0';
+document.getElementById('inp-backend').value = localStorage.getItem('flower_backend') || _defaultBackend;
+updateCertLinks();
+document.getElementById('inp-backend').addEventListener('input', updateCertLinks);
+
+async function doLogin() {
+  const user = document.getElementById('inp-user').value.trim();
+  const pass = document.getElementById('inp-pass').value;
+  backendUrl  = document.getElementById('inp-backend').value.trim();
+
+  document.getElementById('login-err').textContent = '';
+  document.getElementById('login-btn').disabled = true;
+
+  let data;
+  try {
+    const resp = await fetch(backendUrl + '/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    document.getElementById('login-err').textContent = '请求失败: ' + e.message;
+    document.getElementById('login-btn').disabled = false;
+    return;
+  }
+
+  if (!data.access_token) {
+    document.getElementById('login-err').textContent = data.error || '登录失败';
+    document.getElementById('login-btn').disabled = false;
+    return;
+  }
+
+  accessToken = data.access_token;
+  userSub     = jwtSub(accessToken) || user;
+  localStorage.setItem('flower_user',    user);
+  localStorage.setItem('flower_backend', backendUrl);
+  await onLoginSuccess(user);
+}
+
+document.getElementById('login-btn').addEventListener('click', doLogin);
+document.getElementById('inp-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// ── Post-login ────────────────────────────────────────────────────────────────
+async function onLoginSuccess(user) {
+  // Load bound devices from backend
+  let resp;
+  try {
+    resp = await fetch(backendUrl + '/api/my/devices', {
+      headers: { 'Authorization': 'Bearer ' + accessToken },
+    });
+  } catch (e) {
+    document.getElementById('login-err').textContent = '获取设备列表失败: ' + e.message;
+    document.getElementById('login-btn').disabled = false;
+    console.error('fetch /api/my/devices error:', e);
+    return;
+  }
+  myDevices = resp.ok ? await resp.json() : [];
+  console.log('my devices:', myDevices);
+
+  document.getElementById('login-card').style.display  = 'none';
+  document.getElementById('dashboard').style.display   = 'block';
+  document.getElementById('user-badge').textContent    = user;
+  document.getElementById('user-badge').style.display  = '';
+  document.getElementById('login-btn').disabled        = false;
+
+  renderDevices();
+  connectMqtt();
+}
+
+// ── MQTT (browser直连 EMQX WSS:8084) ─────────────────────────────────────────
+function connectMqtt() {
+  const host = new URL(backendUrl).hostname;
+  const wsUrl = 'wss://' + host + ':8084/mqtt';
+  const clientId = 'app_' + userSub + '_' + _hex8();
+
+  document.getElementById('mqtt-status').textContent = '连接中…';
+
+  mqttClient = mqtt.connect(wsUrl, {
+    clientId,
+    username:  userSub,
+    password:  accessToken,
+    protocolVersion: 5,
+    rejectUnauthorized: false,   // self-signed cert
+  });
+
+  mqttClient.on('connect', () => {
+    document.getElementById('mqtt-status').textContent = '已连接 ✓';
+    // 订阅所有绑定设备的心跳
+    myDevices.forEach(d => {
+      mqttClient.subscribe(`flower/${d.device_id}/up/heartbeat`, { qos: 1 });
+    });
+  });
+
+  mqttClient.on('error', e => {
+    document.getElementById('mqtt-status').textContent = '错误: ' + e.message;
+  });
+
+  mqttClient.on('offline', () => {
+    document.getElementById('mqtt-status').textContent = '断开，重连中…';
+  });
+
+  mqttClient.on('message', (topic, payload) => {
+    // topic: flower/{device_id}/up/heartbeat
+    const parts = topic.split('/');
+    if (parts.length < 4 || parts[2] !== 'up' || parts[3] !== 'heartbeat') return;
+    const deviceId = parts[1];
+    try {
+      if (!Heartbeat) return;
+      const hb = Heartbeat.decode(payload);
+      // timestamp is a Long; convert to JS number (ms)
+      const ts = typeof hb.timestamp === 'object' ? hb.timestamp.toNumber() : Number(hb.timestamp);
+      heartbeats[deviceId] = { device_id: hb.deviceId || deviceId, timestamp: ts, received_at: Date.now() };
+      updateCard(deviceId);
+    } catch(e) { console.warn('heartbeat decode error', e); }
+  });
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderDevices() {
+  const grid = document.getElementById('devices-grid');
+  grid.innerHTML = '';
+  myDevices.forEach(dev => {
+    const card = document.createElement('div');
+    card.className = 'device-card';
+    card.id = 'card-' + dev.device_id;
+    card.innerHTML = cardHTML(dev);
+    grid.appendChild(card);
+    card.querySelector('.btn-on') .addEventListener('click', () => sendRelay(dev.device_id, true,  card));
+    card.querySelector('.btn-off').addEventListener('click', () => sendRelay(dev.device_id, false, card));
+  });
+}
+
+function cardHTML(dev) {
+  const hb     = heartbeats[dev.device_id];
+  const online = hb && (Date.now() - hb.received_at < 90000);
+  const tsStr  = hb ? new Date(hb.timestamp).toLocaleString() : '—';
+  const recStr = hb ? new Date(hb.received_at).toLocaleTimeString() : '—';
+  return `
+    <div class="dev-id">${dev.device_id}</div>
+    <div class="dev-name">${dev.display_name || ''}</div>
+    <div class="hb-info" id="hb-${dev.device_id}">
+      <span class="dot ${online ? 'dot-online' : 'dot-offline'}"></span>${online ? '在线' : '离线'}
+      <div class="hb-ts">设备时间: ${tsStr}</div>
+      <div class="hb-ts">收到心跳: ${recStr}</div>
+    </div>
+    <div class="relay-panel">
+      <div class="relay-row">
+        <label>延时(ms)</label>
+        <input type="number" class="duration-input" value="5000" min="0" max="60000" step="500">
+        <button class="btn btn-success btn-sm btn-on">开继电器</button>
+        <button class="btn btn-danger  btn-sm btn-off">关继电器</button>
+      </div>
+      <div class="relay-resp" id="resp-${dev.device_id}"></div>
+    </div>`;
+}
+
+function updateCard(deviceId) {
+  const hbEl = document.getElementById('hb-' + deviceId);
+  if (!hbEl) return;
+  const hb     = heartbeats[deviceId];
+  const online = hb && (Date.now() - hb.received_at < 90000);
+  hbEl.innerHTML = `
+    <span class="dot ${online ? 'dot-online' : 'dot-offline'}"></span>${online ? '在线' : '离线'}
+    <div class="hb-ts">设备时间: ${hb ? new Date(hb.timestamp).toLocaleString() : '—'}</div>
+    <div class="hb-ts">收到心跳: ${hb ? new Date(hb.received_at).toLocaleTimeString() : '—'}</div>`;
+}
+
+// ── Relay command ─────────────────────────────────────────────────────────────
+function sendRelay(deviceId, on, card) {
+  const duration_ms = parseInt(card.querySelector('.duration-input').value) || 0;
+  const respEl      = document.getElementById('resp-' + deviceId);
+  if (!mqttClient || !mqttClient.connected) {
+    respEl.textContent = '✗ MQTT 未连接'; respEl.style.color = '#fc8181'; return;
+  }
+  if (!Command) {
+    respEl.textContent = '✗ proto 未加载'; respEl.style.color = '#fc8181'; return;
+  }
+  const msg     = Command.create({ relayControl: { on, durationMs: duration_ms }, role: 2 });
+  const payload = Command.encode(msg).finish();
+  const topic   = `flower/${deviceId}/down/cmd`;
+  mqttClient.publish(topic, payload, { qos: 1 }, err => {
+    if (err) {
+      respEl.textContent = '✗ ' + err.message; respEl.style.color = '#fc8181';
+    } else {
+      respEl.textContent = `✓ ${on ? '开' : '关'} duration=${duration_ms}ms`;
+      respEl.style.color = '#68d391';
+      toast(`${deviceId} relay ${on ? 'ON' : 'OFF'} sent`);
+      setTimeout(() => { respEl.textContent = ''; }, 4000);
+    }
+  });
+}
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+document.getElementById('logout-btn').addEventListener('click', () => {
+  if (mqttClient) { mqttClient.end(true); mqttClient = null; }
+  accessToken = ''; userSub = ''; myDevices = [];
+  localStorage.removeItem('flower_user');
+  localStorage.removeItem('flower_backend');
+  document.getElementById('inp-user').value    = 'floweruser0';
+  document.getElementById('inp-backend').value = _defaultBackend;
+  updateCertLinks();
+  document.getElementById('dashboard').style.display  = 'none';
+  document.getElementById('login-card').style.display = '';
+  document.getElementById('user-badge').style.display = 'none';
+});
+</script>
+</body>
+</html>
