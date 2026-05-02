@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
-        "proto/device.pb.c"
+        "proto/flower.pb.c"
     INCLUDE_DIRS
         "."
         "proto"
