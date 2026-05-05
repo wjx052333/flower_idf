@@ -21,6 +21,9 @@ PB_BIND(FLOWER_COMMAND, flower_command_t, AUTO)
 PB_BIND(FLOWER_COMMAND_RESPONSE, flower_command_response_t, AUTO)
 
 
+PB_BIND(FLOWER_DEVICE_VERSION, flower_device_version_t, AUTO)
+
+
 
 
 

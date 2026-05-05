@@ -249,8 +249,12 @@ static void publish_status_report(void)
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
-    sr.signal_dbm = (int32_t)raw;
-    sr.timestamp  = (int64_t)now * 1000;
+    sr.signal_dbm      = (int32_t)raw;
+    sr.timestamp       = (int64_t)now * 1000;
+    sr.has_version     = true;
+    sr.version.major   = 1;
+    sr.version.minor   = 0;
+    sr.version.patch   = 0;
 
     uint8_t buf[FLOWER_STATUS_REPORT_SIZE];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
