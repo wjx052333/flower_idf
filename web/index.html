@@ -97,10 +97,10 @@
 let StatusReport = null;
 let Command      = null;
 
-protobuf.load('device_proto.json').then(root => {
-  StatusReport = root.lookupType('device.StatusReport');
-  Command      = root.lookupType('device.Command');
-}).catch(e => console.error('Failed to load device_proto.json:', e));
+protobuf.load('flower_proto.json').then(root => {
+  StatusReport = root.lookupType('flower.StatusReport');
+  Command      = root.lookupType('flower.Command');
+}).catch(e => console.error('Failed to load flower_proto.json:', e));
 </script>
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
