@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "camera.c"
         "proto/flower.pb.c"
+        "proto/mqtt_agent.pb.c"
     INCLUDE_DIRS
         "."
         "proto"

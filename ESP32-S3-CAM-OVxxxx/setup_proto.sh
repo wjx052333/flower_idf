@@ -12,6 +12,7 @@ NANOPB_COMP="$SCRIPT_DIR/components/nanopb"
 PROTO_OUT="$SCRIPT_DIR/main/proto"
 PROTO_DIR="$REPO_ROOT/protocol"
 PROTO_SRC="$PROTO_DIR/flower.proto"
+AGENT_PROTO_SRC="$PROTO_DIR/mqtt_agent.proto"
 
 # ── Dependency checks ────────────────────────────────────────────────────────
 for cmd in git python3 protoc; do
@@ -55,7 +56,7 @@ idf_component_register(SRC_DIRS ./src INCLUDE_DIRS ./include)
 EOF
 
 # ── 3. Generate flower.pb.h / flower.pb.c ────────────────────────────────────
-echo "[3/3] Generating nanopb bindings for flower.proto..."
+echo "[3/4] Generating nanopb bindings for flower.proto..."
 mkdir -p "$PROTO_OUT"
 
 protoc \
@@ -66,7 +67,18 @@ protoc \
     -I "$PROTO_DIR" \
     "$PROTO_SRC"
 
+# ── 4. Generate agent.pb.h / agent.pb.c ──────────────────────────────────────
+echo "[4/4] Generating nanopb bindings for mqtt_agent.proto..."
+protoc \
+    --plugin=protoc-gen-nanopb="$NANOPB_PLUGIN" \
+    --nanopb_out="$PROTO_OUT" \
+    --nanopb_opt=--c-style \
+    "-I$PROTO_DIR" \
+    "$AGENT_PROTO_SRC"
+
 echo "Done."
 echo "  components/nanopb/   — IDF nanopb component"
 echo "  main/proto/flower.pb.h"
 echo "  main/proto/flower.pb.c"
+echo "  main/proto/mqtt_agent.pb.h"
+echo "  main/proto/mqtt_agent.pb.c"

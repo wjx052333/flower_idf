@@ -15,6 +15,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -223,6 +224,23 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_cam_sem, portMAX_DELAY);
+
+    /* Drain stale buffers — the driver fills both at startup then stops.
+     * Requeue them so the sensor produces a fresh frame for us. */
+    for (int i = 0; i < CAM_BUF_COUNT; i++) {
+        memset(&s_vbuf, 0, sizeof(s_vbuf));
+        s_vbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        s_vbuf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(s_cam_fd, VIDIOC_DQBUF, &s_vbuf) < 0) {
+            xSemaphoreGive(s_cam_sem);
+            ESP_LOGE(TAG, "VIDIOC_DQBUF drain failed (errno=%d)", errno);
+            return ESP_FAIL;
+        }
+        ioctl(s_cam_fd, VIDIOC_QBUF, &s_vbuf);
+    }
+    /* Now wait for a fresh frame — the sensor needs ~33 ms @ 30 fps */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     memset(&s_vbuf, 0, sizeof(s_vbuf));
     s_vbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     s_vbuf.memory = V4L2_MEMORY_MMAP;
