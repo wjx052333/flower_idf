@@ -1,0 +1,114 @@
+menu "Flower CAM Device Configuration"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default ""
+
+config WIFI_PASSWORD
+    string "WiFi Password"
+    default ""
+
+config MQTT_BROKER_URI
+    string "MQTT Broker URI"
+    default ""
+
+menu "Camera DVP Pin Configuration"
+    comment "Default values match the ESP32-S3-EYE / OV5640 DVP layout."
+
+    config CAM_SCCB_I2C_PORT
+        int "SCCB (I2C) port number"
+        default 0
+        range 0 1
+
+    config CAM_SCCB_I2C_FREQ
+        int "SCCB (I2C) frequency (Hz)"
+        default 100000
+        range 100000 400000
+
+    config CAM_SCCB_SCL_PIN
+        int "SCCB (I2C) SCL pin"
+        default 5
+        range 0 48
+
+    config CAM_SCCB_SDA_PIN
+        int "SCCB (I2C) SDA pin"
+        default 4
+        range 0 48
+
+    config CAM_RESET_PIN
+        int "Camera RESET pin (-1 = not connected)"
+        default -1
+        range -1 48
+
+    config CAM_PWDN_PIN
+        int "Camera PWDN pin (-1 = not connected)"
+        default -1
+        range -1 48
+
+    config CAM_XCLK_PIN
+        int "XCLK output pin"
+        default 15
+        range 0 48
+
+    config CAM_XCLK_FREQ
+        int "XCLK frequency (Hz)"
+        default 20000000
+
+    config CAM_PCLK_PIN
+        int "PCLK input pin"
+        default 13
+        range 0 48
+
+    config CAM_VSYNC_PIN
+        int "VSYNC input pin"
+        default 6
+        range 0 48
+
+    config CAM_DE_PIN
+        int "DE (HREF) input pin"
+        default 7
+        range 0 48
+
+    config CAM_D0_PIN
+        int "Data bit 0 pin"
+        default 11
+        range 0 48
+
+    config CAM_D1_PIN
+        int "Data bit 1 pin"
+        default 9
+        range 0 48
+
+    config CAM_D2_PIN
+        int "Data bit 2 pin"
+        default 8
+        range 0 48
+
+    config CAM_D3_PIN
+        int "Data bit 3 pin"
+        default 10
+        range 0 48
+
+    config CAM_D4_PIN
+        int "Data bit 4 pin"
+        default 12
+        range 0 48
+
+    config CAM_D5_PIN
+        int "Data bit 5 pin"
+        default 18
+        range 0 48
+
+    config CAM_D6_PIN
+        int "Data bit 6 pin"
+        default 17
+        range 0 48
+
+    config CAM_D7_PIN
+        int "Data bit 7 pin"
+        default 16
+        range 0 48
+
+endmenu
+
+endmenu
