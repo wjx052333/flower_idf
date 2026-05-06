@@ -12,16 +12,24 @@ PB_BIND(FLOWER_STATUS_REPORT, flower_status_report_t, AUTO)
 PB_BIND(FLOWER_RELAY_CONTROL, flower_relay_control_t, AUTO)
 
 
+PB_BIND(FLOWER_OTA_COMMAND, flower_ota_command_t, 2)
+
+
+PB_BIND(FLOWER_OTA_RESPONSE, flower_ota_response_t, AUTO)
+
+
 PB_BIND(FLOWER_RELAY_CONTROL_RESP, flower_relay_control_resp_t, AUTO)
 
 
-PB_BIND(FLOWER_COMMAND, flower_command_t, AUTO)
+PB_BIND(FLOWER_COMMAND, flower_command_t, 2)
 
 
 PB_BIND(FLOWER_COMMAND_RESPONSE, flower_command_response_t, AUTO)
 
 
 PB_BIND(FLOWER_DEVICE_VERSION, flower_device_version_t, AUTO)
+
+
 
 
 

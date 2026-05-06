@@ -10,48 +10,69 @@
   header { background: #1a2332; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
   header h1 { margin: 0; font-size: 1.2rem; font-weight: 600; }
   .badge { background: #38b2ac; color: #fff; font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; }
-  main { max-width: 1000px; margin: 32px auto; padding: 0 16px; }
+  main { max-width: 1040px; margin: 32px auto; padding: 0 16px; }
 
-  /* Login */
-  #login-card { background: #fff; border-radius: 12px; padding: 32px; max-width: 400px; margin: 60px auto; box-shadow: 0 2px 12px #0001; }
-  #login-card h2 { margin: 0 0 24px; font-size: 1.1rem; }
-  .field { margin-bottom: 14px; }
-  .field label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 5px; color: #4a5568; }
-  .field input { width: 100%; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px; font-size: 0.95rem; outline: none; }
+  /* ── Login card ──────────────────────────────────────────────────────── */
+  #login-card { background: #fff; border-radius: 12px; padding: 32px; max-width: 440px; margin: 60px auto; box-shadow: 0 2px 12px #0001; }
+  #login-card h2 { margin: 0 0 20px; font-size: 1.1rem; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 0.82rem; font-weight: 500; margin-bottom: 4px; color: #4a5568; }
+  .field input { width: 100%; border: 1px solid #e2e8f0; border-radius: 8px; padding: 7px 11px; font-size: 0.92rem; outline: none; }
   .field input:focus { border-color: #4299e1; }
-  .btn { display: inline-block; padding: 9px 20px; border-radius: 8px; font-size: 0.9rem; font-weight: 500; cursor: pointer; border: none; }
-  .btn-primary { background: #4299e1; color: #fff; width: 100%; margin-top: 4px; }
-  .btn-success { background: #48bb78; color: #fff; }
-  .btn-danger  { background: #fc8181; color: #fff; }
-  .btn-sm { padding: 5px 12px; font-size: 0.82rem; }
-  #login-err { color: #e53e3e; font-size: 0.85rem; margin-top: 10px; min-height: 18px; }
+  .field-row { display: flex; gap: 8px; }
+  .field-row .field { flex: 1; }
+  .btn { display: inline-block; padding: 8px 18px; border-radius: 8px; font-size: 0.88rem; font-weight: 500; cursor: pointer; border: none; }
+  .btn-primary  { background: #4299e1; color: #fff; width: 100%; margin-top: 6px; }
+  .btn-success  { background: #48bb78; color: #fff; }
+  .btn-danger   { background: #fc8181; color: #fff; }
+  .btn-purple   { background: #805ad5; color: #fff; }
+  .btn-gray     { background: #718096; color: #fff; }
+  .btn-sm { padding: 5px 11px; font-size: 0.8rem; }
+  #login-err { color: #e53e3e; font-size: 0.83rem; margin-top: 8px; min-height: 18px; }
+  .section-sep { border: none; border-top: 1px solid #e2e8f0; margin: 18px 0 14px; }
 
-  /* Dashboard */
+  /* ── Dashboard ───────────────────────────────────────────────────────── */
   #dashboard { display: none; }
-  .section-title { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #718096; margin: 20px 0 12px; }
-  .devices-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
-  .device-card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 6px #0001; }
-  .dev-id { font-size: 0.9rem; font-weight: 700; color: #2d3748; }
-  .dev-name { font-size: 0.78rem; color: #a0aec0; margin-top: 2px; }
-  .hb-info { margin: 12px 0; font-size: 0.82rem; color: #4a5568; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .dot-online { background: #48bb78; }
+  .section-title { font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #718096; margin: 18px 0 10px; }
+  .devices-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
+
+  /* ── Device card ─────────────────────────────────────────────────────── */
+  .device-card { background: #fff; border-radius: 12px; padding: 18px; box-shadow: 0 1px 6px #0001; }
+  .dev-id   { font-size: 0.88rem; font-weight: 700; color: #2d3748; }
+  .dev-name { font-size: 0.76rem; color: #a0aec0; margin-top: 2px; }
+  .hb-info  { margin: 9px 0 0; font-size: 0.8rem; color: #4a5568; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+  .dot-online  { background: #48bb78; }
   .dot-offline { background: #cbd5e0; }
-  .hb-ts { color: #718096; font-size: 0.77rem; margin-top: 3px; }
-  .relay-panel { border-top: 1px solid #f0f4f8; padding-top: 14px; }
-  .relay-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-  .relay-row label { font-size: 0.8rem; color: #718096; }
-  .relay-row input[type=number] { width: 90px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 5px 8px; font-size: 0.85rem; }
-  .relay-row input[type=number]:focus { outline: none; border-color: #4299e1; }
-  .relay-resp { font-size: 0.75rem; min-height: 16px; }
+  .hb-ts { color: #718096; font-size: 0.75rem; margin-top: 2px; }
+  .ver-badge { background: #ebf8ff; color: #2b6cb0; border-radius: 4px; padding: 1px 6px; font-size: 0.7rem; font-weight: 700; margin-left: 6px; }
+  .divider { border: none; border-top: 1px solid #f0f4f8; margin: 11px 0; }
 
-  /* Topbar */
-  #topbar { background: #edf2f7; border-radius: 10px; padding: 10px 16px; font-size: 0.82rem; color: #4a5568; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; }
+  /* ── Relay panel ─────────────────────────────────────────────────────── */
+  .relay-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 6px; }
+  .relay-row label { font-size: 0.78rem; color: #718096; }
+  .relay-row input[type=number] { width: 86px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 4px 8px; font-size: 0.83rem; outline: none; }
+  .relay-row input[type=number]:focus { border-color: #4299e1; }
+  .relay-resp { font-size: 0.73rem; min-height: 15px; }
+
+  /* ── OTA panel ───────────────────────────────────────────────────────── */
+  .ota-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #718096; margin-bottom: 8px; }
+  .ota-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .ota-select { flex: 1; min-width: 0; border: 1px solid #e2e8f0; border-radius: 6px; padding: 5px 7px; font-size: 0.8rem; outline: none; background: #fff; }
+  .ota-select:focus { border-color: #805ad5; }
+  .ota-url { flex: 1; min-width: 0; border: 1px solid #e2e8f0; border-radius: 6px; padding: 5px 7px; font-size: 0.78rem; font-family: monospace; outline: none; }
+  .ota-url:focus { border-color: #805ad5; }
+  .ota-status { font-size: 0.73rem; min-height: 15px; margin-top: 1px; }
+
+  /* ── Topbar ──────────────────────────────────────────────────────────── */
+  #topbar { background: #edf2f7; border-radius: 10px; padding: 9px 14px; font-size: 0.8rem; color: #4a5568; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }
   #mqtt-status { font-weight: 600; }
-  #logout-btn { margin-left: auto; background: none; border: 1px solid #cbd5e0; color: #718096; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
+  .topbar-server { display: flex; align-items: center; gap: 5px; }
+  .topbar-server code { background: #fff; border: 1px solid #e2e8f0; border-radius: 5px; padding: 1px 7px; font-size: 0.78rem; color: #2d3748; }
+  #logout-btn { margin-left: auto; background: none; border: 1px solid #cbd5e0; color: #718096; padding: 3px 11px; border-radius: 6px; cursor: pointer; font-size: 0.78rem; }
 
-  /* Status toast */
-  #toast { position: fixed; bottom: 16px; right: 20px; background: #2d3748; color: #e2e8f0; font-size: 0.78rem; padding: 6px 14px; border-radius: 999px; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  /* ── Toast ───────────────────────────────────────────────────────────── */
+  #toast { position: fixed; bottom: 16px; right: 20px; background: #2d3748; color: #e2e8f0; font-size: 0.76rem; padding: 6px 14px; border-radius: 999px; opacity: 0; transition: opacity .3s; pointer-events: none; }
   #toast.show { opacity: 1; }
 </style>
 </head>
@@ -63,24 +84,37 @@
 </header>
 
 <main>
+  <!-- ── Login ── -->
   <div id="login-card">
     <h2>登录</h2>
-    <div id="cert-tip" style="background:#7d5a00;color:#ffe;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:0.88rem;line-height:1.6">
-      <strong>首次使用：</strong>请先打开以下链接，在安全警告页选择「继续访问（不安全）」：<br>
+    <div id="cert-tip" style="background:#7d5a00;color:#ffe;border-radius:6px;padding:9px 13px;margin-bottom:12px;font-size:0.85rem;line-height:1.6">
+      <strong>首次使用：</strong>请先打开以下链接，接受自签名证书：<br>
       <a id="cert-link-backend" href="#" target="_blank" style="color:#ffe;font-weight:bold">后端 (8080)</a>
-      &nbsp;&nbsp;
+      &nbsp;
       <a id="cert-link-emqx" href="#" target="_blank" style="color:#ffe;font-weight:bold">EMQX WSS (8084)</a>
     </div>
     <div class="field"><label>用户名</label><input id="inp-user" value="floweruser0"></div>
     <div class="field"><label>密码</label><input id="inp-pass" type="password" value="Test1234!"></div>
     <div class="field"><label>Backend URL</label><input id="inp-backend" value=""></div>
+
+    <hr class="section-sep">
+    <div style="font-size:0.82rem;font-weight:600;color:#4a5568;margin-bottom:10px">本地固件服务器（OTA 用）</div>
+    <div class="field-row">
+      <div class="field"><label>服务器 IP</label><input id="inp-server-ip" placeholder="自动检测"></div>
+      <div class="field" style="width:90px;flex:none"><label>端口</label><input id="inp-server-port" value="8000"></div>
+    </div>
+    <div style="font-size:0.73rem;color:#a0aec0;margin-top:-6px;margin-bottom:10px">ESP32 通过此地址下载固件，须与设备在同一局域网</div>
+
     <button class="btn btn-primary" id="login-btn">登录</button>
     <div id="login-err"></div>
   </div>
 
+  <!-- ── Dashboard ── -->
   <div id="dashboard">
     <div id="topbar">
       <span>MQTT：</span><span id="mqtt-status">连接中…</span>
+      <span class="topbar-server">固件服务器：<code id="server-display">—</code></span>
+      <button id="refresh-fw-btn" class="btn btn-sm btn-gray" style="padding:3px 10px;font-size:0.75rem">刷新固件</button>
       <button id="logout-btn">退出</button>
     </div>
     <div class="section-title">绑定设备</div>
@@ -93,14 +127,16 @@
 <script src="protobuf.min.js"></script>
 <script src="mqtt.min.js"></script>
 <script>
-// ── Load proto descriptor ─────────────────────────────────────────────────────
-let StatusReport = null;
-let Command      = null;
+// ── Proto ─────────────────────────────────────────────────────────────────────
+let StatusReport    = null;
+let Command         = null;
+let CommandResponse = null;
 
 protobuf.load('flower_proto.json').then(root => {
-  StatusReport = root.lookupType('flower.StatusReport');
-  Command      = root.lookupType('flower.Command');
-}).catch(e => console.error('Failed to load flower_proto.json:', e));
+  StatusReport    = root.lookupType('flower.StatusReport');
+  Command         = root.lookupType('flower.Command');
+  CommandResponse = root.lookupType('flower.CommandResponse');
+}).catch(e => console.error('proto load error:', e));
 </script>
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -109,58 +145,70 @@ let accessToken = '';
 let userSub     = '';
 let myDevices   = [];
 let mqttClient  = null;
-const heartbeats = {};   // device_id → {timestamp, received_at}
+let firmwareList = [];   // [{ name, size, mtime, source:'build'|'upload' }]
+
+// device_id → { timestamp, received_at, signalDbm, version }
+const heartbeats = {};
+
+// Local OTA server settings (IP + port of this machine, where server.js runs)
+let serverIp   = localStorage.getItem('flower_server_ip')   || window.location.hostname;
+let serverPort = localStorage.getItem('flower_server_port') || (window.location.port || '8000');
+
+function firmwareUrl(filename) {
+  return `http://${serverIp}:${serverPort}/firmware/${filename}`;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function toast(msg, ms = 2500) {
   const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.classList.add('show');
+  el.textContent = msg; el.classList.add('show');
   setTimeout(() => el.classList.remove('show'), ms);
 }
-
-function _hex8() {
-  return Math.random().toString(16).slice(2, 10);
+function _hex8() { return Math.random().toString(16).slice(2, 10); }
+function jwtSub(t) {
+  try { return JSON.parse(atob(t.split('.')[1])).sub || ''; } catch { return ''; }
 }
 
-// JWT payload decode (no verify — browser doesn't need to)
-function jwtSub(token) {
-  try {
-    return JSON.parse(atob(token.split('.')[1])).sub || '';
-  } catch { return ''; }
-}
-
-// ── Login ─────────────────────────────────────────────────────────────────────
+// ── Login page init ───────────────────────────────────────────────────────────
 function updateCertLinks() {
   const raw = document.getElementById('inp-backend').value.trim();
   let host = window.location.hostname;
-  try { host = new URL(raw).hostname; } catch(e) {}
-  document.getElementById('cert-link-backend').href = raw || ('https://' + host + ':8080');
-  document.getElementById('cert-link-emqx').href    = 'https://' + host + ':8084';
+  try { host = new URL(raw).hostname; } catch {}
+  document.getElementById('cert-link-backend').href = raw || `https://${host}:8080`;
+  document.getElementById('cert-link-emqx').href    = `https://${host}:8084`;
 }
 
-const _defaultBackend = window.location.protocol + '//' + window.location.hostname + ':8080';
-document.getElementById('inp-user').value    = localStorage.getItem('flower_user')    || 'floweruser0';
-document.getElementById('inp-backend').value = localStorage.getItem('flower_backend') || _defaultBackend;
+const _defaultBackend = `${window.location.protocol}//${window.location.hostname}:8080`;
+document.getElementById('inp-user').value       = localStorage.getItem('flower_user')    || 'floweruser0';
+document.getElementById('inp-backend').value    = localStorage.getItem('flower_backend') || _defaultBackend;
+document.getElementById('inp-server-ip').value  = localStorage.getItem('flower_server_ip')   || '';
+document.getElementById('inp-server-port').value= localStorage.getItem('flower_server_port') || '8000';
 updateCertLinks();
 document.getElementById('inp-backend').addEventListener('input', updateCertLinks);
 
+// ── Login ─────────────────────────────────────────────────────────────────────
 async function doLogin() {
   const user = document.getElementById('inp-user').value.trim();
   const pass = document.getElementById('inp-pass').value;
   backendUrl  = document.getElementById('inp-backend').value.trim();
+
+  // Read & persist server IP/port
+  serverIp   = document.getElementById('inp-server-ip').value.trim()    || window.location.hostname;
+  serverPort = document.getElementById('inp-server-port').value.trim()  || (window.location.port || '8000');
+  localStorage.setItem('flower_server_ip',   serverIp);
+  localStorage.setItem('flower_server_port', serverPort);
 
   document.getElementById('login-err').textContent = '';
   document.getElementById('login-btn').disabled = true;
 
   let data;
   try {
-    const resp = await fetch(backendUrl + '/api/login', {
+    const r = await fetch(`${backendUrl}/api/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: user, password: pass }),
     });
-    data = await resp.json();
+    data = await r.json();
   } catch (e) {
     document.getElementById('login-err').textContent = '请求失败: ' + e.message;
     document.getElementById('login-btn').disabled = false;
@@ -185,80 +233,163 @@ document.getElementById('inp-pass').addEventListener('keydown', e => { if (e.key
 
 // ── Post-login ────────────────────────────────────────────────────────────────
 async function onLoginSuccess(user) {
-  // Load bound devices from backend
-  let resp;
+  let r;
   try {
-    resp = await fetch(backendUrl + '/api/my/devices', {
-      headers: { 'Authorization': 'Bearer ' + accessToken },
+    r = await fetch(`${backendUrl}/api/my/devices`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
   } catch (e) {
-    document.getElementById('login-err').textContent = '获取设备列表失败: ' + e.message;
+    document.getElementById('login-err').textContent = '获取设备失败: ' + e.message;
     document.getElementById('login-btn').disabled = false;
-    console.error('fetch /api/my/devices error:', e);
     return;
   }
-  myDevices = resp.ok ? await resp.json() : [];
-  console.log('my devices:', myDevices);
+  myDevices = r.ok ? await r.json() : [];
 
   document.getElementById('login-card').style.display  = 'none';
   document.getElementById('dashboard').style.display   = 'block';
   document.getElementById('user-badge').textContent    = user;
   document.getElementById('user-badge').style.display  = '';
   document.getElementById('login-btn').disabled        = false;
+  document.getElementById('server-display').textContent = `${serverIp}:${serverPort}`;
 
   renderDevices();
+  fetchFirmwareList();   // auto-detect build firmware
   connectMqtt();
 }
 
-// ── MQTT (browser直连 EMQX WSS:8084) ─────────────────────────────────────────
-function connectMqtt() {
-  const host = new URL(backendUrl).hostname;
-  const wsUrl = 'wss://' + host + ':8084/mqtt';
-  const clientId = 'app_' + userSub + '_' + _hex8();
+// ── Firmware list ─────────────────────────────────────────────────────────────
+async function fetchFirmwareList() {
+  try {
+    const r = await fetch(`${window.location.origin}/api/firmware`);
+    firmwareList = r.ok ? await r.json() : [];
+  } catch {
+    firmwareList = [];
+  }
+  // Refresh selects on all rendered cards
+  myDevices.forEach(dev => {
+    const card = document.getElementById('card-' + dev.device_id);
+    if (card) populateFirmwareSelect(dev.device_id, card);
+  });
+  if (firmwareList.length) toast(`检测到 ${firmwareList.length} 个固件`);
+}
 
+document.getElementById('refresh-fw-btn').addEventListener('click', fetchFirmwareList);
+
+/** Fill the firmware <select> for one card and auto-pick the newest entry. */
+function populateFirmwareSelect(deviceId, card) {
+  const sel = card.querySelector('.ota-select');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— 选择固件 —</option>';
+  firmwareList.forEach(fw => {
+    const opt = document.createElement('option');
+    opt.value = fw.name;
+    const kb  = (fw.size / 1024).toFixed(1);
+    const dt  = new Date(fw.mtime).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+    const tag = fw.source === 'build' ? '🔨' : '⬆';
+    opt.textContent = `${tag} ${fw.name}  (${kb} KB · ${dt})`;
+    sel.appendChild(opt);
+  });
+  // Restore previous selection, or auto-select the first (newest) entry
+  if (prev && firmwareList.find(f => f.name === prev)) {
+    sel.value = prev;
+  } else if (firmwareList.length > 0) {
+    sel.value = firmwareList[0].name;
+    card.querySelector('.ota-url').value = firmwareList[0].url || '';
+  }
+}
+
+// ── MQTT ──────────────────────────────────────────────────────────────────────
+function connectMqtt() {
+  const host     = new URL(backendUrl).hostname;
+  const clientId = 'app_' + userSub + '_' + _hex8();
   document.getElementById('mqtt-status').textContent = '连接中…';
 
-  mqttClient = mqtt.connect(wsUrl, {
-    clientId,
-    username:  userSub,
-    password:  accessToken,
-    protocolVersion: 5,
-    rejectUnauthorized: false,   // self-signed cert
+  mqttClient = mqtt.connect(`wss://${host}:8084/mqtt`, {
+    clientId, username: userSub, password: accessToken,
+    protocolVersion: 5, rejectUnauthorized: false,
   });
 
   mqttClient.on('connect', () => {
     document.getElementById('mqtt-status').textContent = '已连接 ✓';
-    // 订阅所有绑定设备的状态上报
     myDevices.forEach(d => {
-      mqttClient.subscribe(`flower/${d.device_id}/up/status`, { qos: 1 });
+      mqttClient.subscribe(`flower/${d.device_id}/up/status`,       { qos: 1 });
+      mqttClient.subscribe(`flower/${d.device_id}/up/cmd_response`, { qos: 1 });
     });
   });
-
-  mqttClient.on('error', e => {
-    document.getElementById('mqtt-status').textContent = '错误: ' + e.message;
-  });
-
-  mqttClient.on('offline', () => {
-    document.getElementById('mqtt-status').textContent = '断开，重连中…';
-  });
+  mqttClient.on('error',   e => { document.getElementById('mqtt-status').textContent = '错误: ' + e.message; });
+  mqttClient.on('offline', () => { document.getElementById('mqtt-status').textContent = '断开，重连中…'; });
 
   mqttClient.on('message', (topic, payload) => {
-    // topic: flower/{device_id}/up/status
     const parts = topic.split('/');
-    if (parts.length < 4 || parts[2] !== 'up' || parts[3] !== 'status') return;
+    if (parts.length < 4 || parts[2] !== 'up') return;
     const deviceId = parts[1];
-    try {
-      if (!StatusReport) return;
-      const sr = StatusReport.decode(payload);
-      // timestamp is a Long; convert to JS number (ms)
-      const ts = typeof sr.timestamp === 'object' ? sr.timestamp.toNumber() : Number(sr.timestamp);
-      heartbeats[deviceId] = { device_id: sr.deviceId || deviceId, timestamp: ts, received_at: Date.now() };
-      updateCard(deviceId);
-    } catch(e) { console.warn('status report decode error', e); }
+    if (parts[3] === 'status') {
+      try {
+        if (!StatusReport) return;
+        const sr  = StatusReport.decode(payload);
+        const ts  = typeof sr.timestamp === 'object' ? sr.timestamp.toNumber() : Number(sr.timestamp);
+        const ver = sr.version
+          ? { major: sr.version.major|0, minor: sr.version.minor|0, patch: sr.version.patch|0 }
+          : null;
+        heartbeats[deviceId] = { timestamp: ts, received_at: Date.now(), signalDbm: sr.signalDbm|0, version: ver };
+        updateCard(deviceId);
+      } catch(e) { console.warn('status decode error', e); }
+    } else if (parts[3] === 'cmd_response') {
+      try {
+        if (!CommandResponse) return;
+        handleCmdResponse(deviceId, payload);
+      } catch(e) { console.warn('cmd_response decode error', e); }
+    }
   });
 }
 
-// ── Render ────────────────────────────────────────────────────────────────────
+// ── Card render ───────────────────────────────────────────────────────────────
+function hbHTML(deviceId) {
+  const hb     = heartbeats[deviceId];
+  const online = hb && (Date.now() - hb.received_at < 90000);
+  const ver    = hb && hb.version
+    ? `v${hb.version.major}.${hb.version.minor}.${hb.version.patch}` : '';
+  return `
+    <span class="dot ${online ? 'dot-online' : 'dot-offline'}"></span>${online ? '在线' : '离线'}
+    ${ver ? `<span class="ver-badge">${ver}</span>` : ''}
+    <div class="hb-ts">设备时间：${hb ? new Date(hb.timestamp).toLocaleString() : '—'}</div>
+    <div class="hb-ts">心跳收到：${hb ? new Date(hb.received_at).toLocaleTimeString() : '—'}</div>
+    ${hb != null ? `<div class="hb-ts">信号 / ADC：${hb.signalDbm}</div>` : ''}`;
+}
+
+function cardHTML(dev) {
+  return `
+    <div class="dev-id">${dev.device_id}</div>
+    <div class="dev-name">${dev.display_name || ''}</div>
+    <div class="hb-info" id="hb-${dev.device_id}">${hbHTML(dev.device_id)}</div>
+    <hr class="divider">
+    <div class="relay-row">
+      <label>延时 (ms)</label>
+      <input type="number" class="duration-input" value="5000" min="0" max="60000" step="500">
+      <button class="btn btn-success btn-sm btn-on">开继电器</button>
+      <button class="btn btn-danger  btn-sm btn-off">关继电器</button>
+    </div>
+    <div class="relay-resp" id="resp-${dev.device_id}"></div>
+    <hr class="divider">
+    <div class="ota-label">固件更新 OTA</div>
+    <div class="ota-row">
+      <select class="ota-select"><option value="">— 选择固件 —</option></select>
+      <button class="btn btn-sm btn-gray btn-pick-file" title="上传本地 .bin 文件">上传</button>
+      <input type="file" class="ota-file" accept=".bin" style="display:none">
+    </div>
+    <div class="ota-row">
+      <input type="text" class="ota-url" placeholder="固件 URL（自动生成）">
+      <button class="btn btn-sm btn-purple btn-send-ota">发送 OTA</button>
+    </div>
+    <div class="ota-status" id="ota-${dev.device_id}"></div>`;
+}
+
+function updateCard(deviceId) {
+  const el = document.getElementById('hb-' + deviceId);
+  if (el) el.innerHTML = hbHTML(deviceId);
+}
+
 function renderDevices() {
   const grid = document.getElementById('devices-grid');
   grid.innerHTML = '';
@@ -268,75 +399,124 @@ function renderDevices() {
     card.id = 'card-' + dev.device_id;
     card.innerHTML = cardHTML(dev);
     grid.appendChild(card);
+
     card.querySelector('.btn-on') .addEventListener('click', () => sendRelay(dev.device_id, true,  card));
     card.querySelector('.btn-off').addEventListener('click', () => sendRelay(dev.device_id, false, card));
+
+    // OTA: firmware select → auto-fill URL
+    card.querySelector('.ota-select').addEventListener('change', e => {
+      const fw = firmwareList.find(f => f.name === e.target.value);
+      card.querySelector('.ota-url').value = fw ? fw.url : '';
+    });
+
+    // OTA: "上传" button → trigger hidden file input
+    card.querySelector('.btn-pick-file').addEventListener('click', () => {
+      card.querySelector('.ota-file').click();
+    });
+    card.querySelector('.ota-file').addEventListener('change', () => {
+      uploadFirmware(dev.device_id, card);
+    });
+
+    card.querySelector('.btn-send-ota').addEventListener('click', () => sendOta(dev.device_id, card));
+
+    // Populate firmware select with whatever we already have
+    if (firmwareList.length) populateFirmwareSelect(dev.device_id, card);
   });
 }
 
-function cardHTML(dev) {
-  const hb     = heartbeats[dev.device_id];
-  const online = hb && (Date.now() - hb.received_at < 90000);
-  const tsStr  = hb ? new Date(hb.timestamp).toLocaleString() : '—';
-  const recStr = hb ? new Date(hb.received_at).toLocaleTimeString() : '—';
-  return `
-    <div class="dev-id">${dev.device_id}</div>
-    <div class="dev-name">${dev.display_name || ''}</div>
-    <div class="hb-info" id="hb-${dev.device_id}">
-      <span class="dot ${online ? 'dot-online' : 'dot-offline'}"></span>${online ? '在线' : '离线'}
-      <div class="hb-ts">设备时间: ${tsStr}</div>
-      <div class="hb-ts">收到心跳: ${recStr}</div>
-    </div>
-    <div class="relay-panel">
-      <div class="relay-row">
-        <label>延时(ms)</label>
-        <input type="number" class="duration-input" value="5000" min="0" max="60000" step="500">
-        <button class="btn btn-success btn-sm btn-on">开继电器</button>
-        <button class="btn btn-danger  btn-sm btn-off">关继电器</button>
-      </div>
-      <div class="relay-resp" id="resp-${dev.device_id}"></div>
-    </div>`;
-}
-
-function updateCard(deviceId) {
-  const hbEl = document.getElementById('hb-' + deviceId);
-  if (!hbEl) return;
-  const hb     = heartbeats[deviceId];
-  const online = hb && (Date.now() - hb.received_at < 90000);
-  hbEl.innerHTML = `
-    <span class="dot ${online ? 'dot-online' : 'dot-offline'}"></span>${online ? '在线' : '离线'}
-    <div class="hb-ts">设备时间: ${hb ? new Date(hb.timestamp).toLocaleString() : '—'}</div>
-    <div class="hb-ts">收到心跳: ${hb ? new Date(hb.received_at).toLocaleTimeString() : '—'}</div>`;
-}
-
-// ── Relay command ─────────────────────────────────────────────────────────────
+// ── Relay ─────────────────────────────────────────────────────────────────────
 function sendRelay(deviceId, on, card) {
   const duration_ms = parseInt(card.querySelector('.duration-input').value) || 0;
   const respEl      = document.getElementById('resp-' + deviceId);
   if (!mqttClient || !mqttClient.connected) {
     respEl.textContent = '✗ MQTT 未连接'; respEl.style.color = '#fc8181'; return;
   }
-  if (!Command) {
-    respEl.textContent = '✗ proto 未加载'; respEl.style.color = '#fc8181'; return;
-  }
-  const msg     = Command.create({ relayControl: { on, durationMs: duration_ms }, role: 2 });
-  const payload = Command.encode(msg).finish();
-  const topic   = `flower/${deviceId}/down/cmd`;
-  mqttClient.publish(topic, payload, { qos: 1 }, err => {
-    if (err) {
-      respEl.textContent = '✗ ' + err.message; respEl.style.color = '#fc8181';
-    } else {
-      respEl.textContent = `✓ ${on ? '开' : '关'} duration=${duration_ms}ms`;
+  if (!Command) { respEl.textContent = '✗ proto 未加载'; respEl.style.color = '#fc8181'; return; }
+  const payload = Command.encode(Command.create({ relayControl: { on, durationMs: duration_ms }, role: 2 })).finish();
+  mqttClient.publish(`flower/${deviceId}/down/cmd`, payload, { qos: 1 }, err => {
+    if (err) { respEl.textContent = '✗ ' + err.message; respEl.style.color = '#fc8181'; }
+    else {
+      respEl.textContent = `✓ ${on ? '开' : '关'}  duration=${duration_ms}ms`;
       respEl.style.color = '#68d391';
-      toast(`${deviceId} relay ${on ? 'ON' : 'OFF'} sent`);
+      toast(`${deviceId} relay ${on ? 'ON' : 'OFF'}`);
       setTimeout(() => { respEl.textContent = ''; }, 4000);
     }
   });
 }
 
+// ── OTA: upload .bin to local server ─────────────────────────────────────────
+async function uploadFirmware(deviceId, card) {
+  const fileInput = card.querySelector('.ota-file');
+  const statusEl  = document.getElementById('ota-' + deviceId);
+  if (!fileInput.files.length) return;
+
+  const file = fileInput.files[0];
+  statusEl.textContent = '上传中…'; statusEl.style.color = '#718096';
+
+  try {
+    const r = await fetch(
+      `${window.location.origin}/upload?name=${encodeURIComponent(file.name)}`,
+      { method: 'POST', body: file }
+    );
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+
+    card.querySelector('.ota-url').value = data.url || '';
+
+    // Add to firmwareList and refresh all selects
+    const existing = firmwareList.findIndex(f => f.name === data.name);
+    const entry = { name: data.name, size: data.size, mtime: Date.now(), source: 'upload' };
+    if (existing >= 0) firmwareList[existing] = entry; else firmwareList.unshift(entry);
+    myDevices.forEach(d => {
+      const c = document.getElementById('card-' + d.device_id);
+      if (c) populateFirmwareSelect(d.device_id, c);
+    });
+
+    statusEl.textContent = `✓ 已上传 ${(file.size/1024).toFixed(1)} KB`;
+    statusEl.style.color = '#68d391';
+  } catch (e) {
+    statusEl.textContent = '✗ 上传失败: ' + e.message; statusEl.style.color = '#fc8181';
+  }
+}
+
+// ── OTA: send MQTT OtaCommand ─────────────────────────────────────────────────
+function sendOta(deviceId, card) {
+  const url      = card.querySelector('.ota-url').value.trim();
+  const statusEl = document.getElementById('ota-' + deviceId);
+  if (!url)    { statusEl.textContent = '请选择固件或填写 URL'; statusEl.style.color = '#fc8181'; return; }
+  if (!mqttClient || !mqttClient.connected) { statusEl.textContent = '✗ MQTT 未连接'; statusEl.style.color = '#fc8181'; return; }
+  if (!Command) { statusEl.textContent = '✗ proto 未加载'; statusEl.style.color = '#fc8181'; return; }
+
+  const payload = Command.encode(Command.create({ ota: { url }, role: 1 })).finish();
+  mqttClient.publish(`flower/${deviceId}/down/cmd`, payload, { qos: 1 }, err => {
+    if (err) { statusEl.textContent = '✗ ' + err.message; statusEl.style.color = '#fc8181'; }
+    else {
+      statusEl.textContent = '⬆ OTA 指令已发送，等待设备响应…';
+      statusEl.style.color = '#ed8936';
+      toast(`OTA → ${deviceId}`);
+    }
+  });
+}
+
+// ── OTA: handle CommandResponse ───────────────────────────────────────────────
+function handleCmdResponse(deviceId, payload) {
+  const cr = CommandResponse.decode(payload);
+  if (cr.payload !== 'ota') return;
+  const ota = cr.ota;
+  const el  = document.getElementById('ota-' + deviceId);
+  if (!el) return;
+  switch (ota.status) {
+    case 0: el.textContent = '⬇ 开始下载固件…';             el.style.color = '#ed8936'; break;
+    case 1: el.textContent = `⬇ 下载中 ${ota.progress}%`;  el.style.color = '#4299e1'; break;
+    case 2: el.textContent = '✓ OTA 成功，设备重启中…';      el.style.color = '#48bb78'; break;
+    case 3: el.textContent = `✗ OTA 失败：${ota.message || '未知'}`; el.style.color = '#fc8181'; break;
+  }
+}
+
 // ── Logout ────────────────────────────────────────────────────────────────────
 document.getElementById('logout-btn').addEventListener('click', () => {
   if (mqttClient) { mqttClient.end(true); mqttClient = null; }
-  accessToken = ''; userSub = ''; myDevices = [];
+  accessToken = ''; userSub = ''; myDevices = []; firmwareList = [];
   localStorage.removeItem('flower_user');
   localStorage.removeItem('flower_backend');
   document.getElementById('inp-user').value    = 'floweruser0';

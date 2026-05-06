@@ -19,6 +19,8 @@ idf_component_register(
         esp_adc
         lwip
         nanopb
+        esp_https_ota
+        app_update
 )
 
 target_link_libraries(${COMPONENT_LIB} m)

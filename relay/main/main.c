@@ -5,14 +5,15 @@
  *   1. WiFi STA + NTP time sync
  *   2. HMAC-SHA256 MQTT credentials (clientId{id}timestamp{ms})
  *   3. MQTT 5.0 with User Property {"project","flower"} on CONNECT
- *   4. nanopb: receives relay_control commands; sends status_report + cmd_response
+ *   4. nanopb: receives relay_control/ota commands; sends status_report + cmd_response
  *   5. GPIO: relay (pin 4, active-low), button (pin 9), breathing LED (pin 3)
  *   6. HTTP server: GET /change_relay1[?duration=ms]
+ *   7. OTA: HTTPS firmware update triggered via MQTT OtaCommand
  *
  * Topics:
- *   sub  flower/{DEVICE_ID}/down/command
+ *   sub  flower/{DEVICE_ID}/down/cmd
  *   pub  flower/{DEVICE_ID}/up/status
- *   pub  flower/{DEVICE_ID}/up/command_response
+ *   pub  flower/{DEVICE_ID}/up/cmd_response
  */
 
 #include <string.h>
@@ -38,6 +39,8 @@
 #include "esp_adc/adc_oneshot.h"
 
 #include "esp_http_server.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
 
 #include "mqtt_client.h"
 #include "mqtt5_client.h"
@@ -173,11 +176,11 @@ static void calc_signature(int64_t ts_ms, const char *device_id,
 }
 
 /* ── nanopb publish helpers ──────────────────────────────────────────────── */
-static void publish_cmd_resp(void)
+static void publish_resp(const flower_command_response_t *resp)
 {
     uint8_t buf[128];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    if (!pb_encode(&stream, &flower_command_response_t_msg, &s_resp)) {
+    if (!pb_encode(&stream, &flower_command_response_t_msg, resp)) {
         ESP_LOGE(TAG, "resp encode: %s", PB_GET_ERROR(&stream));
         return;
     }
@@ -191,12 +194,91 @@ static void send_relay_resp(bool success)
     s_resp.which_payload = FLOWER_COMMAND_RESPONSE_RELAY_CONTROL_TAG;
     s_resp.payload.relay_control.result =
         success ? FLOWER_CMD_RESULT_OK : FLOWER_CMD_RESULT_BUSY;
-    publish_cmd_resp();
+    publish_resp(&s_resp);
 }
 
-static void send_unsupported_resp(pb_size_t which_cmd)
+/* ── OTA ─────────────────────────────────────────────────────────────────── */
+#define OTA_URL_MAX    256
+#define OTA_TASK_STACK 8192
+
+static QueueHandle_t  s_ota_url_queue   = NULL;
+static volatile bool  s_ota_in_progress = false;
+
+static void publish_ota_status(flower_ota_status_t status, int32_t progress,
+                                const char *msg)
 {
-    ESP_LOGW(TAG, "Unknown cmd tag=%d, no response", (int)which_cmd);
+    flower_command_response_t resp = FLOWER_COMMAND_RESPONSE_INIT_ZERO;
+    resp.which_payload             = FLOWER_COMMAND_RESPONSE_OTA_TAG;
+    resp.payload.ota.status        = status;
+    resp.payload.ota.progress      = progress;
+    if (msg)
+        strncpy(resp.payload.ota.message, msg, sizeof(resp.payload.ota.message) - 1);
+    publish_resp(&resp);
+}
+
+static void ota_task(void *arg)
+{
+    char url[OTA_URL_MAX];
+    for (;;) {
+        xQueueReceive(s_ota_url_queue, url, portMAX_DELAY);
+        s_ota_in_progress = true;
+
+        ESP_LOGI(TAG, "OTA starting: %s", url);
+        publish_ota_status(FLOWER_OTA_STATUS_OTA_STARTED, 0, NULL);
+
+        esp_http_client_config_t http_cfg = {
+            .url                        = url,
+            .timeout_ms                 = 30000,
+            .keep_alive_enable          = true,
+            .skip_cert_common_name_check = true,
+        };
+        esp_https_ota_config_t ota_cfg = { .http_config = &http_cfg };
+
+        esp_https_ota_handle_t handle = NULL;
+        esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA begin: %s", esp_err_to_name(err));
+            publish_ota_status(FLOWER_OTA_STATUS_OTA_FAILED, 0, esp_err_to_name(err));
+            s_ota_in_progress = false;
+            continue;
+        }
+
+        int img_size   = esp_https_ota_get_image_size(handle);
+        int last_pct10 = -1;
+
+        while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            if (img_size > 0) {
+                int read = esp_https_ota_get_image_len_read(handle);
+                int pct  = (int)((int64_t)read * 100 / img_size);
+                int bucket = pct / 10;
+                if (bucket != last_pct10) {
+                    last_pct10 = bucket;
+                    publish_ota_status(FLOWER_OTA_STATUS_OTA_PROGRESS, pct, NULL);
+                }
+            }
+        }
+
+        if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
+            ESP_LOGE(TAG, "OTA download: %s", esp_err_to_name(err));
+            esp_https_ota_abort(handle);
+            publish_ota_status(FLOWER_OTA_STATUS_OTA_FAILED, 0, esp_err_to_name(err));
+            s_ota_in_progress = false;
+            continue;
+        }
+
+        err = esp_https_ota_finish(handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA finish: %s", esp_err_to_name(err));
+            publish_ota_status(FLOWER_OTA_STATUS_OTA_FAILED, 0, esp_err_to_name(err));
+            s_ota_in_progress = false;
+            continue;
+        }
+
+        publish_ota_status(FLOWER_OTA_STATUS_OTA_SUCCESS, 100, NULL);
+        ESP_LOGI(TAG, "OTA done, restarting in 2 s");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    }
 }
 
 /* ── MQTT message handler ────────────────────────────────────────────────── */
@@ -209,34 +291,50 @@ static void handle_mqtt_data(const char *data, int data_len)
         return;
     }
 
-    if (s_cmd.which_payload != FLOWER_COMMAND_RELAY_CONTROL_TAG) {
-        send_unsupported_resp(s_cmd.which_payload);
-        return;
-    }
-
-    flower_relay_control_t *rc = &s_cmd.payload.relay_control;
-    if (rc->on) {
-        if (s_relay_on) {
-            ESP_LOGW(TAG, "Relay already ON, ignoring command");
-            send_relay_resp(false);
-            return;
-        }
-        gpio_set_level(RELAY_PIN, 0);
-        s_relay_on_us = esp_timer_get_time();
-        if (rc->duration_ms > 0) {
-            s_relay_duration = rc->duration_ms;
-            s_relay_on = true;
+    switch (s_cmd.which_payload) {
+    case FLOWER_COMMAND_RELAY_CONTROL_TAG: {
+        flower_relay_control_t *rc = &s_cmd.payload.relay_control;
+        if (rc->on) {
+            if (s_relay_on) {
+                ESP_LOGW(TAG, "Relay already ON, ignoring command");
+                send_relay_resp(false);
+                break;
+            }
+            gpio_set_level(RELAY_PIN, 0);
+            s_relay_on_us = esp_timer_get_time();
+            if (rc->duration_ms > 0) {
+                s_relay_duration = rc->duration_ms;
+                s_relay_on = true;
+            } else {
+                s_relay_on = false; /* duration_ms=0: no auto-off */
+            }
         } else {
-            s_relay_on = false; /* duration_ms=0: no auto-off */
+            gpio_set_level(RELAY_PIN, 1);
+            s_relay_on = false;
         }
-    } else {
-        gpio_set_level(RELAY_PIN, 1);
-        s_relay_on = false;
+        send_relay_resp(true);
+        ESP_LOGI(TAG, "Relay %s via MQTT (duration=%u ms)",
+                 rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
+        break;
+    }
+    case FLOWER_COMMAND_OTA_TAG: {
+        if (s_ota_in_progress) {
+            ESP_LOGW(TAG, "OTA already in progress, ignoring");
+            break;
+        }
+        if (s_cmd.payload.ota.url[0] == '\0') {
+            ESP_LOGE(TAG, "OTA: empty URL");
+            break;
+        }
+        if (xQueueSend(s_ota_url_queue, s_cmd.payload.ota.url, 0) != pdTRUE)
+            ESP_LOGE(TAG, "OTA queue full");
+        break;
+    }
+    default:
+        ESP_LOGW(TAG, "Unknown cmd tag=%d", (int)s_cmd.which_payload);
+        break;
     }
 
-    send_relay_resp(true);
-    ESP_LOGI(TAG, "Relay %s via MQTT (duration=%u ms)",
-             rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
 }
 
 static void publish_status_report(void)
@@ -254,7 +352,7 @@ static void publish_status_report(void)
     sr.has_version     = true;
     sr.version.major   = 1;
     sr.version.minor   = 0;
-    sr.version.patch   = 0;
+    sr.version.patch   = 2;
 
     uint8_t buf[FLOWER_STATUS_REPORT_SIZE];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
@@ -563,6 +661,10 @@ void app_main(void)
         .name            = "reconnect",
     };
     ESP_ERROR_CHECK(esp_timer_create(&rc_args, &s_reconnect_timer));
+
+    /* OTA task */
+    s_ota_url_queue = xQueueCreate(1, OTA_URL_MAX);
+    xTaskCreate(ota_task, "ota", OTA_TASK_STACK, NULL, 5, NULL);
 
     /* WiFi */
     wifi_init_sta();
