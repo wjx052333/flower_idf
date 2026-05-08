@@ -40,6 +40,11 @@ static const audio_codec_if_t        *s_mic_codec = NULL;
 static const audio_codec_gpio_if_t   *s_gpio_if = NULL;
 
 static SemaphoreHandle_t s_audio_mutex = NULL;
+static i2c_master_dev_handle_t s_io_expander_dev = NULL;
+
+/* CH32V003 register addresses (I2C addr 0x24) */
+#define CH32V003_DIR_REG    0x02
+#define CH32V003_OUT_REG    0x03
 
 /* ── Duplex I2S channel setup ──────────────────────────────────────────── */
 
@@ -277,6 +282,43 @@ esp_err_t audio_set_volume(int volume)
 {
     if (!s_spk_dev) return ESP_ERR_INVALID_STATE;
     return esp_codec_dev_set_out_vol(s_spk_dev, volume);
+}
+
+void audio_pa_init(i2c_master_bus_handle_t i2c_handle)
+{
+    i2c_device_config_t dev_cfg = {
+        .device_address = 0x24,
+        .scl_speed_hz   = 400000,
+    };
+    esp_err_t ret = i2c_master_bus_add_device(i2c_handle, &dev_cfg, &s_io_expander_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "IO expander not found (err %d) — PA control disabled", ret);
+        return;
+    }
+    /* Pins 0,1,2,4,5,6 → OUTPUT, pin 3 (camera PWDN) → INPUT (do NOT touch).
+       Pins 0,1,2,5,6 → HIGH, pin 4 → LOW (PA off initially). */
+    uint8_t dir[] = {CH32V003_DIR_REG, 0x77};
+    ret = i2c_master_transmit(s_io_expander_dev, dir, sizeof(dir), 100);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "IO expander DIR_REG write failed (%d) — PA control disabled", ret);
+        s_io_expander_dev = NULL;
+        return;
+    }
+    uint8_t out[] = {CH32V003_OUT_REG, 0x67};
+    ret = i2c_master_transmit(s_io_expander_dev, out, sizeof(out), 100);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "IO expander OUT_REG write failed (%d) — PA control disabled", ret);
+        s_io_expander_dev = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "IO expander OK (CH32V003 @0x24), PA initially OFF");
+}
+
+void audio_pa_enable(bool enable)
+{
+    if (!s_io_expander_dev) return;
+    uint8_t data[] = {CH32V003_OUT_REG, enable ? 0x77 : 0x67};
+    i2c_master_transmit(s_io_expander_dev, data, sizeof(data), 100);
 }
 
 void audio_hw_deinit(void)

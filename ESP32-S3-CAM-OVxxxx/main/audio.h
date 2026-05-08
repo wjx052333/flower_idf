@@ -50,5 +50,11 @@ int audio_spk_write(const int16_t *data, int samples);
 /** Set speaker volume (0-100) */
 esp_err_t audio_set_volume(int volume);
 
+/** Initialize PA control via CH32V003 IO expander (I2C addr 0x24) */
+void audio_pa_init(i2c_master_bus_handle_t i2c_handle);
+
+/** Enable/disable speaker power amplifier */
+void audio_pa_enable(bool enable);
+
 /** Deinitialize audio hardware */
 void audio_hw_deinit(void);

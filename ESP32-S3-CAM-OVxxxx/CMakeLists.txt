@@ -4,6 +4,13 @@ cmake_minimum_required(VERSION 3.16)
 # Run flower_idf/relay/setup_proto.sh once first if not already done.
 list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../relay/components")
 
+# Include private sdkconfig defaults if present (gitignored — copy from sdkconfig.defaults
+# and fill in your WiFi + MQTT credentials)
+set(SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_SOURCE_DIR}/sdkconfig.defaults")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sdkconfig.defaults.private")
+    list(APPEND SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_SOURCE_DIR}/sdkconfig.defaults.private")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(cam_mqtt)
 
@@ -13,16 +20,6 @@ add_custom_target(touch_build_info ALL
     COMMENT "Refreshing build timestamp in build_info.c"
 )
 
-# IDF's partition system generates an empty srmodels.bin during cmake configure
-# (inside project() above). We must overwrite it POST_BUILD so it sticks.
-set(SRMODELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/srmodels.bin")
-if(EXISTS "${SRMODELS_SRC}")
-    add_custom_command(TARGET cam_mqtt.elf POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SRMODELS_SRC}"
-            "${CMAKE_BINARY_DIR}/srmodels/srmodels.bin"
-        COMMENT "Overwriting empty srmodels.bin with real model data (629 KB)"
-    )
-else()
-    message(WARNING "srmodels.bin not found in project root — run scripts/pack_models.py first")
-endif()
+# SR models are auto-packed by esp-sr's movemodel.py during build.
+# CONFIG_SR_WN_WN9_HIESP=y and CONFIG_SR_NSN_NSNET2=y in sdkconfig.defaults
+# tell movemodel.py which models to include in srmodels/srmodels.bin.

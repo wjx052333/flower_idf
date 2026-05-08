@@ -27,6 +27,9 @@ typedef struct {
     void (*on_uplink_opus)(const uint8_t *data, size_t len, uint64_t seq,
                            uint64_t timestamp_ms, bool is_eos, void *user_data);
 
+    /** Downlink TTS stream finished (EOS received from server). May be NULL. */
+    void (*on_downlink_eos)(void *user_data);
+
     void *user_data;
 } audio_pipeline_callbacks_t;
 

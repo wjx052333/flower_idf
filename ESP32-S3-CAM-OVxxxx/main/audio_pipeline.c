@@ -296,8 +296,14 @@ static esp_err_t afe_vc_init(void)
     int fetch_size = s_vc_iface->get_fetch_chunksize(s_vc_data);
     s_vc_feed_buf = heap_caps_malloc(s_vc_feed_chunksize * AFE_CHANNELS * sizeof(int16_t),
                                      MALLOC_CAP_SPIRAM);
-    s_vc_pcm_buf = heap_caps_malloc(SAMPLES_PER_FRAME * sizeof(int16_t),
-                                    MALLOC_CAP_SPIRAM);
+    /* pcm_buf must hold at least one AFE fetch chunk — fetch_size may exceed SAMPLES_PER_FRAME */
+    size_t pcm_buf_samples = (fetch_size > SAMPLES_PER_FRAME) ? (size_t)fetch_size * 2
+                                                               : (size_t)SAMPLES_PER_FRAME * 2;
+    s_vc_pcm_buf = heap_caps_malloc(pcm_buf_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    s_vc_pcm_buf_len = 0;
+    if (fetch_size > SAMPLES_PER_FRAME)
+        ESP_LOGW(TAG, "AFE(VC) fetch=%d > SAMPLES_PER_FRAME=%d, pcm_buf sized to %d",
+                 fetch_size, SAMPLES_PER_FRAME, (int)pcm_buf_samples);
     if (!s_vc_feed_buf || !s_vc_pcm_buf) {
         ESP_LOGE(TAG, "AFE(VC) buffer alloc failed");
         return ESP_ERR_NO_MEM;
@@ -491,6 +497,9 @@ static void playback_task(void *arg)
     audio_output_enable(true);
     audio_set_volume(80);
 
+    /* Enable speaker PA via IO expander — required for sound on this board */
+    audio_pa_enable(true);
+
     /* Startup chime — validates speaker chain (I2S TX → ES8311 → PA → speaker) */
     ESP_LOGI(TAG, "Startup chime: %d samples (%.0f ms)", STARTUP_CHIME_NUM_SAMPLES,
              (STARTUP_CHIME_NUM_SAMPLES * 1000) / SAMPLE_RATE);
@@ -525,7 +534,7 @@ static void playback_task(void *arg)
             continue;
         }
         if (out.decoded_size > 0) {
-            ESP_LOGI(TAG, "Opus → %u B PCM (%u Hz %u ch)",
+            ESP_LOGD(TAG, "Opus → %u B PCM (%u Hz %u ch)",
                      (unsigned)out.decoded_size, (unsigned)dec_info.sample_rate,
                      (unsigned)dec_info.channel);
             int wr = audio_spk_write(pcm.pcm, SAMPLES_PER_FRAME);
@@ -649,24 +658,23 @@ esp_err_t audio_pipeline_feed_downlink(const uint8_t *opus_data, size_t len,
     if (!s_mutex || !s_opus_dec) return ESP_ERR_INVALID_STATE;
 
     if (is_eos) {
+        bool was_speaking = false;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (s_mode == MODE_SPEAKING) {
             s_mode = MODE_LISTENING;
+            was_speaking = true;
             ESP_LOGI(TAG, "Downlink EOS → LISTENING");
         }
         xSemaphoreGive(s_mutex);
+        if (was_speaking && s_cb.on_downlink_eos)
+            s_cb.on_downlink_eos(s_cb.user_data);
         return ESP_OK;
     }
 
     /* Stats-only messages have no opus_data — skip silently */
     if (!opus_data || len == 0) return ESP_OK;
 
-    ESP_LOGI(TAG, "Decode downlink: len=%u, data=%02X %02X %02X %02X %02X %02X %02X %02X",
-             (unsigned)len,
-             len > 0 ? opus_data[0] : 0, len > 1 ? opus_data[1] : 0,
-             len > 2 ? opus_data[2] : 0, len > 3 ? opus_data[3] : 0,
-             len > 4 ? opus_data[4] : 0, len > 5 ? opus_data[5] : 0,
-             len > 6 ? opus_data[6] : 0, len > 7 ? opus_data[7] : 0);
+    ESP_LOGD(TAG, "Decode downlink: len=%u", (unsigned)len);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 

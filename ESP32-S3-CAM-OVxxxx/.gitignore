@@ -15,3 +15,6 @@ dependencies.lock
 factory/*.bin
 
 managed_components
+
+# Private credentials (copy from sdkconfig.defaults and fill in real values)
+sdkconfig.defaults.private

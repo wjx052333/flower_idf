@@ -524,15 +524,7 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         frame.stats.extra.funcs.decode       = decode_bytes_callback;
         frame.stats.extra.arg                = &ex_buf;
 
-        /* Hex dump first 24 bytes of raw protobuf for diagnostics */
-        ESP_LOGI(TAG, "Raw downlink: len=%u, hex=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-                 (unsigned)data_len,
-                 data_len > 0  ? data[0]  : 0, data_len > 1  ? data[1]  : 0,
-                 data_len > 2  ? data[2]  : 0, data_len > 3  ? data[3]  : 0,
-                 data_len > 4  ? data[4]  : 0, data_len > 5  ? data[5]  : 0,
-                 data_len > 6  ? data[6]  : 0, data_len > 7  ? data[7]  : 0,
-                 data_len > 8  ? data[8]  : 0, data_len > 9  ? data[9]  : 0,
-                 data_len > 10 ? data[10] : 0, data_len > 11 ? data[11] : 0);
+        ESP_LOGD(TAG, "Raw downlink: len=%u", (unsigned)data_len);
 
         pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)data, data_len);
         if (!pb_decode(&stream, &mqtt_agent_audio_frame_t_msg, &frame)) {
@@ -540,7 +532,7 @@ static void handle_mqtt_data(const char *topic, int topic_len,
             return;
         }
         if (!s_audio_pipeline_ok) return;
-        ESP_LOGI(TAG, "Decoded AF: seq=%llu eos=%d opus_len=%u",
+        ESP_LOGD(TAG, "Decoded AF: seq=%llu eos=%d opus_len=%u",
                  (unsigned long long)frame.seq, (int)frame.is_eos,
                  (unsigned)opus_buf.len);
         if (ts_buf.len > 0)
@@ -548,7 +540,7 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         if (llm_buf2.len > 0)
             ESP_LOGI(TAG, "  LLM: %.*s", (int)llm_buf2.len, llm_buf2.data);
         if (ex_buf.len > 0)
-            ESP_LOGI(TAG, "  Extra: %.*s", (int)ex_buf.len, ex_buf.data);
+            ESP_LOGD(TAG, "  Extra: %.*s", (int)ex_buf.len, ex_buf.data);
         audio_pipeline_feed_downlink(opus_buf.data, opus_buf.len, frame.is_eos);
         return;
     }
@@ -740,6 +732,15 @@ static void on_wake_word_detected(void *user_data)
     }
 }
 
+/* Called when downlink TTS EOS received — return to IDLE for wake-word detection */
+static void on_downlink_eos(void *user_data)
+{
+    ESP_LOGI(TAG, "Downlink TTS done → stop listening");
+    audio_pipeline_stop_listening();
+    /* Also notify auto_test if it is running */
+    auto_test_on_downlink_eos(user_data);
+}
+
 /* Called when VAD changes during listening */
 static void on_vad_state_change(bool speaking, void *user_data)
 {
@@ -875,6 +876,9 @@ void app_main(void)
     /* HTTP server */
     http_server_start();
 
+    /* IO expander (CH32V003 @0x24) — needed for PA control on this board */
+    audio_pa_init(s_i2c_bus);
+
     /* Audio hardware (ES8311 + ES7210 on shared I2C bus) */
     ret = audio_hw_init(s_i2c_bus);
     if (ret != ESP_OK) {
@@ -884,10 +888,11 @@ void app_main(void)
     /* Audio pipeline (dual AFE: SR wake word + VC voice communication, Opus codec) */
     if (ret == ESP_OK) {
         audio_pipeline_callbacks_t cb = {
-            .on_wake_word   = on_wake_word_detected,
-            .on_vad_change  = on_vad_state_change,
-            .on_uplink_opus = on_uplink_opus_ready,
-            .user_data      = NULL,
+            .on_wake_word      = on_wake_word_detected,
+            .on_vad_change     = on_vad_state_change,
+            .on_uplink_opus    = on_uplink_opus_ready,
+            .on_downlink_eos   = on_downlink_eos,
+            .user_data         = NULL,
         };
         ret = audio_pipeline_init(&cb);
         if (ret != ESP_OK)

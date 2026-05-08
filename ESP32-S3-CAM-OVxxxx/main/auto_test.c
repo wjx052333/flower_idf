@@ -16,6 +16,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -52,6 +53,7 @@ static esp_mqtt_client_handle_t s_client         = NULL;
 static const char              *s_topic_up_opus   = NULL;
 static const char              *s_topic_up_agent  = NULL;
 static const volatile bool     *s_mqtt_connected = NULL;
+static SemaphoreHandle_t        s_eos_sem         = NULL;
 
 /* ── Send helpers ─────────────────────────────────────────────────────────── */
 
@@ -86,7 +88,7 @@ static void publish_opus_frame(const uint8_t *frame, size_t len,
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
     if (!pb_encode(&stream, &mqtt_agent_audio_frame_t_msg, &af)) return;
     esp_mqtt_client_publish(s_client, s_topic_up_opus,
-                            (const char *)buf, (int)stream.bytes_written, 0, 0);
+                            (const char *)buf, (int)stream.bytes_written, 1, 0);
 }
 
 /* ── Stream pre-encoded Opus data ─────────────────────────────────────────── */
@@ -143,14 +145,19 @@ static void test_task(void *arg)
     stream_opus_packed(test_opus_tools, test_opus_tools_size, 0);
     ESP_LOGI(TAG, "Round 1 done");
 
-    /* Pause between rounds */
-    ESP_LOGI(TAG, "Pausing 50s...");
-    vTaskDelay(pdMS_TO_TICKS(50000));
+    /* Wait for Round 1 TTS EOS — server takes ~11s for LLM+TTS, cap at 30s */
+    ESP_LOGI(TAG, "Waiting for Round 1 TTS EOS...");
+    xSemaphoreTake(s_eos_sem, pdMS_TO_TICKS(30000));
+    vTaskDelay(pdMS_TO_TICKS(2000));  /* brief pause after playback ends */
 
     /* ════ Round 2: Multi-turn conversation ════ */
     ESP_LOGI(TAG, "══════ Round 2: Multi-turn Conversation ══════");
 
-    struct {
+    /* Re-establish agent session — Round 1 session terminated after 10s idle */
+    publish_agent_request(MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    const struct {
         const uint8_t *data;
         size_t         size;
         const char    *text;
@@ -165,8 +172,9 @@ static void test_task(void *arg)
         ESP_LOGI(TAG, "--- Turn %d: '%s' (%d bytes) ---",
                  i + 1, turns[i].text, (int)turns[i].size);
         global_seq = stream_opus_packed(turns[i].data, turns[i].size, global_seq);
-        ESP_LOGI(TAG, "Turn %d done, waiting for TTS response...", i + 1);
-        vTaskDelay(pdMS_TO_TICKS(4000));
+        ESP_LOGI(TAG, "Turn %d done, waiting for TTS EOS...", i + 1);
+        xSemaphoreTake(s_eos_sem, pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(1000));  /* brief pause between turns */
     }
     ESP_LOGI(TAG, "Round 2 done");
 
@@ -180,6 +188,13 @@ static void test_task(void *arg)
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
 
+void auto_test_on_downlink_eos(void *user_data)
+{
+    (void)user_data;
+    if (s_eos_sem)
+        xSemaphoreGive(s_eos_sem);
+}
+
 esp_err_t auto_test_start(esp_mqtt_client_handle_t client,
                           const volatile bool *mqtt_connected,
                           const char *topic_up_opus,
@@ -188,6 +203,9 @@ esp_err_t auto_test_start(esp_mqtt_client_handle_t client,
     if (!client || !mqtt_connected || !topic_up_opus || !topic_up_agent)
         return ESP_ERR_INVALID_ARG;
 
+    s_eos_sem = xSemaphoreCreateBinary();
+    if (!s_eos_sem) return ESP_ERR_NO_MEM;
+
     s_client         = client;
     s_mqtt_connected = mqtt_connected;
     s_topic_up_opus  = topic_up_opus;
@@ -195,6 +213,8 @@ esp_err_t auto_test_start(esp_mqtt_client_handle_t client,
 
     if (xTaskCreate(test_task, "auto_test", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create auto_test task");
+        vSemaphoreDelete(s_eos_sem);
+        s_eos_sem = NULL;
         return ESP_ERR_NO_MEM;
     }
 
