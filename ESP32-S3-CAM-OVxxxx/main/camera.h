@@ -2,7 +2,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "driver/i2c_master.h"
 
+/* Init camera with existing I2C bus (shared with audio codecs).
+ * Pass NULL i2c to use default port-0 internal bus. */
+esp_err_t camera_init_with_i2c(i2c_master_bus_handle_t i2c_handle);
 esp_err_t camera_init(void);
 bool      camera_is_ready(void);
 

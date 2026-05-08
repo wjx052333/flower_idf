@@ -74,6 +74,14 @@ Replace `COM<N>` with your serial port (Windows: `COM3`, Linux/Mac: `/dev/ttyUSB
 idf.py -p COM<N> flash monitor
 ```
 
+### Flash SR models (required for wake word + noise suppression)
+
+```bash
+esptool.py --chip esp32s3 write_flash 0x7E0000 srmodels.bin
+```
+
+Pack the models first with `scripts/pack_models.py` (see section 9).
+
 Press `Ctrl+]` to exit the monitor.
 
 ## 4. Provision device identity
@@ -180,5 +188,24 @@ CONFIG_CAM_D0_PIN=45  # ... D7
 | phy_init  | 0x00F000   | 4 KB     | RF calibration |
 | fctry     | 0x010000   | 4 KB     | Device identity (device_id, device_secret) |
 | otadata   | 0x011000   | 8 KB     | OTA boot selection |
-| ota_0     | 0x020000   | 7.9375 MB | App slot 0 |
-| ota_1     | 0x810000   | 7.9375 MB | App slot 1 |
+| ota_0     | 0x020000   | 3.875 MB | App slot 0 |
+| ota_1     | 0x400000   | 3.875 MB | App slot 1 |
+| model     | 0x7E0000   | 8.125 MB | SR models (WakeNet + NSNet, raw mmap) |
+
+## 9. SR models
+
+The audio pipeline requires two models:
+- **WakeNet** (`wn9_hiesp`) — "Hi ESP" wake word detection in IDLE mode
+- **NSNet** (`nsnet2`) — noise suppression in LISTENING mode
+
+Both come bundled with the esp-sr component. To pack and flash:
+
+```bash
+cd C:\temp\esp32\test\livekit_mqtt_cpp
+
+# Pack models into srmodels.bin
+python client/esp32/flower_idf/ESP32-S3-CAM-OVxxxx/scripts/pack_models.py
+
+# Flash to the model partition
+esptool.py --chip esp32s3 write_flash 0x7E0000 srmodels.bin
+```

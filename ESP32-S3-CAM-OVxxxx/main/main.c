@@ -9,11 +9,15 @@
  *   5. OV5640 DVP camera via esp_video / V4L2
  *   6. Snapshot: JPEG capture + HTTP PUT to pre-signed URL
  *   7. OTA: HTTPS firmware update triggered via MQTT OtaCommand
+ *   8. Voice intercom: Opus encode/decode, MQTT-based duplex audio
  *
  * Topics:
  *   sub  flower/{DEVICE_ID}/down/cmd       — Command protobuf (snapshot / ota)
+ *   sub  flower/{DEVICE_ID}/down/opus      — AudioFrame (TTS audio from server)
  *   pub  flower/{DEVICE_ID}/up/status      — periodic StatusReport
  *   pub  flower/{DEVICE_ID}/up/cmd_response — CommandResponse (snapshot / ota)
+ *   pub  flower/{DEVICE_ID}/up/opus        — AudioFrame (mic audio to server)
+ *   pub  flower/{DEVICE_ID}/up/agent_request — AgentRequest (CHAT / STOP / INTERRUPT)
  */
 
 #include <string.h>
@@ -21,6 +25,10 @@
 #include <stdint.h>
 #include <time.h>
 #include "camera.h"
+#include "audio.h"
+#include "audio_pipeline.h"
+#include "auto_test.h"
+#include "build_info.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,6 +43,9 @@
 #include "esp_sntp.h"
 #include "nvs_flash.h"
 
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+
 #include "mqtt_client.h"
 #include "mqtt5_client.h"
 #include "esp_http_client.h"
@@ -48,6 +59,48 @@
 #include "pb_encode.h"
 #include "pb_decode.h"
 #include "proto/flower.pb.h"
+#include "proto/mqtt_agent.pb.h"
+
+/* ── Nanopb bytes callback helpers ───────────────────────────────────── */
+
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+    size_t   cap;
+} bytes_buf_t;
+
+static bool encode_bytes_callback(pb_ostream_t *stream, const pb_field_t *field,
+                                   void *const *arg)
+{
+    const bytes_buf_t *buf = (const bytes_buf_t *)(*arg);
+    if (!pb_encode_tag_for_field(stream, field)) return false;
+    return pb_encode_string(stream, buf->data, buf->len);
+}
+
+static bool decode_bytes_callback(pb_istream_t *stream, const pb_field_t *field,
+                                   void **arg)
+{
+    bytes_buf_t *buf = (bytes_buf_t *)(*arg);
+    size_t field_len = stream->bytes_left;
+    if (field_len > buf->cap) return false;
+    if (!pb_read(stream, buf->data, field_len)) return false;
+    buf->len = field_len;
+    return true;
+}
+
+/* Compatible no-op decode callback matching nanopb's decode function signature */
+static bool noop_decode(pb_istream_t *stream, const pb_field_t *field, void **arg)
+{
+    (void)stream; (void)field; (void)arg;
+    return true;
+}
+
+/* Compatible no-op encode callback matching nanopb's encode function signature */
+static bool noop_encode(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
+{
+    (void)stream; (void)field; (void)arg;
+    return true;
+}
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
@@ -67,9 +120,16 @@ static char g_device_secret[128];
 static char s_topic_cmd[96];
 static char s_topic_status[96];
 static char s_topic_cmd_resp[96];
+static char s_topic_down_opus[96];
+static char s_topic_up_opus[96];
+static char s_topic_up_agent[96];
+
+/* ── Shared I2C bus ─────────────────────────────────────────────────────── */
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
 #define STATUS_INTERVAL_MS  30000
+#define BOOT_BUTTON_GPIO    GPIO_NUM_0
 
 #define TAG "CamMqtt"
 
@@ -79,6 +139,7 @@ static EventGroupHandle_t       s_wifi_event_group;
 
 static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
 static volatile bool            s_mqtt_connected = false;
+static volatile bool            s_audio_pipeline_ok = false;
 
 static flower_command_t         s_cmd;
 
@@ -134,9 +195,12 @@ static void device_identity_init(void)
     ESP_LOGI(TAG, "Identity loaded: id=%s", g_device_id);
 
 build_topics:
-    snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
-    snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
-    snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
+    snprintf(s_topic_cmd,       sizeof(s_topic_cmd),       "flower/%s/down/cmd",  g_device_id);
+    snprintf(s_topic_status,    sizeof(s_topic_status),    "flower/%s/up/status", g_device_id);
+    snprintf(s_topic_cmd_resp,  sizeof(s_topic_cmd_resp),  "flower/%s/up/cmd_response", g_device_id);
+    snprintf(s_topic_down_opus, sizeof(s_topic_down_opus), "flower/%s/down/opus", g_device_id);
+    snprintf(s_topic_up_opus,   sizeof(s_topic_up_opus),   "flower/%s/up/opus",   g_device_id);
+    snprintf(s_topic_up_agent,  sizeof(s_topic_up_agent),  "flower/%s/up/agent_request", g_device_id);
 }
 
 /* ── Status report ───────────────────────────────────────────────────────── */
@@ -439,6 +503,55 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         }
         return;
     }
+
+    /* down/opus topic — voice intercom downlink */
+    if (topic_len == (int)strlen(s_topic_down_opus) &&
+        memcmp(topic, s_topic_down_opus, topic_len) == 0) {
+        mqtt_agent_audio_frame_t frame = MQTT_AGENT_AUDIO_FRAME_INIT_ZERO;
+        uint8_t opus_raw[256];
+        bytes_buf_t opus_buf = { .data = opus_raw, .cap = sizeof(opus_raw) };
+        frame.opus_data.funcs.decode = decode_bytes_callback;
+        frame.opus_data.arg = &opus_buf;
+
+        uint8_t transcript_buf[256], llm_buf[1024], extra_buf[256];
+        bytes_buf_t ts_buf  = { .data = transcript_buf, .cap = sizeof(transcript_buf) };
+        bytes_buf_t llm_buf2 = { .data = llm_buf,       .cap = sizeof(llm_buf) };
+        bytes_buf_t ex_buf   = { .data = extra_buf,     .cap = sizeof(extra_buf) };
+        frame.stats.transcript.funcs.decode   = decode_bytes_callback;
+        frame.stats.transcript.arg            = &ts_buf;
+        frame.stats.llm_response.funcs.decode = decode_bytes_callback;
+        frame.stats.llm_response.arg          = &llm_buf2;
+        frame.stats.extra.funcs.decode       = decode_bytes_callback;
+        frame.stats.extra.arg                = &ex_buf;
+
+        /* Hex dump first 24 bytes of raw protobuf for diagnostics */
+        ESP_LOGI(TAG, "Raw downlink: len=%u, hex=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                 (unsigned)data_len,
+                 data_len > 0  ? data[0]  : 0, data_len > 1  ? data[1]  : 0,
+                 data_len > 2  ? data[2]  : 0, data_len > 3  ? data[3]  : 0,
+                 data_len > 4  ? data[4]  : 0, data_len > 5  ? data[5]  : 0,
+                 data_len > 6  ? data[6]  : 0, data_len > 7  ? data[7]  : 0,
+                 data_len > 8  ? data[8]  : 0, data_len > 9  ? data[9]  : 0,
+                 data_len > 10 ? data[10] : 0, data_len > 11 ? data[11] : 0);
+
+        pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)data, data_len);
+        if (!pb_decode(&stream, &mqtt_agent_audio_frame_t_msg, &frame)) {
+            ESP_LOGW(TAG, "Downlink AudioFrame decode: %s", PB_GET_ERROR(&stream));
+            return;
+        }
+        if (!s_audio_pipeline_ok) return;
+        ESP_LOGI(TAG, "Decoded AF: seq=%llu eos=%d opus_len=%u",
+                 (unsigned long long)frame.seq, (int)frame.is_eos,
+                 (unsigned)opus_buf.len);
+        if (ts_buf.len > 0)
+            ESP_LOGI(TAG, "  STT: %.*s", (int)ts_buf.len, ts_buf.data);
+        if (llm_buf2.len > 0)
+            ESP_LOGI(TAG, "  LLM: %.*s", (int)llm_buf2.len, llm_buf2.data);
+        if (ex_buf.len > 0)
+            ESP_LOGI(TAG, "  Extra: %.*s", (int)ex_buf.len, ex_buf.data);
+        audio_pipeline_feed_downlink(opus_buf.data, opus_buf.len, frame.is_eos);
+        return;
+    }
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -469,7 +582,9 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         s_mqtt_connected = true;
         esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd, 1);
-        ESP_LOGI(TAG, "MQTT connected, sub: %s", s_topic_cmd);
+        esp_mqtt_client_subscribe(s_mqtt_client, s_topic_down_opus, 1);
+        ESP_LOGI(TAG, "MQTT connected, sub: %s + %s",
+                 s_topic_cmd, s_topic_down_opus);
         publish_status_report();
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -573,9 +688,121 @@ static void wifi_init_sta(void)
                         pdFALSE, pdTRUE, portMAX_DELAY);
 }
 
+/* ── Audio pipeline callbacks ─────────────────────────────────────────────── */
+
+/* Called by audio_pipeline when encoded Opus packet is ready */
+static void on_uplink_opus_ready(const uint8_t *data, size_t len,
+                                  uint64_t seq, uint64_t timestamp_ms,
+                                  bool is_eos, void *user_data)
+{
+    mqtt_agent_audio_frame_t frame = MQTT_AGENT_AUDIO_FRAME_INIT_ZERO;
+    frame.seq          = seq;
+    frame.timestamp_ms = timestamp_ms;
+    frame.is_eos       = is_eos;
+
+    uint8_t buf[512];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+
+    if (!is_eos && data) {
+        bytes_buf_t opus_buf = { .data = (uint8_t *)data, .len = len };
+        frame.opus_data.funcs.encode = encode_bytes_callback;
+        frame.opus_data.arg = &opus_buf;
+    }
+
+    if (!pb_encode(&stream, &mqtt_agent_audio_frame_t_msg, &frame)) {
+        ESP_LOGE(TAG, "AudioFrame encode: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_up_opus,
+                            (const char *)buf, (int)stream.bytes_written, 1, 0);
+}
+
+/* Called when wake word detected */
+static void on_wake_word_detected(void *user_data)
+{
+    ESP_LOGI(TAG, "Wake word detected → start listening");
+    if (audio_pipeline_is_listening()) {
+        ESP_LOGW(TAG, "Already listening, ignoring wake word");
+        return;
+    }
+    audio_pipeline_start_listening();
+
+    /* Publish AgentRequest(CHAT) */
+    mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
+    req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT;
+    req.chat_id.funcs.encode = noop_encode;
+
+    uint8_t buf[32];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
+        esp_mqtt_client_publish(s_mqtt_client, s_topic_up_agent,
+                                (const char *)buf, (int)stream.bytes_written, 1, 0);
+    }
+}
+
+/* Called when VAD changes during listening */
+static void on_vad_state_change(bool speaking, void *user_data)
+{
+    ESP_LOGI(TAG, "VAD: %s", speaking ? "SPEECH" : "SILENCE");
+}
+
+/* ── Button task ─────────────────────────────────────────────────────────── */
+static void button_task(void *arg)
+{
+    gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    int stable_level = 1;
+    int debounce_cnt = 0;
+    for (;;) {
+        int level = gpio_get_level(BOOT_BUTTON_GPIO);
+        if (level == stable_level) {
+            debounce_cnt = 0;
+        } else {
+            debounce_cnt++;
+            if (debounce_cnt >= 3) {  /* 3 × 10ms = 30ms debounce */
+                stable_level = level;
+                debounce_cnt = 0;
+                if (stable_level == 0) {
+                    /* Button pressed — toggle listening */
+                    if (audio_pipeline_is_listening()) {
+                        audio_pipeline_stop_listening();
+
+                        /* Publish AgentRequest(STOP) */
+                        mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
+                        req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_STOP;
+                        req.chat_id.funcs.encode = noop_encode;
+                        uint8_t buf[32];
+                        pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+                        if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
+                            esp_mqtt_client_publish(s_mqtt_client, s_topic_up_agent,
+                                                    (const char *)buf, (int)stream.bytes_written, 1, 0);
+                        }
+                    } else {
+                        audio_pipeline_start_listening();
+
+                        /* Publish AgentRequest(CHAT) */
+                        mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
+                        req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT;
+                        req.chat_id.funcs.encode = noop_encode;
+                        uint8_t buf[32];
+                        pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+                        if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
+                            esp_mqtt_client_publish(s_mqtt_client, s_topic_up_agent,
+                                                    (const char *)buf, (int)stream.bytes_written, 1, 0);
+                        }
+                    }
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Firmware built: %s", BUILD_TIMESTAMP);
     /*
      * esp_video_init() must be called EARLY — some cameras need XCLK before
      * the host finishes booting. We call it before WiFi to satisfy OV5640.
@@ -595,8 +822,21 @@ void app_main(void)
     nvs_flash_init_partition("fctry");
     device_identity_init();
 
-    /* Camera init — must be early */
-    ret = camera_init();
+    /* Shared I2C bus (SCL=7, SDA=8 — shared by camera SCCB + audio codecs) */
+    {
+        i2c_master_bus_config_t i2c_cfg = {
+            .i2c_port              = 1,
+            .scl_io_num            = GPIO_NUM_7,
+            .sda_io_num            = GPIO_NUM_8,
+            .clk_source            = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt     = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus));
+    }
+
+    /* Camera init — must be early, shares I2C bus */
+    ret = camera_init_with_i2c(s_i2c_bus);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed (%s) — continuing without camera",
                  esp_err_to_name(ret));
@@ -635,6 +875,30 @@ void app_main(void)
     /* HTTP server */
     http_server_start();
 
+    /* Audio hardware (ES8311 + ES7210 on shared I2C bus) */
+    ret = audio_hw_init(s_i2c_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Audio HW init failed — continuing without audio");
+    }
+
+    /* Audio pipeline (dual AFE: SR wake word + VC voice communication, Opus codec) */
+    if (ret == ESP_OK) {
+        audio_pipeline_callbacks_t cb = {
+            .on_wake_word   = on_wake_word_detected,
+            .on_vad_change  = on_vad_state_change,
+            .on_uplink_opus = on_uplink_opus_ready,
+            .user_data      = NULL,
+        };
+        ret = audio_pipeline_init(&cb);
+        if (ret != ESP_OK)
+            ESP_LOGE(TAG, "Audio pipeline init failed — continuing without audio");
+        else
+            s_audio_pipeline_ok = true;
+    }
+
+    /* Button task */
+    xTaskCreate(button_task, "button", 2048, NULL, 1, NULL);
+
     /* NTP */
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
@@ -652,6 +916,10 @@ void app_main(void)
 
     /* MQTT */
     mqtt_start();
+
+    /* Auto-test: streams pre-encoded Opus test utterances after MQTT connects */
+    auto_test_start(s_mqtt_client, &s_mqtt_connected,
+                    s_topic_up_opus, s_topic_up_agent);
 
     /* Idle */
     while (1) {
