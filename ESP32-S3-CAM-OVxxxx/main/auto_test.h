@@ -1,4 +1,5 @@
 #pragma once
+#include "sdkconfig.h"
 #include "esp_err.h"
 #include "mqtt_client.h"
 
@@ -20,6 +21,7 @@
  * @param topic_up_opus   Topic for uplink AudioFrame publish
  * @param topic_up_agent  Topic for AgentRequest publish
  */
+#ifdef CONFIG_AUTO_TEST
 esp_err_t auto_test_start(esp_mqtt_client_handle_t client,
                           const volatile bool *mqtt_connected,
                           const char *topic_up_opus,
@@ -27,3 +29,9 @@ esp_err_t auto_test_start(esp_mqtt_client_handle_t client,
 
 /** Register as audio_pipeline_callbacks_t.on_downlink_eos */
 void auto_test_on_downlink_eos(void *user_data);
+#else
+static inline esp_err_t auto_test_start(esp_mqtt_client_handle_t c,
+    const volatile bool *m, const char *o, const char *a)
+{ (void)c; (void)m; (void)o; (void)a; return ESP_OK; }
+static inline void auto_test_on_downlink_eos(void *u) { (void)u; }
+#endif

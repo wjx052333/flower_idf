@@ -41,7 +41,7 @@
 #define OPUS_FRAME_DURATION_MS  20
 #define SAMPLES_PER_FRAME       ((SAMPLE_RATE * OPUS_FRAME_DURATION_MS) / 1000)  // 320
 #define MAX_OPUS_PKT            256
-#define PLAYBACK_QUEUE_SIZE     8
+#define PLAYBACK_QUEUE_SIZE     32
 #define MIC_BUF_SIZE            (SAMPLES_PER_FRAME * 4)  /* 4ch raw */
 
 /* Logical channels fed to AFE: 1 MIC (ch0) + 1 REF (ch1) */
@@ -112,6 +112,9 @@ static uint64_t s_uplink_seq = 0;
 /* ── Playback ───────────────────────────────────────────────────────────── */
 
 static QueueHandle_t s_playback_queue = NULL;
+
+/* Set when downlink data arrives while in IDLE mode (auto_test bypass) */
+static bool s_downlink_data_received = false;
 
 /* ── Tasks ──────────────────────────────────────────────────────────────── */
 
@@ -202,25 +205,18 @@ static esp_err_t afe_sr_init(void)
         return ESP_FAIL;
     }
 
-    char *wn_name = esp_srmodel_filter(s_models, ESP_WN_PREFIX, NULL);
     ESP_LOGI(TAG, "srmodels count=%d, names:", s_models->num);
     for (int i = 0; i < s_models->num; i++)
         ESP_LOGI(TAG, "  [%d] '%s'", i, s_models->model_name[i]);
 
+    char *wn_name = esp_srmodel_filter(s_models, ESP_WN_PREFIX, NULL);
     if (!wn_name) {
         ESP_LOGE(TAG, "No WakeNet model found");
         return ESP_FAIL;
     }
-
-    /* Parse wake words (semicolon-separated) */
-    char *save = NULL;
-    char *token = strtok_r(wn_name, ";", &save);
-    while (token && s_wake_word_count < 4) {
-        strncpy(s_wake_words[s_wake_word_count], token, 31);
-        s_wake_word_count++;
-        token = strtok_r(NULL, ";", &save);
-    }
-    ESP_LOGI(TAG, "WakeNet: %s (%d words)", wn_name, s_wake_word_count);
+    strncpy(s_wake_words[0], wn_name, 31);
+    s_wake_word_count = 1;
+    ESP_LOGI(TAG, "WakeNet: %s", wn_name);
 
     /* Create AFE(SR) with AEC — format "MR" (1 MIC + 1 REF) */
     afe_config_t *cfg = afe_config_init("MR", s_models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
@@ -245,8 +241,9 @@ static esp_err_t afe_sr_init(void)
 
     s_sr_feed_chunksize = s_sr_iface->get_feed_chunksize(s_sr_data);
     int fetch_size = s_sr_iface->get_fetch_chunksize(s_sr_data);
-    s_sr_feed_buf = heap_caps_malloc(s_sr_feed_chunksize * AFE_CHANNELS * sizeof(int16_t),
-                                     MALLOC_CAP_SPIRAM);
+    s_sr_feed_buf = heap_caps_malloc(
+        (s_sr_feed_chunksize + SAMPLES_PER_FRAME) * AFE_CHANNELS * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM);
     if (!s_sr_feed_buf) {
         ESP_LOGE(TAG, "AFE(SR) feed buf alloc failed");
         return ESP_ERR_NO_MEM;
@@ -294,8 +291,9 @@ static esp_err_t afe_vc_init(void)
 
     s_vc_feed_chunksize = s_vc_iface->get_feed_chunksize(s_vc_data);
     int fetch_size = s_vc_iface->get_fetch_chunksize(s_vc_data);
-    s_vc_feed_buf = heap_caps_malloc(s_vc_feed_chunksize * AFE_CHANNELS * sizeof(int16_t),
-                                     MALLOC_CAP_SPIRAM);
+    s_vc_feed_buf = heap_caps_malloc(
+        (s_vc_feed_chunksize + SAMPLES_PER_FRAME) * AFE_CHANNELS * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM);
     /* pcm_buf must hold at least one AFE fetch chunk — fetch_size may exceed SAMPLES_PER_FRAME */
     size_t pcm_buf_samples = (fetch_size > SAMPLES_PER_FRAME) ? (size_t)fetch_size * 2
                                                                : (size_t)SAMPLES_PER_FRAME * 2;
@@ -331,7 +329,7 @@ static void mic_feed_task(void *arg)
 
         if (mode == MODE_IDLE) {
             /* Feed AFE(SR) for wake word */
-            if (s_sr_feed_buf_len + SAMPLES_PER_FRAME > s_sr_feed_chunksize * AFE_CHANNELS)
+            if (s_sr_feed_buf_len > s_sr_feed_chunksize * AFE_CHANNELS)
                 s_sr_feed_buf_len = 0;  /* overflow safety */
 
             extract_mic_ref(raw, SAMPLES_PER_FRAME,
@@ -347,7 +345,7 @@ static void mic_feed_task(void *arg)
             }
         } else {
             /* MODE_LISTENING or MODE_SPEAKING: feed AFE(VC) */
-            if (s_vc_feed_buf_len + SAMPLES_PER_FRAME > s_vc_feed_chunksize * AFE_CHANNELS)
+            if (s_vc_feed_buf_len > s_vc_feed_chunksize * AFE_CHANNELS)
                 s_vc_feed_buf_len = 0;
 
             extract_mic_ref(raw, SAMPLES_PER_FRAME,
@@ -658,15 +656,19 @@ esp_err_t audio_pipeline_feed_downlink(const uint8_t *opus_data, size_t len,
     if (!s_mutex || !s_opus_dec) return ESP_ERR_INVALID_STATE;
 
     if (is_eos) {
-        bool was_speaking = false;
+        bool fire_cb = false;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (s_mode == MODE_SPEAKING) {
             s_mode = MODE_LISTENING;
-            was_speaking = true;
+            fire_cb = true;
             ESP_LOGI(TAG, "Downlink EOS → LISTENING");
+        } else if (s_downlink_data_received) {
+            s_downlink_data_received = false;
+            fire_cb = true;
+            ESP_LOGI(TAG, "Downlink EOS (direct, mode stays IDLE)");
         }
         xSemaphoreGive(s_mutex);
-        if (was_speaking && s_cb.on_downlink_eos)
+        if (fire_cb && s_cb.on_downlink_eos)
             s_cb.on_downlink_eos(s_cb.user_data);
         return ESP_OK;
     }
@@ -681,6 +683,8 @@ esp_err_t audio_pipeline_feed_downlink(const uint8_t *opus_data, size_t len,
     if (s_mode == MODE_LISTENING) {
         s_mode = MODE_SPEAKING;
         ESP_LOGI(TAG, "Mode: LISTENING → SPEAKING (TTS playback)");
+    } else if (s_mode == MODE_IDLE) {
+        s_downlink_data_received = true;
     }
     xSemaphoreGive(s_mutex);
 

@@ -39,6 +39,9 @@ CONFIG_MQTT_BUFFER_SIZE=65536
 CONFIG_SR_WN_WN9_MIAOMIAOTONGXUE_TTS=y
 CONFIG_SR_NSN_NSNET2=y
 
+# Auto-test (disabled by default; set =y to enable MQTT voice test on boot)
+# CONFIG_AUTO_TEST=y
+
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 

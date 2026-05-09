@@ -11,6 +11,7 @@ Usage:
 
 import os
 import sys
+import wave
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv(str(_REPO_ROOT / "deploy" / ".env"))
 
 import asyncio
+import opuslib
 from mqtt_agent.plugins.tts import iFlytekTTS
 from mqtt_agent.pipeline import OpusEncoder
 
@@ -35,13 +37,47 @@ MAIN_DIR = OUTPUT_DIR.parent / "main"
 SAMPLE_RATE = 16000
 
 
+# ── Audio helpers ────────────────────────────────────────────────────────────
+
+def save_wav_16k(pcm_bytes: bytes, path: Path) -> None:
+    """Save raw int16 PCM (16kHz mono) as WAV."""
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm_bytes)
+
+
+def packed_to_wav_48k(data: bytes, path: Path) -> None:
+    """Decode packed Opus frames → WAV at 48kHz (Opus native rate, no resampling)."""
+    dec = opuslib.Decoder(48000, 1)
+    frames = []
+    pos = 0
+    while pos + 2 <= len(data):
+        n = data[pos] | (data[pos + 1] << 8)
+        pos += 2
+        if n == 0 or pos + n > len(data):
+            break
+        frames.append(dec.decode(bytes(data[pos:pos + n]), 960, decode_fec=False))
+        pos += n
+    pcm = b"".join(frames)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(48000)
+        w.writeframes(pcm)
+    print(f"    decoded: {path.name}  {len(pcm)/2/48000:.1f}s  {len(frames)} frames")
+
+
+# ── Opus packing helpers ─────────────────────────────────────────────────────
+
 def pcm_to_opus_frames(pcm: bytes, encoder: OpusEncoder) -> list[bytes]:
     """Encode PCM to a list of Opus frames."""
-    fs = encoder.frame_size  # 320 samples = 640 bytes for 20ms @ 16kHz
+    frame_bytes = encoder.frame_size * 2  # 320 samples * 2 bytes/sample = 640 bytes
     frames = []
-    for i in range(0, len(pcm), fs):
-        chunk = pcm[i : i + fs]
-        if len(chunk) < fs:
+    for i in range(0, len(pcm), frame_bytes):
+        chunk = pcm[i : i + frame_bytes]
+        if len(chunk) < frame_bytes:
             break
         opus = encoder.encode(chunk)
         if opus:
@@ -70,14 +106,15 @@ def flat_to_c_array(name: str, data: bytes, columns: int = 16) -> str:
     return "\n".join(lines)
 
 
-async def generate_utterance(text: str, tts: iFlytekTTS, encoder: OpusEncoder) -> bytes:
-    """Generate packed Opus stream for a text utterance."""
+async def generate_utterance(text: str, tts: iFlytekTTS,
+                             encoder: OpusEncoder) -> tuple[bytes, bytes]:
+    """Returns (packed_opus, raw_pcm_int16_16kHz)."""
     pcm = bytearray()
     async for chunk in tts.stream(text):
         pcm.extend(chunk.tobytes())
     frames = pcm_to_opus_frames(bytes(pcm), encoder)
     packed = opus_frames_to_flat(frames)
-    return packed
+    return packed, bytes(pcm)
 
 
 async def main():
@@ -90,26 +127,28 @@ async def main():
     )
     encoder = OpusEncoder(SAMPLE_RATE, 1)
 
-    # ── Generate tools inquiry ──
+    # ── Generate tools inquiry ──────────────────────────────────────────────
     print(f"Generating tools inquiry: '{TOOLS_QUESTION}'...")
-    tools_data = await generate_utterance(TOOLS_QUESTION, tts, encoder)
-    tools_path = OUTPUT_DIR / "test_tools_inquiry.opus"
-    with open(tools_path, "wb") as f:
-        f.write(tools_data)
-    print(f"  → {tools_path} ({len(tools_data)} bytes packed Opus)")
+    tools_data, tools_pcm = await generate_utterance(TOOLS_QUESTION, tts, encoder)
 
-    # ── Generate multiturn utterances ──
+    with open(OUTPUT_DIR / "test_tools_inquiry.opus", "wb") as f:
+        f.write(tools_data)
+    save_wav_16k(tools_pcm, OUTPUT_DIR / "test_tools_inquiry.wav")
+    print(f"  opus: {len(tools_data)} bytes  wav: {len(tools_pcm)/2/SAMPLE_RATE:.1f}s")
+
+    # ── Generate multiturn utterances ───────────────────────────────────────
     multiturn_data = []
     for i, text in enumerate(MULTITURN_DIALOG):
         print(f"Generating multiturn[{i}]: '{text}'...")
-        data = await generate_utterance(text, tts, encoder)
-        path = OUTPUT_DIR / f"test_multiturn_{i}.opus"
-        with open(path, "wb") as f:
-            f.write(data)
-        multiturn_data.append(data)
-        print(f"  → {path} ({len(data)} bytes packed Opus)")
+        data, pcm = await generate_utterance(text, tts, encoder)
 
-    # ── Generate test_opus_data.h ──
+        with open(OUTPUT_DIR / f"test_multiturn_{i}.opus", "wb") as f:
+            f.write(data)
+        save_wav_16k(pcm, OUTPUT_DIR / f"test_multiturn_{i}.wav")
+        multiturn_data.append(data)
+        print(f"  opus: {len(data)} bytes  wav: {len(pcm)/2/SAMPLE_RATE:.1f}s")
+
+    # ── Generate test_opus_data.h ───────────────────────────────────────────
     print("Generating test_opus_data.h...")
     header = """#pragma once
 #include <stdint.h>
@@ -134,9 +173,8 @@ extern const size_t  test_opus_multiturn_2_size;
 """
     with open(MAIN_DIR / "test_opus_data.h", "w", encoding="utf-8") as f:
         f.write(header)
-    print(f"  → {MAIN_DIR / 'test_opus_data.h'}")
 
-    # ── Generate test_opus_data.c ──
+    # ── Generate test_opus_data.c ───────────────────────────────────────────
     print("Generating test_opus_data.c...")
     parts = [
         '#include "test_opus_data.h"',
@@ -156,11 +194,20 @@ extern const size_t  test_opus_multiturn_2_size;
     ]
     with open(MAIN_DIR / "test_opus_data.c", "w", encoding="utf-8") as f:
         f.write("\n".join(parts))
-    print(f"  → {MAIN_DIR / 'test_opus_data.c'}")
 
-    # ── Summary ──
+    # ── Decode C arrays back to WAV (round-trip verification) ───────────────
+    print("Decoding C arrays → WAV (round-trip check, 48kHz)...")
+    all_items = [("test_opus_tools", tools_data)] + [
+        (f"test_opus_multiturn_{i}", multiturn_data[i]) for i in range(3)
+    ]
+    for name, data in all_items:
+        packed_to_wav_48k(data, MAIN_DIR / f"{name}_decoded.wav")
+
+    # ── Summary ─────────────────────────────────────────────────────────────
     total = len(tools_data) + sum(len(d) for d in multiturn_data)
-    print(f"\nDone! Total Opus data: {total} bytes ({total / 1024:.1f} KB)")
+    print(f"\nDone!  Opus total: {total} bytes ({total / 1024:.1f} KB)")
+    print(f"WAV source  → {OUTPUT_DIR}/*.wav  (TTS PCM, 16kHz)")
+    print(f"WAV decoded → {MAIN_DIR}/*_decoded.wav  (Opus round-trip, 48kHz)")
 
 
 if __name__ == "__main__":

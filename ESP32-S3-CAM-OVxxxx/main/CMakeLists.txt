@@ -1,12 +1,18 @@
+set(SRCS
+    "main.c"
+    "camera.c"
+    "audio.c"
+    "audio_pipeline.c"
+    "build_info.c"
+)
+
+if(CONFIG_AUTO_TEST)
+    list(APPEND SRCS "auto_test.c" "test_opus_data.c")
+endif()
+
 idf_component_register(
     SRCS
-        "main.c"
-        "camera.c"
-        "audio.c"
-        "audio_pipeline.c"
-        "build_info.c"
-        "auto_test.c"
-        "test_opus_data.c"
+        ${SRCS}
         "proto/flower.pb.c"
         "proto/mqtt_agent.pb.c"
     INCLUDE_DIRS

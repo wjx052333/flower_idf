@@ -140,20 +140,18 @@ static void test_task(void *arg)
 
     /* ════ Round 1: Tools inquiry ════ */
     ESP_LOGI(TAG, "══════ Round 1: Tools Inquiry ══════");
-    ESP_LOGI(TAG, "Sending: '你有哪些工具可以用' (%d bytes packed Opus)",
-             (int)test_opus_tools_size);
+    ESP_LOGI(TAG, "Sending: '你有哪些工具可以用' (%d bytes)", (int)test_opus_tools_size);
     stream_opus_packed(test_opus_tools, test_opus_tools_size, 0);
-    ESP_LOGI(TAG, "Round 1 done");
-
-    /* Wait for Round 1 TTS EOS — server takes ~11s for LLM+TTS, cap at 30s */
-    ESP_LOGI(TAG, "Waiting for Round 1 TTS EOS...");
-    xSemaphoreTake(s_eos_sem, pdMS_TO_TICKS(30000));
-    vTaskDelay(pdMS_TO_TICKS(2000));  /* brief pause after playback ends */
-
+    ESP_LOGI(TAG, "Round 1 done, waiting for TTS EOS...");
+    if (xSemaphoreTake(s_eos_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Round 1 TTS EOS timeout -- aborting test");
+        goto cleanup;
+    }
     /* ════ Round 2: Multi-turn conversation ════ */
     ESP_LOGI(TAG, "══════ Round 2: Multi-turn Conversation ══════");
 
-    /* Re-establish agent session — Round 1 session terminated after 10s idle */
+    //publish_agent_request(MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_STOP);
+    vTaskDelay(pdMS_TO_TICKS(20000));
     publish_agent_request(MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT);
     vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -173,12 +171,14 @@ static void test_task(void *arg)
                  i + 1, turns[i].text, (int)turns[i].size);
         global_seq = stream_opus_packed(turns[i].data, turns[i].size, global_seq);
         ESP_LOGI(TAG, "Turn %d done, waiting for TTS EOS...", i + 1);
-        xSemaphoreTake(s_eos_sem, pdMS_TO_TICKS(30000));
-        vTaskDelay(pdMS_TO_TICKS(1000));  /* brief pause between turns */
+        if (xSemaphoreTake(s_eos_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
+            ESP_LOGE(TAG, "Turn %d TTS EOS timeout -- aborting test", i + 1);
+            goto cleanup;
+        }
     }
-    ESP_LOGI(TAG, "Round 2 done");
+    ESP_LOGI(TAG, "Round 2 done -- all turns completed");
 
-    /* Cleanup */
+cleanup:
     publish_agent_request(MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_STOP);
     vTaskDelay(pdMS_TO_TICKS(1000));
 

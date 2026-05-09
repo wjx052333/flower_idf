@@ -12,6 +12,14 @@ config MQTT_BROKER_URI
     string "MQTT Broker URI"
     default ""
 
+config AUTO_TEST
+    bool "Enable automatic MQTT voice test on boot"
+    default n
+    help
+        When enabled, the device runs a pre-encoded Opus voice test sequence
+        after MQTT connects (tools inquiry + 3-turn conversation).
+        Disable for normal production use.
+
 menu "Camera DVP Pin Configuration"
     comment "Default values match the ESP32-S3-EYE / OV5640 DVP layout."
 
