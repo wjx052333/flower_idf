@@ -36,6 +36,15 @@
 
 #define TAG "AudioPipe"
 
+/* Heap bounds check — logs and aborts if a write would overflow */
+#define BOUNDS_ASSERT(_off, _cnt, _cap, _tag) do {           \
+    if ((_off) + (_cnt) > (_cap)) {                          \
+        ESP_LOGE(TAG, "%s OVERFLOW: off=%d cnt=%d cap=%d",  \
+                 (_tag), (int)(_off), (int)(_cnt), (int)(_cap)); \
+        assert(0 && (_tag));                                  \
+    }                                                        \
+} while(0)
+
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define SAMPLE_RATE             16000
@@ -85,6 +94,7 @@ static int                       s_wake_word_count = 0;
 
 static int16_t *s_sr_feed_buf = NULL;
 static size_t   s_sr_feed_buf_len = 0;
+static size_t   s_sr_feed_buf_cap = 0;   /* samples */
 static size_t   s_sr_feed_chunksize = 0;
 
 /* ── AFE(VC) — voice communication ──────────────────────────────────────── */
@@ -94,6 +104,7 @@ static esp_afe_sr_data_t        *s_vc_data  = NULL;
 
 static int16_t *s_vc_feed_buf = NULL;
 static size_t   s_vc_feed_buf_len = 0;
+static size_t   s_vc_feed_buf_cap = 0;   /* samples */
 static size_t   s_vc_feed_chunksize = 0;
 
 /* Output clean mono PCM accumulator */
@@ -126,11 +137,15 @@ static TaskHandle_t s_detect_task_hdl  = NULL;
 static TaskHandle_t s_process_task_hdl = NULL;
 static TaskHandle_t s_playback_task_hdl = NULL;
 
-/* Task stacks in PSRAM to conserve internal DRAM */
-#define MIC_FEED_STACK_BYTES 8192   /* raw I2S read + extract + AFE feed (raw[] = 2560B on stack) */
-#define DETECT_STACK_BYTES   8192   /* AFE SR fetch + wake word (ref: 02_esp_sr uses 8K) */
-#define PROCESS_STACK_BYTES  32768  /* AFE VC fetch (~8K) + Opus encode (~12K) + callback (~1K) */
-#define PLAYBACK_STACK_BYTES 12288  /* Opus decode + speaker write */
+/* mic_feed and detect task stacks MUST be in internal DRAM: esp-sr's TIE-based dl_tie728_memcpy
+ * uses the Xtensa hardware LOOP instruction; when a hardware interrupt fires mid-LOOP and the
+ * stack is in PSRAM (cache not always available in exception context), LBEG/LEND/LCOUNT are
+ * corrupted → LCOUNT=0xffffffff → infinite loop → MMU fault.
+ * process/playback stacks stay in PSRAM (Opus path does not use TIE LOOP) to save DRAM. */
+#define MIC_FEED_STACK_BYTES 16384  /* DRAM: I2S read + AFE SR/VC feed + TIE inference headroom */
+#define DETECT_STACK_BYTES   8192   /* DRAM: AFE SR fetch + wake word */
+#define PROCESS_STACK_BYTES  32768  /* PSRAM: AFE VC fetch (~8K) + Opus encode (~12K) + callback */
+#define PLAYBACK_STACK_BYTES 12288  /* PSRAM: Opus decode + speaker write */
 
 static StackType_t *s_mic_stack      = NULL;
 static StaticTask_t  s_mic_task_buf;
@@ -252,6 +267,7 @@ static esp_err_t afe_sr_init(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "AFE(SR) OK: feed=%d fetch=%d", (int)s_sr_feed_chunksize, fetch_size);
+    s_sr_feed_buf_cap = (s_sr_feed_chunksize + SAMPLES_PER_FRAME) * AFE_CHANNELS;
     return ESP_OK;
 }
 
@@ -309,7 +325,9 @@ static esp_err_t afe_vc_init(void)
         ESP_LOGE(TAG, "AFE(VC) buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "AFE(VC) OK: feed=%d fetch=%d", (int)s_vc_feed_chunksize, fetch_size);
+    ESP_LOGI(TAG, "AFE(VC) OK: feed=%d fetch=%d pcm_buf_cap=%d",
+             (int)s_vc_feed_chunksize, fetch_size, (int)pcm_buf_samples);
+    s_vc_feed_buf_cap = (s_vc_feed_chunksize + SAMPLES_PER_FRAME) * AFE_CHANNELS;
     return ESP_OK;
 }
 
@@ -337,6 +355,8 @@ static void mic_feed_task(void *arg)
             if (s_sr_feed_buf_len > s_sr_feed_chunksize * AFE_CHANNELS)
                 s_sr_feed_buf_len = 0;
 
+            BOUNDS_ASSERT(s_sr_feed_buf_len, SAMPLES_PER_FRAME * AFE_CHANNELS,
+                          s_sr_feed_buf_cap, "sr_feed");
             memcpy(s_sr_feed_buf + s_sr_feed_buf_len, raw,
                    SAMPLES_PER_FRAME * AFE_CHANNELS * sizeof(int16_t));
             s_sr_feed_buf_len += SAMPLES_PER_FRAME * AFE_CHANNELS;
@@ -353,6 +373,8 @@ static void mic_feed_task(void *arg)
             if (s_vc_feed_buf_len > s_vc_feed_chunksize * AFE_CHANNELS)
                 s_vc_feed_buf_len = 0;
 
+            BOUNDS_ASSERT(s_vc_feed_buf_len, SAMPLES_PER_FRAME * AFE_CHANNELS,
+                          s_vc_feed_buf_cap, "vc_feed");
             memcpy(s_vc_feed_buf + s_vc_feed_buf_len, raw,
                    SAMPLES_PER_FRAME * AFE_CHANNELS * sizeof(int16_t));
             s_vc_feed_buf_len += SAMPLES_PER_FRAME * AFE_CHANNELS;
@@ -453,11 +475,19 @@ static void process_task(void *arg)
 
         /* Accumulate clean mono PCM from AFE output */
         int fetch_samples = res->data_size / sizeof(int16_t);
+        if ((size_t)fetch_samples > s_vc_pcm_buf_cap) {
+            ESP_LOGE(TAG, "VC fetch_samples=%d > buf_cap=%d — AFE data_size=%d, skipping",
+                     fetch_samples, (int)s_vc_pcm_buf_cap, (int)res->data_size);
+            continue;
+        }
         if (s_vc_pcm_buf_len + (size_t)fetch_samples > s_vc_pcm_buf_cap) {
-            s_vc_pcm_buf_len = 0;  /* should never happen; guard against overflow */
+            ESP_LOGW(TAG, "VC pcm_buf overflow: len=%d + fetch=%d > cap=%d, discarding",
+                     (int)s_vc_pcm_buf_len, fetch_samples, (int)s_vc_pcm_buf_cap);
+            s_vc_pcm_buf_len = 0;
         }
         memcpy(s_vc_pcm_buf + s_vc_pcm_buf_len, res->data,
                fetch_samples * sizeof(int16_t));
+        BOUNDS_ASSERT(s_vc_pcm_buf_len, (size_t)fetch_samples, s_vc_pcm_buf_cap, "vc_pcm");
         s_vc_pcm_buf_len += fetch_samples;
 
         /* Encode when we have enough for one Opus frame */
@@ -477,6 +507,11 @@ static void process_task(void *arg)
                 .len    = (uint32_t)s_enc_out_size,
             };
             esp_audio_err_t ret = esp_opus_enc_process(s_opus_enc, &in, &out);
+            if (out.encoded_bytes > (uint32_t)s_enc_out_size) {
+                ESP_LOGE(TAG, "Opus enc overflow: encoded=%d cap=%d",
+                         (int)out.encoded_bytes, s_enc_out_size);
+                assert(0 && "opus_enc_overflow");
+            }
             if (ret == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0) {
                 if (out.encoded_bytes < 10) {
                     ESP_LOGW(TAG, "Tiny Opus frame seq=%" PRIu64 " len=%d (DTX/silence)",
@@ -602,7 +637,7 @@ esp_err_t audio_pipeline_init(const audio_pipeline_callbacks_t *callbacks)
 
     /* Start background tasks — all stacks in PSRAM to conserve internal DRAM */
     s_running = true;
-    s_mic_stack = heap_caps_malloc(MIC_FEED_STACK_BYTES, MALLOC_CAP_SPIRAM);
+    s_mic_stack = heap_caps_malloc(MIC_FEED_STACK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s_mic_stack) {
         s_mic_task_hdl = xTaskCreateStaticPinnedToCore(
             mic_feed_task, "mic_feed", MIC_FEED_STACK_BYTES,
@@ -613,7 +648,7 @@ esp_err_t audio_pipeline_init(const audio_pipeline_callbacks_t *callbacks)
         s_running = false;
         return ESP_ERR_NO_MEM;
     }
-    s_detect_stack = heap_caps_malloc(DETECT_STACK_BYTES, MALLOC_CAP_SPIRAM);
+    s_detect_stack = heap_caps_malloc(DETECT_STACK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s_detect_stack) {
         s_detect_task_hdl = xTaskCreateStaticPinnedToCore(
             detect_task, "afe_det", DETECT_STACK_BYTES,

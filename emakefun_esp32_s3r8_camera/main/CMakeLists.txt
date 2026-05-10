@@ -1,0 +1,28 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "camera.c"
+        "build_info.c"
+        "proto/flower.pb.c"
+    INCLUDE_DIRS
+        "."
+        "proto"
+    REQUIRES
+        esp_wifi
+        esp_event
+        nvs_flash
+        esp_mqtt
+        mbedtls
+        esp_timer
+        esp_driver_cam
+        esp_driver_i2c
+        esp_driver_gpio
+        lwip
+        nanopb
+        esp_http_client
+        esp_http_server
+        esp_https_ota
+        app_update
+        esp_new_jpeg
+        spi_flash
+)

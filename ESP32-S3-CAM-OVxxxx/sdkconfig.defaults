@@ -30,7 +30,7 @@ CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
 CONFIG_MQTT_PROTOCOL_5=y
 
 # MQTT task stack
-CONFIG_MQTT_TASK_STACK_SIZE=6144
+CONFIG_MQTT_TASK_STACK_SIZE=16384
 
 # MQTT out-buffer large enough to hold a full JPEG snapshot (VGA~30KB + margin)
 CONFIG_MQTT_BUFFER_SIZE=65536
@@ -42,8 +42,15 @@ CONFIG_SR_NSN_NSNET2=y
 # Auto-test (disabled by default; set =y to enable MQTT voice test on boot)
 # CONFIG_AUTO_TEST=y
 
+# FreeRTOS stack overflow detection (canary method — logs task name + overflowed bytes)
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW=2
+
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Heap corruption detection — comprehensive poisoning adds canaries around
+# every heap block; caught at free/malloc time if overwritten.
+CONFIG_HEAP_POISONING_COMPREHENSIVE=y
 
 # Target
 CONFIG_IDF_TARGET="esp32s3"
