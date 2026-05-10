@@ -6,7 +6,7 @@
  *   LISTENING: AFE(VC) → AEC+NS+BSS → VAD → clean mono → Opus encode → callback
  *   SPEAKING:  AFE(VC) keeps running (echo cancellation), downlink Opus → decode → speaker
  *
- * Mic format: ES7210 4ch TDM → extract ch0(MIC) + ch1(REF) → AFE "MR" input
+ * Mic format: ES7210 4ch TDM, channel_mask={ch0,ch1} → DMA outputs 2ch [MIC,REF] → AFE "MR"
  */
 
 #include "audio_pipeline.h"
@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -42,11 +43,12 @@
 #define SAMPLES_PER_FRAME       ((SAMPLE_RATE * OPUS_FRAME_DURATION_MS) / 1000)  // 320
 #define MAX_OPUS_PKT            256
 #define PLAYBACK_QUEUE_SIZE     32
-#define MIC_BUF_SIZE            (SAMPLES_PER_FRAME * 4)  /* 4ch raw */
-
-/* Logical channels fed to AFE: 1 MIC (ch0) + 1 REF (ch1) */
-#define AFE_CHANNELS            2
-#define REF_CHANNEL_IDX         1
+/* ES7210 TDM: esp_codec_dev_open(channel=4, channel_mask={ch0,ch1}) reconfigures the
+ * I2S DMA to compact-output only 2 active slots (active_slot=2).  i2s_channel_read
+ * returns interleaved [ch0=MIC, ch1=REF, ...] — already "MR" order for AFE feed.
+ */
+#define AFE_CHANNELS            2   /* 2ch DMA output after channel_mask={0,1} */
+#define MIC_BUF_SIZE            (SAMPLES_PER_FRAME * AFE_CHANNELS)  /* 2ch: MIC+REF */
 
 /* ── Internal types ─────────────────────────────────────────────────────── */
 
@@ -95,8 +97,9 @@ static size_t   s_vc_feed_buf_len = 0;
 static size_t   s_vc_feed_chunksize = 0;
 
 /* Output clean mono PCM accumulator */
-static int16_t *s_vc_pcm_buf = NULL;
+static int16_t *s_vc_pcm_buf     = NULL;
 static size_t   s_vc_pcm_buf_len = 0;
+static size_t   s_vc_pcm_buf_cap = 0;  /* allocated capacity in samples */
 
 /* VAD tracking */
 static bool     s_vad_speaking = false;
@@ -123,10 +126,20 @@ static TaskHandle_t s_detect_task_hdl  = NULL;
 static TaskHandle_t s_process_task_hdl = NULL;
 static TaskHandle_t s_playback_task_hdl = NULL;
 
-/* Playback task stack in PSRAM to conserve internal DRAM */
-#define PLAYBACK_STACK_BYTES 12288
+/* Task stacks in PSRAM to conserve internal DRAM */
+#define MIC_FEED_STACK_BYTES 8192   /* raw I2S read + extract + AFE feed (raw[] = 2560B on stack) */
+#define DETECT_STACK_BYTES   8192   /* AFE SR fetch + wake word (ref: 02_esp_sr uses 8K) */
+#define PROCESS_STACK_BYTES  32768  /* AFE VC fetch (~8K) + Opus encode (~12K) + callback (~1K) */
+#define PLAYBACK_STACK_BYTES 12288  /* Opus decode + speaker write */
+
+static StackType_t *s_mic_stack      = NULL;
+static StaticTask_t  s_mic_task_buf;
+static StackType_t *s_detect_stack   = NULL;
+static StaticTask_t  s_detect_task_buf;
+static StackType_t *s_process_stack  = NULL;
+static StaticTask_t  s_process_task_buf;
 static StackType_t *s_playback_stack = NULL;
-static StaticTask_t s_playback_task_buf;
+static StaticTask_t  s_playback_task_buf;
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
@@ -139,17 +152,6 @@ static pipeline_mode_t get_mode(void)
     return m;
 }
 
-/* Extract 2 logical channels (MIC+REF) from 4ch TDM raw data.
- * Input:  [ch0,ch1,ch2,ch3, ch0,ch1,ch2,ch3, ...]
- * Output: [MIC,REF, MIC,REF, ...] where MIC=ch0, REF=ch1 */
-static void extract_mic_ref(const int16_t *raw, int n_frames,
-                            int16_t *out)
-{
-    for (int i = 0; i < n_frames; i++) {
-        out[i * AFE_CHANNELS]     = raw[i * AUDIO_INPUT_CHANNELS];        /* ch0 → MIC */
-        out[i * AFE_CHANNELS + 1] = raw[i * AUDIO_INPUT_CHANNELS + REF_CHANNEL_IDX]; /* ch1 → REF */
-    }
-}
 
 /* ── Opus init ──────────────────────────────────────────────────────────── */
 
@@ -164,7 +166,7 @@ static esp_err_t opus_encoder_init(void)
         .application_mode = ESP_OPUS_ENC_APPLICATION_VOIP,
         .complexity       = 1,
         .enable_fec       = false,
-        .enable_dtx       = true,
+        .enable_dtx       = false,
         .enable_vbr       = true,
     };
     esp_audio_err_t ret = esp_opus_enc_open(&cfg, sizeof(cfg), &s_opus_enc);
@@ -218,14 +220,15 @@ static esp_err_t afe_sr_init(void)
     s_wake_word_count = 1;
     ESP_LOGI(TAG, "WakeNet: %s", wn_name);
 
-    /* Create AFE(SR) with AEC — format "MR" (1 MIC + 1 REF) */
-    afe_config_t *cfg = afe_config_init("MR", s_models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    /* Create AFE(SR) — format "MR" (2ch: MIC+REF), LOW_COST mode.
+     * 4ch "RMNM" uses too much internal DRAM on this board (leaves lwip starved). */
+    afe_config_t *cfg = afe_config_init("MR", s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (!cfg) {
         ESP_LOGE(TAG, "AFE(SR) config init failed");
         return ESP_FAIL;
     }
     cfg->aec_init     = true;
-    cfg->aec_mode     = AEC_MODE_SR_HIGH_PERF;
+    cfg->aec_mode     = AEC_MODE_SR_LOW_COST;
     cfg->afe_perferred_core  = 1;
     cfg->afe_perferred_priority = 1;
     cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
@@ -258,7 +261,8 @@ static esp_err_t afe_vc_init(void)
     srmodel_list_t *vc_models = esp_srmodel_init("model");
     char *ns_name = vc_models ? esp_srmodel_filter(vc_models, ESP_NSNET_PREFIX, NULL) : NULL;
 
-    /* Create AFE(VC) with AEC + NS + VAD — format "MR" */
+    /* Create AFE(VC): AEC_VOIP_HIGH_PERF + NS, no VAD (server-side VAD handles it).
+     * Board has hardware loopback ES8311→ES7210 ch1; xiaozhi config.json: CONFIG_USE_DEVICE_AEC=y */
     afe_config_t *cfg = afe_config_init("MR", NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     if (!cfg) {
         ESP_LOGE(TAG, "AFE(VC) config init failed");
@@ -267,9 +271,7 @@ static esp_err_t afe_vc_init(void)
     }
     cfg->aec_init       = true;
     cfg->aec_mode       = AEC_MODE_VOIP_HIGH_PERF;
-    cfg->vad_init       = true;
-    cfg->vad_mode       = VAD_MODE_0;
-    cfg->vad_min_noise_ms = 100;
+    cfg->vad_init       = false;
     if (ns_name) {
         cfg->ns_init       = true;
         cfg->ns_model_name = ns_name;
@@ -299,6 +301,7 @@ static esp_err_t afe_vc_init(void)
                                                                : (size_t)SAMPLES_PER_FRAME * 2;
     s_vc_pcm_buf = heap_caps_malloc(pcm_buf_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_vc_pcm_buf_len = 0;
+    s_vc_pcm_buf_cap = pcm_buf_samples;
     if (fetch_size > SAMPLES_PER_FRAME)
         ESP_LOGW(TAG, "AFE(VC) fetch=%d > SAMPLES_PER_FRAME=%d, pcm_buf sized to %d",
                  fetch_size, SAMPLES_PER_FRAME, (int)pcm_buf_samples);
@@ -314,26 +317,28 @@ static esp_err_t afe_vc_init(void)
 
 static void mic_feed_task(void *arg)
 {
-    int16_t raw[MIC_BUF_SIZE];  /* 4ch raw read buffer */
+    int16_t raw[MIC_BUF_SIZE];  /* 2ch MR read buffer */
 
     ESP_LOGI(TAG, "Mic feed task started");
     audio_input_enable(true);
 
     while (s_running) {
         pipeline_mode_t mode = get_mode();
-        int read = audio_mic_read(raw, SAMPLES_PER_FRAME * AUDIO_INPUT_CHANNELS);
+        /* esp_codec_dev_open(channel=4, channel_mask={0,1}) reconfigures the TDM DMA
+         * to compact-output only 2 active slots. Read exactly 2-channel × SAMPLES_PER_FRAME. */
+        int read = audio_mic_read(raw, SAMPLES_PER_FRAME * AFE_CHANNELS);
         if (read < 0) {
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 
         if (mode == MODE_IDLE) {
-            /* Feed AFE(SR) for wake word */
+            /* Feed AFE(SR) for wake word detection */
             if (s_sr_feed_buf_len > s_sr_feed_chunksize * AFE_CHANNELS)
-                s_sr_feed_buf_len = 0;  /* overflow safety */
+                s_sr_feed_buf_len = 0;
 
-            extract_mic_ref(raw, SAMPLES_PER_FRAME,
-                            s_sr_feed_buf + s_sr_feed_buf_len);
+            memcpy(s_sr_feed_buf + s_sr_feed_buf_len, raw,
+                   SAMPLES_PER_FRAME * AFE_CHANNELS * sizeof(int16_t));
             s_sr_feed_buf_len += SAMPLES_PER_FRAME * AFE_CHANNELS;
 
             while (s_sr_feed_buf_len >= s_sr_feed_chunksize * AFE_CHANNELS) {
@@ -348,8 +353,8 @@ static void mic_feed_task(void *arg)
             if (s_vc_feed_buf_len > s_vc_feed_chunksize * AFE_CHANNELS)
                 s_vc_feed_buf_len = 0;
 
-            extract_mic_ref(raw, SAMPLES_PER_FRAME,
-                            s_vc_feed_buf + s_vc_feed_buf_len);
+            memcpy(s_vc_feed_buf + s_vc_feed_buf_len, raw,
+                   SAMPLES_PER_FRAME * AFE_CHANNELS * sizeof(int16_t));
             s_vc_feed_buf_len += SAMPLES_PER_FRAME * AFE_CHANNELS;
 
             while (s_vc_feed_buf_len >= s_vc_feed_chunksize * AFE_CHANNELS) {
@@ -429,6 +434,14 @@ static void process_task(void *arg)
             continue;
         }
 
+        /* Re-check mode: stop_listening may have called reset_buffer while fetch was blocked.
+         * Concurrent reset_buffer+fetch on the same AFE handle corrupts res->data_size,
+         * which would overflow s_vc_pcm_buf and trash the Opus encoder state on the heap. */
+        mode = get_mode();
+        if (mode != MODE_LISTENING && mode != MODE_SPEAKING) {
+            continue;
+        }
+
         /* VAD state change */
         bool speaking = (res->vad_state == VAD_SPEECH);
         if (speaking != s_vad_speaking) {
@@ -440,15 +453,21 @@ static void process_task(void *arg)
 
         /* Accumulate clean mono PCM from AFE output */
         int fetch_samples = res->data_size / sizeof(int16_t);
-        if (s_vc_pcm_buf_len + fetch_samples > SAMPLES_PER_FRAME) {
-            s_vc_pcm_buf_len = 0;  /* safety reset */
+        if (s_vc_pcm_buf_len + (size_t)fetch_samples > s_vc_pcm_buf_cap) {
+            s_vc_pcm_buf_len = 0;  /* should never happen; guard against overflow */
         }
         memcpy(s_vc_pcm_buf + s_vc_pcm_buf_len, res->data,
                fetch_samples * sizeof(int16_t));
         s_vc_pcm_buf_len += fetch_samples;
 
         /* Encode when we have enough for one Opus frame */
-        while (s_vc_pcm_buf_len >= SAMPLES_PER_FRAME && mode == MODE_LISTENING) {
+        while (mode == MODE_LISTENING) {
+            /* Snapshot buf_len under mutex to avoid race with stop_listening */
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            size_t buf_len = s_vc_pcm_buf_len;
+            xSemaphoreGive(s_mutex);
+
+            if (buf_len < (size_t)SAMPLES_PER_FRAME) break;
             esp_audio_enc_in_frame_t in = {
                 .buffer = (uint8_t *)s_vc_pcm_buf,
                 .len    = (uint32_t)s_enc_in_size,
@@ -459,6 +478,10 @@ static void process_task(void *arg)
             };
             esp_audio_err_t ret = esp_opus_enc_process(s_opus_enc, &in, &out);
             if (ret == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0) {
+                if (out.encoded_bytes < 10) {
+                    ESP_LOGW(TAG, "Tiny Opus frame seq=%" PRIu64 " len=%d (DTX/silence)",
+                             s_uplink_seq, (int)out.encoded_bytes);
+                }
                 if (s_cb.on_uplink_opus) {
                     s_cb.on_uplink_opus(enc_out, out.encoded_bytes,
                                         s_uplink_seq++,
@@ -467,12 +490,15 @@ static void process_task(void *arg)
                 }
             }
 
-            /* Consume SAMPLES_PER_FRAME from accumulator */
-            size_t remain = s_vc_pcm_buf_len - SAMPLES_PER_FRAME;
+            /* Consume SAMPLES_PER_FRAME from accumulator (use snapshotted buf_len) */
+            size_t remain = buf_len - SAMPLES_PER_FRAME;
             if (remain > 0)
                 memmove(s_vc_pcm_buf, s_vc_pcm_buf + SAMPLES_PER_FRAME,
                         remain * sizeof(int16_t));
-            s_vc_pcm_buf_len = remain;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_vc_pcm_buf_len = (s_vc_pcm_buf_len >= (size_t)SAMPLES_PER_FRAME)
+                                ? s_vc_pcm_buf_len - SAMPLES_PER_FRAME : 0;
+            xSemaphoreGive(s_mutex);
 
             /* Re-read mode in case it changed during encoding */
             mode = get_mode();
@@ -574,16 +600,43 @@ esp_err_t audio_pipeline_init(const audio_pipeline_callbacks_t *callbacks)
     ret = opus_decoder_init();
     if (ret != ESP_OK) return ret;
 
-    /* Start background tasks */
+    /* Start background tasks — all stacks in PSRAM to conserve internal DRAM */
     s_running = true;
-    xTaskCreatePinnedToCore(mic_feed_task, "mic_feed", 6144, NULL, 6,
-                            &s_mic_task_hdl, 0);
-    xTaskCreatePinnedToCore(detect_task,  "afe_det",  3072, NULL, 4,
-                            &s_detect_task_hdl, 1);
-    xTaskCreatePinnedToCore(process_task, "afe_proc", 3072, NULL, 4,
-                            &s_process_task_hdl, 1);
+    s_mic_stack = heap_caps_malloc(MIC_FEED_STACK_BYTES, MALLOC_CAP_SPIRAM);
+    if (s_mic_stack) {
+        s_mic_task_hdl = xTaskCreateStaticPinnedToCore(
+            mic_feed_task, "mic_feed", MIC_FEED_STACK_BYTES,
+            NULL, 6, s_mic_stack, &s_mic_task_buf, 0);
+    }
+    if (!s_mic_task_hdl) {
+        ESP_LOGE(TAG, "Mic feed task create failed");
+        s_running = false;
+        return ESP_ERR_NO_MEM;
+    }
+    s_detect_stack = heap_caps_malloc(DETECT_STACK_BYTES, MALLOC_CAP_SPIRAM);
+    if (s_detect_stack) {
+        s_detect_task_hdl = xTaskCreateStaticPinnedToCore(
+            detect_task, "afe_det", DETECT_STACK_BYTES,
+            NULL, 4, s_detect_stack, &s_detect_task_buf, 1);
+    }
+    if (!s_detect_task_hdl) {
+        ESP_LOGE(TAG, "Detect task create failed");
+        s_running = false;
+        return ESP_ERR_NO_MEM;
+    }
 
-    /* Playback task stack allocated from PSRAM to conserve internal DRAM */
+    s_process_stack = heap_caps_malloc(PROCESS_STACK_BYTES, MALLOC_CAP_SPIRAM);
+    if (s_process_stack) {
+        s_process_task_hdl = xTaskCreateStaticPinnedToCore(
+            process_task, "afe_proc", PROCESS_STACK_BYTES,
+            NULL, 4, s_process_stack, &s_process_task_buf, 1);
+    }
+    if (!s_process_task_hdl) {
+        ESP_LOGE(TAG, "Process task create failed");
+        s_running = false;
+        return ESP_ERR_NO_MEM;
+    }
+
     s_playback_stack = heap_caps_malloc(PLAYBACK_STACK_BYTES, MALLOC_CAP_SPIRAM);
     if (s_playback_stack) {
         s_playback_task_hdl = xTaskCreateStaticPinnedToCore(
@@ -637,8 +690,9 @@ esp_err_t audio_pipeline_stop_listening(void)
                             esp_timer_get_time() / 1000, true, s_cb.user_data);
     }
 
-    /* Reset AFE(VC), clear SR feed for clean restart */
-    s_vc_iface->reset_buffer(s_vc_data);
+    /* Do NOT call reset_buffer here — process_task may be blocked in fetch on Core 1.
+     * Concurrent reset_buffer+fetch corrupts AFE internal state → crash in Opus encoder.
+     * reset_buffer is called in start_listening instead, when process_task is idle. */
     s_vc_feed_buf_len = 0;
     s_vc_pcm_buf_len = 0;
     s_sr_feed_buf_len = 0;
@@ -729,6 +783,9 @@ void audio_pipeline_deinit(void)
     /* Free queues and mutex */
     if (s_playback_queue) { vQueueDelete(s_playback_queue); s_playback_queue = NULL; }
     if (s_mutex)          { vSemaphoreDelete(s_mutex);      s_mutex = NULL; }
+    if (s_mic_stack)      { free(s_mic_stack);               s_mic_stack      = NULL; }
+    if (s_detect_stack)   { free(s_detect_stack);           s_detect_stack   = NULL; }
+    if (s_process_stack)  { free(s_process_stack);          s_process_stack  = NULL; }
     if (s_playback_stack) { free(s_playback_stack);         s_playback_stack = NULL; }
 
     ESP_LOGI(TAG, "Audio pipeline deinitialized");

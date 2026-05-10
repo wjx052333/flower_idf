@@ -44,7 +44,7 @@ factory/
 ```bash
 cd relay
 
-python factory/gen_factory_nvs.py --id     flr001  --secret 37e73a61317f6ca96f054ff7025c18ac67d0ccf636f376c78bb800fd9e8d2eb3   --out    factory/factory_flr001.bin
+python factory/gen_factory_nvs.py --id     flr003  --secret f7f168b240b774e53c314a26d4c185a6114d3a54eb0c90c494e216d5083612ea   --out    factory/factory_flr003.bin
 ```
 
 成功后输出：
