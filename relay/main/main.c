@@ -37,6 +37,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
+#include "driver/uart.h"
 
 #include "esp_http_server.h"
 #include "esp_https_ota.h"
@@ -75,7 +76,13 @@ static char s_topic_status[96];
 #define BUTTON_PIN  9
 #define RELAY_PIN   4
 #define LED_PIN     3
-#define ADC_PIN     ADC_CHANNEL_0   /* GPIO0 = ADC1 CH0 */
+#define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_0   /* GPIO0 */
+#define ADC_PIN_DEEP_HUMIDITY ADC_CHANNEL_1   /* GPIO1 */
+
+#define MODBUS_UART_PORT  UART_NUM_1
+#define MODBUS_UART_TXD   GPIO_NUM_6
+#define MODBUS_UART_RXD   GPIO_NUM_7
+#define MODBUS_BAUD       9600
 
 #define STATUS_INTERVAL_MS        30000
 #define RELAY_DEFAULT_DURATION_MS 10000
@@ -138,14 +145,71 @@ static void adc_init(void)
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten    = ADC_ATTEN_DB_12,   /* 0 ~ 3.3 V */
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN, &chan_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_LOW_HUMIDITY, &chan_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_DEEP_HUMIDITY, &chan_cfg));
 }
 
-static int adc_read_raw(void)
+static int adc_read_raw(adc_channel_t channel)
 {
     int raw = 0;
-    adc_oneshot_read(s_adc_handle, ADC_PIN, &raw);
+    adc_oneshot_read(s_adc_handle, channel, &raw);
     return raw;
+}
+
+/* ── Modbus-RTU illuminance ───────────────────────────────────────────────── */
+static uint16_t modbus_crc16(const uint8_t *data, int len)
+{
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xA001;
+            else
+                crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+static void modbus_init(void)
+{
+    uart_config_t uart_cfg = {
+        .baud_rate = MODBUS_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(MODBUS_UART_PORT, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(MODBUS_UART_PORT, MODBUS_UART_TXD, MODBUS_UART_RXD,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(MODBUS_UART_PORT, 256, 0, 0, NULL, 0));
+}
+
+static float modbus_read_illuminance(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x02, 0x00, 0x02};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[9];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 9) {
+        ESP_LOGW(TAG, "Modbus illuminance: expected 9 bytes, got %d", len);
+        return -1.0f;
+    }
+
+    uint32_t raw = ((uint32_t)rx_buf[3] << 24) | ((uint32_t)rx_buf[4] << 16)
+                 | ((uint32_t)rx_buf[5] << 8) | rx_buf[6];
+    return (float)raw / 1000.0f;
 }
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
@@ -339,15 +403,20 @@ static void handle_mqtt_data(const char *data, int data_len)
 
 static void publish_status_report(void)
 {
-    int raw = adc_read_raw();
-    ESP_LOGI(TAG, "ADC IO0 raw=%d", raw);
+    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+    int raw_deep = adc_read_raw(ADC_PIN_DEEP_HUMIDITY);
+    ESP_LOGI(TAG, "ADC low_humidity(GPIO0)=%d deep_humidity(GPIO1)=%d", raw_low, raw_deep);
+
+    float lux = modbus_read_illuminance();
+    if (lux >= 0)
+        ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
 
     if (!s_mqtt_connected) return;
 
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
-    sr.signal_dbm      = (int32_t)raw;
+    sr.signal_dbm      = (int32_t)raw_low;
     sr.timestamp       = (int64_t)now * 1000;
     sr.has_version     = true;
     sr.version.major   = 1;
@@ -362,7 +431,7 @@ static void publish_status_report(void)
     }
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
-    ESP_LOGI(TAG, "Status published (signal_dbm=%d)", raw);
+    ESP_LOGI(TAG, "Status published (signal_dbm=%d)", raw_low);
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -595,8 +664,11 @@ void app_main(void)
     nvs_flash_init_partition("fctry");
     device_identity_init();
 
-    /* ADC: IO0 */
+    /* ADC: low_humidity (IO0) + deep_humidity (IO1) */
     adc_init();
+
+    /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
+    modbus_init();
 
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
