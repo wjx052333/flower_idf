@@ -11,3 +11,5 @@ sdkconfig.old
 dependencies.lock
 
 factory/*.bin
+
+__pycache__

@@ -401,11 +401,28 @@ static void handle_mqtt_data(const char *data, int data_len)
 
 }
 
+static flower_metric_t s_metrics[3];
+
+static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
+{
+    flower_metric_t *metrics = (flower_metric_t *)(*arg);
+    for (int i = 0; i < 3; i++) {
+        if (!pb_encode_tag_for_field(stream, field))
+            return false;
+        if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
+            return false;
+    }
+    return true;
+}
+
 static void publish_status_report(void)
 {
     int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
     int raw_deep = adc_read_raw(ADC_PIN_DEEP_HUMIDITY);
-    ESP_LOGI(TAG, "ADC low_humidity(GPIO0)=%d deep_humidity(GPIO1)=%d", raw_low, raw_deep);
+    float humidity_low = raw_low*100.0f/4096;
+    float humidity_deep = raw_deep*100.0f/4096;
+    ESP_LOGI(TAG, "ADC low_humidity(GPIO0)=%d,%f deep_humidity(GPIO1)=%d,%f",
+        raw_low, humidity_low, raw_deep, humidity_deep);
 
     float lux = modbus_read_illuminance();
     if (lux >= 0)
@@ -413,17 +430,31 @@ static void publish_status_report(void)
 
     if (!s_mqtt_connected) return;
 
+    strcpy(s_metrics[0].key, "humiL");
+    s_metrics[0].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[0].value.double_value = humidity_low;
+
+    strcpy(s_metrics[1].key, "humiD");
+    s_metrics[1].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[1].value.double_value = humidity_deep;
+
+    strcpy(s_metrics[2].key, "lux");
+    s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
+
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
-    sr.signal_dbm      = (int32_t)raw_low;
     sr.timestamp       = (int64_t)now * 1000;
     sr.has_version     = true;
     sr.version.major   = 1;
     sr.version.minor   = 0;
     sr.version.patch   = 2;
+    strcpy(sr.device_type, "humidityX2_lux");
+    sr.metrics.arg = s_metrics;
+    sr.metrics.funcs.encode = encode_metrics;
 
-    uint8_t buf[FLOWER_STATUS_REPORT_SIZE];
+    uint8_t buf[256];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
     if (!pb_encode(&stream, &flower_status_report_t_msg, &sr)) {
         ESP_LOGE(TAG, "Status encode: %s", PB_GET_ERROR(&stream));
@@ -431,7 +462,8 @@ static void publish_status_report(void)
     }
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
-    ESP_LOGI(TAG, "Status published (signal_dbm=%d)", raw_low);
+    ESP_LOGI(TAG, "Status published (humiL=%.1f, humiD=%.1f, lux=%.1f)",
+             humidity_low, humidity_deep, (double)(lux >= 0 ? lux : 0));
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */

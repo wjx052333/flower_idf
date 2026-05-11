@@ -39,6 +39,15 @@ typedef enum flower_snapshot_result_code {
 } flower_snapshot_result_code_t;
 
 /* Struct definitions */
+typedef struct flower_metric {
+    char key[32];
+    pb_size_t which_value;
+    union {
+        double double_value;
+        int64_t int64_value;
+    } value;
+} flower_metric_t;
+
 typedef struct flower_relay_control {
     bool on;
     uint32_t duration_ms; /* auto-off delay (ms); 0 = no auto-off */
@@ -86,10 +95,11 @@ typedef struct flower_device_version {
 } flower_device_version_t;
 
 typedef struct flower_status_report {
-    int32_t signal_dbm; /* ADC/WiFi signal */
-    int64_t timestamp; /* device local time (unix ms) */
+    int64_t timestamp;
     bool has_version;
     flower_device_version_t version;
+    char device_type[32];
+    pb_callback_t metrics;
 } flower_status_report_t;
 
 typedef struct flower_ota_command {
@@ -135,6 +145,7 @@ extern "C" {
 
 
 
+
 #define flower_relay_control_resp_t_result_ENUMTYPE flower_cmd_result_t
 
 
@@ -150,7 +161,8 @@ extern "C" {
 
 
 /* Initializer values for message structs */
-#define FLOWER_STATUS_REPORT_INIT_DEFAULT        {0, 0, false, FLOWER_DEVICE_VERSION_INIT_DEFAULT}
+#define FLOWER_METRIC_INIT_DEFAULT               {"", 0, {0}}
+#define FLOWER_STATUS_REPORT_INIT_DEFAULT        {0, false, FLOWER_DEVICE_VERSION_INIT_DEFAULT, "", {{NULL}, NULL}}
 #define FLOWER_RELAY_CONTROL_INIT_DEFAULT        {0, 0}
 #define FLOWER_RELAY_CONTROL_RESP_INIT_DEFAULT   {_FLOWER_CMD_RESULT_MIN, ""}
 #define FLOWER_OTA_COMMAND_INIT_DEFAULT          {"", false, FLOWER_DEVICE_VERSION_INIT_DEFAULT, false, FLOWER_DEVICE_VERSION_INIT_DEFAULT}
@@ -160,7 +172,8 @@ extern "C" {
 #define FLOWER_COMMAND_INIT_DEFAULT              {_FLOWER_COMMAND_ROLE_MIN, 0, {FLOWER_RELAY_CONTROL_INIT_DEFAULT}}
 #define FLOWER_COMMAND_RESPONSE_INIT_DEFAULT     {_FLOWER_COMMAND_ROLE_MIN, 0, {FLOWER_RELAY_CONTROL_RESP_INIT_DEFAULT}}
 #define FLOWER_DEVICE_VERSION_INIT_DEFAULT       {0, 0, 0}
-#define FLOWER_STATUS_REPORT_INIT_ZERO           {0, 0, false, FLOWER_DEVICE_VERSION_INIT_ZERO}
+#define FLOWER_METRIC_INIT_ZERO                  {"", 0, {0}}
+#define FLOWER_STATUS_REPORT_INIT_ZERO           {0, false, FLOWER_DEVICE_VERSION_INIT_ZERO, "", {{NULL}, NULL}}
 #define FLOWER_RELAY_CONTROL_INIT_ZERO           {0, 0}
 #define FLOWER_RELAY_CONTROL_RESP_INIT_ZERO      {_FLOWER_CMD_RESULT_MIN, ""}
 #define FLOWER_OTA_COMMAND_INIT_ZERO             {"", false, FLOWER_DEVICE_VERSION_INIT_ZERO, false, FLOWER_DEVICE_VERSION_INIT_ZERO}
@@ -172,6 +185,9 @@ extern "C" {
 #define FLOWER_DEVICE_VERSION_INIT_ZERO          {0, 0, 0}
 
 /* Field tags (for use in manual encoding/decoding) */
+#define FLOWER_METRIC_KEY_TAG                    1
+#define FLOWER_METRIC_DOUBLE_VALUE_TAG           2
+#define FLOWER_METRIC_INT64_VALUE_TAG            3
 #define FLOWER_RELAY_CONTROL_ON_TAG              1
 #define FLOWER_RELAY_CONTROL_DURATION_MS_TAG     2
 #define FLOWER_RELAY_CONTROL_RESP_RESULT_TAG     1
@@ -192,9 +208,10 @@ extern "C" {
 #define FLOWER_DEVICE_VERSION_MAJOR_TAG          1
 #define FLOWER_DEVICE_VERSION_MINOR_TAG          2
 #define FLOWER_DEVICE_VERSION_PATCH_TAG          3
-#define FLOWER_STATUS_REPORT_SIGNAL_DBM_TAG      1
 #define FLOWER_STATUS_REPORT_TIMESTAMP_TAG       2
 #define FLOWER_STATUS_REPORT_VERSION_TAG         3
+#define FLOWER_STATUS_REPORT_DEVICE_TYPE_TAG     4
+#define FLOWER_STATUS_REPORT_METRICS_TAG         5
 #define FLOWER_OTA_COMMAND_URL_TAG               1
 #define FLOWER_OTA_COMMAND_EXPECTED_VERSION_TAG  2
 #define FLOWER_OTA_COMMAND_MINI_COMPACT_VERSION_TAG 3
@@ -204,13 +221,22 @@ extern "C" {
 #define FLOWER_COMMAND_SNAPSHOT_TAG              4
 
 /* Struct field encoding specification for nanopb */
+#define FLOWER_METRIC_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   key,               1) \
+X(a, STATIC,   ONEOF,    DOUBLE,   (value,double_value,value.double_value),   2) \
+X(a, STATIC,   ONEOF,    INT64,    (value,int64_value,value.int64_value),   3)
+#define FLOWER_METRIC_CALLBACK NULL
+#define FLOWER_METRIC_DEFAULT NULL
+
 #define FLOWER_STATUS_REPORT_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, INT32,    signal_dbm,        1) \
 X(a, STATIC,   SINGULAR, INT64,    timestamp,         2) \
-X(a, STATIC,   OPTIONAL, MESSAGE,  version,           3)
-#define FLOWER_STATUS_REPORT_CALLBACK NULL
+X(a, STATIC,   OPTIONAL, MESSAGE,  version,           3) \
+X(a, STATIC,   SINGULAR, STRING,   device_type,       4) \
+X(a, CALLBACK, REPEATED, MESSAGE,  metrics,           5)
+#define FLOWER_STATUS_REPORT_CALLBACK pb_default_field_callback
 #define FLOWER_STATUS_REPORT_DEFAULT NULL
 #define flower_status_report_t_version_MSGTYPE flower_device_version_t
+#define flower_status_report_t_metrics_MSGTYPE flower_metric_t
 
 #define FLOWER_RELAY_CONTROL_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     on,                1) \
@@ -283,6 +309,7 @@ X(a, STATIC,   SINGULAR, INT32,    patch,             3)
 #define FLOWER_DEVICE_VERSION_CALLBACK NULL
 #define FLOWER_DEVICE_VERSION_DEFAULT NULL
 
+extern const pb_msgdesc_t flower_metric_t_msg;
 extern const pb_msgdesc_t flower_status_report_t_msg;
 extern const pb_msgdesc_t flower_relay_control_t_msg;
 extern const pb_msgdesc_t flower_relay_control_resp_t_msg;
@@ -295,6 +322,7 @@ extern const pb_msgdesc_t flower_command_response_t_msg;
 extern const pb_msgdesc_t flower_device_version_t_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
+#define FLOWER_METRIC_FIELDS &flower_metric_t_msg
 #define FLOWER_STATUS_REPORT_FIELDS &flower_status_report_t_msg
 #define FLOWER_RELAY_CONTROL_FIELDS &flower_relay_control_t_msg
 #define FLOWER_RELAY_CONTROL_RESP_FIELDS &flower_relay_control_resp_t_msg
@@ -307,17 +335,18 @@ extern const pb_msgdesc_t flower_device_version_t_msg;
 #define FLOWER_DEVICE_VERSION_FIELDS &flower_device_version_t_msg
 
 /* Maximum encoded size of messages (where known) */
+/* flower_StatusReport_size depends on runtime parameters */
 #define FLOWER_COMMAND_RESPONSE_SIZE             77
 #define FLOWER_COMMAND_SIZE                      531
 #define FLOWER_DEVICE_VERSION_SIZE               33
 #define FLOWER_FLOWER_PB_H_MAX_SIZE              FLOWER_COMMAND_SIZE
+#define FLOWER_METRIC_SIZE                       44
 #define FLOWER_OTA_COMMAND_SIZE                  328
 #define FLOWER_OTA_RESPONSE_SIZE                 46
 #define FLOWER_RELAY_CONTROL_RESP_SIZE           67
 #define FLOWER_RELAY_CONTROL_SIZE                8
 #define FLOWER_SNAPSHOT_COMMAND_SIZE             526
 #define FLOWER_SNAPSHOT_RESPONSE_SIZE            73
-#define FLOWER_STATUS_REPORT_SIZE                57
 
 #ifdef __cplusplus
 } /* extern "C" */
