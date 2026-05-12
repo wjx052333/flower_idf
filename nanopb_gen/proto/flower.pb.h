@@ -95,7 +95,7 @@ typedef struct flower_device_version {
 } flower_device_version_t;
 
 typedef struct flower_status_report {
-    int64_t timestamp;
+    int64_t timestamp; /* device local time (unix ms) */
     bool has_version;
     flower_device_version_t version;
     char device_type[32];
