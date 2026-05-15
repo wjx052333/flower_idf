@@ -1,9 +1,18 @@
 set(SRCS
-    "main.c"
+    "main.cc"
     "camera.c"
-    "audio.c"
-    "audio_pipeline.c"
     "build_info.c"
+)
+
+# C++ audio subsystem (from xiaozhi-esp32)
+list(APPEND SRCS
+    "audio/codecs/audio_codec.cc"
+    "audio/codecs/box_audio_codec.cc"
+    "audio/wake_words/afe_wake_word.cc"
+    "audio/processors/no_audio_processor.cc"
+    "audio/audio_service.cc"
+    "audio/demuxer/ogg_demuxer.cc"
+    "settings.cc"
 )
 
 if(CONFIG_AUTO_TEST)
@@ -18,6 +27,12 @@ idf_component_register(
     INCLUDE_DIRS
         "."
         "proto"
+        "stubs"
+        "audio"
+        "audio/codecs"
+        "audio/wake_words"
+        "audio/processors"
+        "audio/demuxer"
     REQUIRES
         esp_wifi
         esp_event
@@ -25,9 +40,9 @@ idf_component_register(
         esp_mqtt
         mbedtls
         esp_timer
-        esp_driver_cam          # provides esp_cam_ctlr.h (CAM_CTLR_DATA_WIDTH_8)
-        esp_driver_i2c          # provides driver/i2c_master.h for pre-init with pullups
-        esp_driver_i2s          # provides driver/i2s_tdm.h / driver/i2s_std.h
+        esp_driver_cam
+        esp_driver_i2c
+        esp_driver_i2s
         lwip
         nanopb
         esp_http_client
@@ -38,4 +53,6 @@ idf_component_register(
         esp_codec_dev
         esp-sr
         spi_flash
+        esp_audio_codec       # provides esp_opus_enc, esp_opus_dec
+        esp_audio_effects     # provides esp_ae_rate_cvt
 )

@@ -1,5 +1,7 @@
 /**
- * main.c — Flower ESP32-S3 camera node (ESP-IDF)
+ * main.cc — Flower ESP32-S3 camera node (ESP-IDF)
+ *
+ * Audio pipeline: xiaozhi-esp32 AudioService + BoxAudioCodec + AfeWakeWord
  *
  * Features:
  *   1. WiFi STA + NTP time sync
@@ -9,24 +11,26 @@
  *   5. OV5640 DVP camera via esp_video / V4L2
  *   6. Snapshot: JPEG capture + HTTP PUT to pre-signed URL
  *   7. OTA: HTTPS firmware update triggered via MQTT OtaCommand
- *   8. Voice intercom: Opus encode/decode, MQTT-based duplex audio
+ *   8. Voice intercom: Opus encode/decode via AudioService, MQTT-based duplex audio
  *
  * Topics:
- *   sub  flower/{DEVICE_ID}/down/cmd       — Command protobuf (snapshot / ota)
- *   sub  flower/{DEVICE_ID}/down/opus      — AudioFrame (TTS audio from server)
- *   pub  flower/{DEVICE_ID}/up/status      — periodic StatusReport
- *   pub  flower/{DEVICE_ID}/up/cmd_response — CommandResponse (snapshot / ota)
- *   pub  flower/{DEVICE_ID}/up/opus        — AudioFrame (mic audio to server)
- *   pub  flower/{DEVICE_ID}/up/agent_request — AgentRequest (CHAT / STOP / INTERRUPT)
+ *   sub  flower/{device_id}/down/cmd                  — Command (snapshot / ota)
+ *   sub  flower/{user_id}/{device_id}/down/opus        — TTS AudioFrame
+ *   sub  flower/{user_id}/{device_id}/down/agent_response — Agent handshake
+ *   pub  flower/{device_id}/up/status                  — periodic StatusReport
+ *   pub  flower/{device_id}/up/cmd_response            — CommandResponse
+ *   pub  flower/{user_id}/{device_id}/up/opus          — Mic AudioFrame
+ *   pub  flower/{user_id}/{device_id}/up/agent_request — AgentRequest (CHAT/STOP/INTERRUPT)
  */
 
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
+#include <memory>
+#include <string>
+
 #include "camera.h"
-#include "audio.h"
-#include "audio_pipeline.h"
 #include "auto_test.h"
 #include "build_info.h"
 
@@ -60,6 +64,12 @@
 #include "pb_decode.h"
 #include "proto/flower.pb.h"
 #include "proto/mqtt_agent.pb.h"
+
+/* ── xiaozhi-esp32 audio subsystem ─────────────────────────────────────── */
+
+#include "box_audio_codec.h"
+#include "audio_service.h"
+#include "board_stub.h"
 
 /* ── Nanopb bytes callback helpers ───────────────────────────────────── */
 
@@ -112,20 +122,34 @@ static bool noop_encode(pb_ostream_t *stream, const pb_field_t *field, void *con
 #ifndef CONFIG_MQTT_BROKER_URI
 #define CONFIG_MQTT_BROKER_URI "mqtts://your-emqx-host:8883"
 #endif
+#ifndef CONFIG_FLOWER_USER_ID
+#define CONFIG_FLOWER_USER_ID "floweruser0"
+#endif
 
 /* ── Device identity ─────────────────────────────────────────────────────── */
 static char g_device_id[64];
 static char g_device_secret[128];
+static char g_user_id[64] = CONFIG_FLOWER_USER_ID;
 
-static char s_topic_cmd[96];
-static char s_topic_status[96];
-static char s_topic_cmd_resp[96];
-static char s_topic_down_opus[96];
-static char s_topic_up_opus[96];
-static char s_topic_up_agent[96];
+static char s_topic_cmd[128];
+static char s_topic_status[128];
+static char s_topic_cmd_resp[128];
+static char s_topic_down_opus[128];
+static char s_topic_up_opus[128];
+static char s_topic_up_agent[128];
+static char s_topic_down_agent[128];
 
 /* ── Shared I2C bus ─────────────────────────────────────────────────────── */
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
+
+/* ── Audio hardware pins (matching waveshare ESP32-S3-CAM) ──────────────── */
+#define AUDIO_MCLK_PIN         GPIO_NUM_10
+#define AUDIO_BCLK_PIN         GPIO_NUM_11
+#define AUDIO_WS_PIN           GPIO_NUM_12
+#define AUDIO_DOUT_PIN         GPIO_NUM_14
+#define AUDIO_DIN_PIN          GPIO_NUM_13
+#define AUDIO_SAMPLE_RATE      24000
+#define AUDIO_INPUT_REFERENCE  true
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
 #define STATUS_INTERVAL_MS  30000
@@ -139,7 +163,6 @@ static EventGroupHandle_t       s_wifi_event_group;
 
 static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
 static volatile bool            s_mqtt_connected = false;
-static volatile bool            s_audio_pipeline_ok = false;
 
 static flower_command_t         s_cmd;
 
@@ -150,6 +173,53 @@ typedef struct {
 
 static QueueHandle_t     s_snap_queue;
 static volatile bool     s_snap_in_progress = false;
+
+/* ── Audio service ─────────────────────────────────────────────────────── */
+static AudioService*      s_audio_service = nullptr;
+static BoxAudioCodec*     s_audio_codec   = nullptr;
+static srmodel_list_t*    s_models        = nullptr;
+static volatile bool      s_audio_ok      = false;
+static volatile int       s_chat_state    = 0;  // 0=idle, 1=listening, 2=speaking
+
+/* ── PA control (CH32V003 IO expander @ I2C 0x24) ─────────────────────── */
+#define CH32V003_DIR_REG    0x02
+#define CH32V003_OUT_REG    0x03
+static i2c_master_dev_handle_t s_io_expander_dev = NULL;
+
+static void audio_pa_init(i2c_master_bus_handle_t i2c_handle)
+{
+    i2c_device_config_t dev_cfg = {
+        .device_address = 0x24,
+        .scl_speed_hz   = 400000,
+    };
+    esp_err_t ret = i2c_master_bus_add_device(i2c_handle, &dev_cfg, &s_io_expander_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "IO expander not found (err %d) — PA control disabled", ret);
+        return;
+    }
+    uint8_t dir[] = {CH32V003_DIR_REG, 0x77};
+    ret = i2c_master_transmit(s_io_expander_dev, dir, sizeof(dir), 100);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "IO expander DIR_REG write failed (%d) — PA control disabled", ret);
+        s_io_expander_dev = NULL;
+        return;
+    }
+    uint8_t out[] = {CH32V003_OUT_REG, 0x77};  // All OUTPUT pins HIGH — PA ON
+    ret = i2c_master_transmit(s_io_expander_dev, out, sizeof(out), 100);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "IO expander OUT_REG write failed (%d) — PA control disabled", ret);
+        s_io_expander_dev = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "IO expander OK (CH32V003 @0x24), PA ON");
+}
+
+static void audio_pa_enable(bool enable)
+{
+    if (!s_io_expander_dev) return;
+    uint8_t data[] = {CH32V003_OUT_REG, enable ? 0x77 : 0x67};
+    i2c_master_transmit(s_io_expander_dev, data, sizeof(data), 100);
+}
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
 static void calc_signature(int64_t ts_ms, const char *device_id,
@@ -195,12 +265,21 @@ static void device_identity_init(void)
     ESP_LOGI(TAG, "Identity loaded: id=%s", g_device_id);
 
 build_topics:
-    snprintf(s_topic_cmd,       sizeof(s_topic_cmd),       "flower/%s/down/cmd",  g_device_id);
-    snprintf(s_topic_status,    sizeof(s_topic_status),    "flower/%s/up/status", g_device_id);
-    snprintf(s_topic_cmd_resp,  sizeof(s_topic_cmd_resp),  "flower/%s/up/cmd_response", g_device_id);
-    snprintf(s_topic_down_opus, sizeof(s_topic_down_opus), "flower/%s/down/opus", g_device_id);
-    snprintf(s_topic_up_opus,   sizeof(s_topic_up_opus),   "flower/%s/up/opus",   g_device_id);
-    snprintf(s_topic_up_agent,  sizeof(s_topic_up_agent),  "flower/%s/up/agent_request", g_device_id);
+    /* Topics: cmd/status use device_id only; opus/agent include user_id */
+    snprintf(s_topic_cmd,        sizeof(s_topic_cmd),
+             "flower/%s/down/cmd",  g_device_id);
+    snprintf(s_topic_status,     sizeof(s_topic_status),
+             "flower/%s/up/status", g_device_id);
+    snprintf(s_topic_cmd_resp,   sizeof(s_topic_cmd_resp),
+             "flower/%s/up/cmd_response", g_device_id);
+    snprintf(s_topic_down_opus,  sizeof(s_topic_down_opus),
+             "flower/%s/%s/down/opus", g_user_id, g_device_id);
+    snprintf(s_topic_up_opus,    sizeof(s_topic_up_opus),
+             "flower/%s/%s/up/opus", g_user_id, g_device_id);
+    snprintf(s_topic_up_agent,   sizeof(s_topic_up_agent),
+             "flower/%s/%s/up/agent_request", g_user_id, g_device_id);
+    snprintf(s_topic_down_agent, sizeof(s_topic_down_agent),
+             "flower/%s/%s/down/agent_response", g_user_id, g_device_id);
 }
 
 /* ── Status report ───────────────────────────────────────────────────────── */
@@ -289,7 +368,6 @@ static void snapshot_task(void *arg)
 
         camera_release_jpeg();
 
-        /* Publish result */
         if (herr != ESP_OK) {
             ESP_LOGE(TAG, "HTTP PUT error: %s", esp_err_to_name(herr));
             publish_snapshot_response(req.role,
@@ -448,6 +526,57 @@ static void http_server_start(void)
     ESP_LOGI(TAG, "HTTP server started on port %d", cfg.server_port);
 }
 
+/* ── Audio callbacks (AudioService → MQTT) ─────────────────────────────── */
+
+static void on_audio_wake_word(const std::string& wake_word)
+{
+    ESP_LOGI(TAG, "Wake word detected: %s → start listening", wake_word.c_str());
+    if (!s_audio_ok) return;
+
+    s_audio_service->EnableVoiceProcessing(true);
+    s_chat_state = 1;
+
+    /* Publish AgentRequest(CHAT) */
+    mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
+    req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT;
+    req.chat_id.funcs.encode = noop_encode;
+
+    uint8_t buf[64];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
+        esp_mqtt_client_enqueue(s_mqtt_client, s_topic_up_agent,
+                                (const char *)buf, (int)stream.bytes_written, 1, 0, false);
+        ESP_LOGI(TAG, "AgentRequest CHAT sent (wake word)");
+    }
+}
+
+static void on_audio_send_queue()
+{
+    if (!s_audio_ok || !s_mqtt_connected) return;
+
+    /* Drain all ready Opus frames from AudioService */
+    while (auto pkt = s_audio_service->PopPacketFromSendQueue()) {
+        mqtt_agent_audio_frame_t frame = MQTT_AGENT_AUDIO_FRAME_INIT_ZERO;
+        frame.seq          = 0;  // seq not used by server for ordering
+        frame.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
+        frame.is_eos       = false;
+
+        bytes_buf_t opus_buf = {
+            .data = pkt->payload.data(),
+            .len  = pkt->payload.size()
+        };
+        frame.opus_data.funcs.encode = encode_bytes_callback;
+        frame.opus_data.arg = &opus_buf;
+
+        uint8_t buf[512];
+        pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+        if (pb_encode(&stream, &mqtt_agent_audio_frame_t_msg, &frame)) {
+            esp_mqtt_client_enqueue(s_mqtt_client, s_topic_up_opus,
+                                    (const char *)buf, (int)stream.bytes_written, 0, 0, false);
+        }
+    }
+}
+
 /* ── MQTT message handler ────────────────────────────────────────────────── */
 static void handle_mqtt_data(const char *topic, int topic_len,
                               const char *data,  int data_len)
@@ -504,9 +633,11 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         return;
     }
 
-    /* down/opus topic — voice intercom downlink */
+    /* down/opus topic — TTS audio → AudioService */
     if (topic_len == (int)strlen(s_topic_down_opus) &&
         memcmp(topic, s_topic_down_opus, topic_len) == 0) {
+        if (!s_audio_ok) return;
+
         mqtt_agent_audio_frame_t frame = MQTT_AGENT_AUDIO_FRAME_INIT_ZERO;
         uint8_t opus_raw[256];
         bytes_buf_t opus_buf = { .data = opus_raw, .cap = sizeof(opus_raw) };
@@ -514,7 +645,7 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         frame.opus_data.arg = &opus_buf;
 
         uint8_t transcript_buf[256], llm_buf[1024], extra_buf[256];
-        bytes_buf_t ts_buf  = { .data = transcript_buf, .cap = sizeof(transcript_buf) };
+        bytes_buf_t ts_buf   = { .data = transcript_buf, .cap = sizeof(transcript_buf) };
         bytes_buf_t llm_buf2 = { .data = llm_buf,       .cap = sizeof(llm_buf) };
         bytes_buf_t ex_buf   = { .data = extra_buf,     .cap = sizeof(extra_buf) };
         frame.stats.transcript.funcs.decode   = decode_bytes_callback;
@@ -524,24 +655,51 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         frame.stats.extra.funcs.decode       = decode_bytes_callback;
         frame.stats.extra.arg                = &ex_buf;
 
-        ESP_LOGD(TAG, "Raw downlink: len=%u", (unsigned)data_len);
-
         pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)data, data_len);
         if (!pb_decode(&stream, &mqtt_agent_audio_frame_t_msg, &frame)) {
             ESP_LOGW(TAG, "Downlink AudioFrame decode: %s", PB_GET_ERROR(&stream));
             return;
         }
-        if (!s_audio_pipeline_ok) return;
-        ESP_LOGD(TAG, "Decoded AF: seq=%llu eos=%d opus_len=%u",
-                 (unsigned long long)frame.seq, (int)frame.is_eos,
-                 (unsigned)opus_buf.len);
+
         if (ts_buf.len > 0)
             ESP_LOGI(TAG, "  STT: %.*s", (int)ts_buf.len, ts_buf.data);
         if (llm_buf2.len > 0)
             ESP_LOGI(TAG, "  LLM: %.*s", (int)llm_buf2.len, llm_buf2.data);
-        if (ex_buf.len > 0)
-            ESP_LOGD(TAG, "  Extra: %.*s", (int)ex_buf.len, ex_buf.data);
-        audio_pipeline_feed_downlink(opus_buf.data, opus_buf.len, frame.is_eos);
+
+        if (frame.is_eos) {
+            ESP_LOGI(TAG, "Downlink EOS → stop listening");
+            s_audio_service->EnableVoiceProcessing(false);
+            s_chat_state = 0;
+            auto_test_on_downlink_eos(NULL);
+            return;
+        }
+
+        if (opus_buf.len > 0) {
+            auto pkt = std::make_unique<AudioStreamPacket>();
+            pkt->sample_rate   = 16000;
+            pkt->frame_duration = 20;
+            pkt->timestamp     = (uint32_t)frame.timestamp_ms;
+            pkt->payload.assign(opus_raw, opus_raw + opus_buf.len);
+            s_audio_service->PushPacketToDecodeQueue(std::move(pkt));
+        }
+        return;
+    }
+
+    /* down/agent_response topic */
+    if (topic_len == (int)strlen(s_topic_down_agent) &&
+        memcmp(topic, s_topic_down_agent, topic_len) == 0) {
+        mqtt_agent_agent_response_t resp = MQTT_AGENT_AGENT_RESPONSE_INIT_ZERO;
+        uint8_t reason_buf[128] = {};
+        bytes_buf_t r_buf = { .data = reason_buf, .cap = sizeof(reason_buf) };
+        resp.reason.funcs.decode = decode_bytes_callback;
+        resp.reason.arg = &r_buf;
+
+        pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)data, data_len);
+        if (!pb_decode(&stream, &mqtt_agent_agent_response_t_msg, &resp)) {
+            ESP_LOGW(TAG, "AgentResponse decode: %s", PB_GET_ERROR(&stream));
+            return;
+        }
+        ESP_LOGI(TAG, "AgentResponse: code=%d", resp.code);
         return;
     }
 }
@@ -575,8 +733,9 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         s_mqtt_connected = true;
         esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd, 1);
         esp_mqtt_client_subscribe(s_mqtt_client, s_topic_down_opus, 1);
-        ESP_LOGI(TAG, "MQTT connected, sub: %s + %s",
-                 s_topic_cmd, s_topic_down_opus);
+        esp_mqtt_client_subscribe(s_mqtt_client, s_topic_down_agent, 1);
+        ESP_LOGI(TAG, "MQTT connected, sub: %s + %s + %s",
+                 s_topic_cmd, s_topic_down_opus, s_topic_down_agent);
         publish_status_report();
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -680,73 +839,6 @@ static void wifi_init_sta(void)
                         pdFALSE, pdTRUE, portMAX_DELAY);
 }
 
-/* ── Audio pipeline callbacks ─────────────────────────────────────────────── */
-
-/* Called by audio_pipeline when encoded Opus packet is ready */
-static void on_uplink_opus_ready(const uint8_t *data, size_t len,
-                                  uint64_t seq, uint64_t timestamp_ms,
-                                  bool is_eos, void *user_data)
-{
-    mqtt_agent_audio_frame_t frame = MQTT_AGENT_AUDIO_FRAME_INIT_ZERO;
-    frame.seq          = seq;
-    frame.timestamp_ms = timestamp_ms;
-    frame.is_eos       = is_eos;
-
-    uint8_t buf[512];
-    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-
-    if (!is_eos && data) {
-        bytes_buf_t opus_buf = { .data = (uint8_t *)data, .len = len };
-        frame.opus_data.funcs.encode = encode_bytes_callback;
-        frame.opus_data.arg = &opus_buf;
-    }
-
-    if (!pb_encode(&stream, &mqtt_agent_audio_frame_t_msg, &frame)) {
-        ESP_LOGE(TAG, "AudioFrame encode: %s", PB_GET_ERROR(&stream));
-        return;
-    }
-    esp_mqtt_client_enqueue(s_mqtt_client, s_topic_up_opus,
-                            (const char *)buf, (int)stream.bytes_written, 1, 0, false);
-}
-
-/* Called when wake word detected */
-static void on_wake_word_detected(void *user_data)
-{
-    ESP_LOGI(TAG, "Wake word detected → start listening");
-    if (audio_pipeline_is_listening()) {
-        ESP_LOGW(TAG, "Already listening, ignoring wake word");
-        return;
-    }
-    audio_pipeline_start_listening();
-
-    /* Publish AgentRequest(CHAT) */
-    mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
-    req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT;
-    req.chat_id.funcs.encode = noop_encode;
-
-    uint8_t buf[32];
-    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
-        esp_mqtt_client_publish(s_mqtt_client, s_topic_up_agent,
-                                (const char *)buf, (int)stream.bytes_written, 1, 0);
-    }
-}
-
-/* Called when downlink TTS EOS received — return to IDLE for wake-word detection */
-static void on_downlink_eos(void *user_data)
-{
-    ESP_LOGI(TAG, "Downlink TTS done → stop listening");
-    audio_pipeline_stop_listening();
-    /* Also notify auto_test if it is running */
-    auto_test_on_downlink_eos(user_data);
-}
-
-/* Called when VAD changes during listening */
-static void on_vad_state_change(bool speaking, void *user_data)
-{
-    ESP_LOGI(TAG, "VAD: %s", speaking ? "SPEECH" : "SILENCE");
-}
-
 /* ── Button task ─────────────────────────────────────────────────────────── */
 static void button_task(void *arg)
 {
@@ -756,11 +848,8 @@ static void button_task(void *arg)
 
     int stable_level = 1;
     int debounce_cnt = 0;
-    int heartbeat = 0;
     for (;;) {
         int level = gpio_get_level(BOOT_BUTTON_GPIO);
-        if (++heartbeat % 300 == 0)  /* ~every 3s */
-            ESP_LOGI(TAG, "Button heartbeat level=%d stable=%d", level, stable_level);
         if (level == stable_level) {
             debounce_cnt = 0;
         } else {
@@ -770,41 +859,45 @@ static void button_task(void *arg)
                 debounce_cnt = 0;
                 if (stable_level == 0) {
                     /* Button pressed — start listening (PTT) */
-                    if (!audio_pipeline_is_listening()) {
-                        audio_pipeline_start_listening();
-#if 0  // DISABLED: diagnostic — isolate VFS heap corruption
-                        /* Enqueue AgentRequest(CHAT) — enqueue avoids cross-core TLS race */
+                    if (s_audio_ok && s_chat_state == 0) {
+                        ESP_LOGI(TAG, "Button PTT → start listening");
+                        s_audio_service->EnableVoiceProcessing(true);
+                        s_chat_state = 1;
+
+                        /* Send AgentRequest(CHAT) */
                         if (s_mqtt_connected) {
                             mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
                             req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_CHAT;
                             req.chat_id.funcs.encode = noop_encode;
-                            uint8_t buf[32];
+                            uint8_t buf[64];
                             pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
                             if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
                                 esp_mqtt_client_enqueue(s_mqtt_client, s_topic_up_agent,
                                                         (const char *)buf, (int)stream.bytes_written, 1, 0, false);
+                                ESP_LOGI(TAG, "AgentRequest CHAT sent (button)");
                             }
                         }
-#endif
                     }
                 } else {
                     /* Button released — stop listening (PTT) */
-                    if (audio_pipeline_is_listening()) {
-                        audio_pipeline_stop_listening();
-#if 0  // DISABLED: diagnostic — does enqueue trigger VFS heap corruption?
-                        /* Enqueue AgentRequest(STOP) — enqueue avoids cross-core TLS race */
+                    if (s_audio_ok && s_chat_state != 0) {
+                        ESP_LOGI(TAG, "Button release → stop listening");
+                        s_audio_service->EnableVoiceProcessing(false);
+                        s_chat_state = 0;
+
+                        /* Send AgentRequest(STOP) */
                         if (s_mqtt_connected) {
                             mqtt_agent_agent_request_t req = MQTT_AGENT_AGENT_REQUEST_INIT_ZERO;
                             req.action = MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_STOP;
                             req.chat_id.funcs.encode = noop_encode;
-                            uint8_t buf[32];
+                            uint8_t buf[64];
                             pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
                             if (pb_encode(&stream, &mqtt_agent_agent_request_t_msg, &req)) {
                                 esp_mqtt_client_enqueue(s_mqtt_client, s_topic_up_agent,
                                                         (const char *)buf, (int)stream.bytes_written, 1, 0, false);
+                                ESP_LOGI(TAG, "AgentRequest STOP sent (button)");
                             }
                         }
-#endif
                     }
                 }
             }
@@ -814,13 +907,9 @@ static void button_task(void *arg)
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
-void app_main(void)
+extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Firmware built: %s", BUILD_TIMESTAMP);
-    /*
-     * esp_video_init() must be called EARLY — some cameras need XCLK before
-     * the host finishes booting. We call it before WiFi to satisfy OV5640.
-     */
 
     /* NVS */
     esp_err_t ret = nvs_flash_init();
@@ -889,30 +978,53 @@ void app_main(void)
     /* HTTP server */
     http_server_start();
 
-    /* IO expander (CH32V003 @0x24) — needed for PA control on this board */
+    /* ── IO expander + PA init (synchronous, before audio) ── */
     audio_pa_init(s_i2c_bus);
 
-    /* Audio hardware (ES8311 + ES7210 on shared I2C bus) */
-    ret = audio_hw_init(s_i2c_bus);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Audio HW init failed — continuing without audio");
+    /* ── Audio hardware (BoxAudioCodec: ES8311 + ES7210) ── */
+    s_audio_codec = new BoxAudioCodec(
+        s_i2c_bus,
+        AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_RATE,
+        AUDIO_MCLK_PIN, AUDIO_BCLK_PIN, AUDIO_WS_PIN,
+        AUDIO_DOUT_PIN, AUDIO_DIN_PIN,
+        GPIO_NUM_NC,                         // PA pin (not used; IO expander controls PA)
+        (uint8_t)ES8311_CODEC_DEFAULT_ADDR,  // 0x18
+        (uint8_t)ES7210_CODEC_DEFAULT_ADDR,  // 0x40
+        AUDIO_INPUT_REFERENCE
+    );
+
+    /* Register codec with Board stub (AudioService uses Board::GetInstance().GetAudioCodec()) */
+    Board::GetInstance().SetAudioCodec(s_audio_codec);
+
+    /* Load wake word models */
+    s_models = esp_srmodel_init("model");
+    if (s_models) {
+        ESP_LOGI(TAG, "SR models loaded: %d models", s_models->num);
+    } else {
+        ESP_LOGW(TAG, "No SR models found — KWS disabled");
     }
 
-    /* Audio pipeline (dual AFE: SR wake word + VC voice communication, Opus codec) */
-    if (ret == ESP_OK) {
-        audio_pipeline_callbacks_t cb = {
-            .on_wake_word      = on_wake_word_detected,
-            .on_vad_change     = on_vad_state_change,
-            .on_uplink_opus    = on_uplink_opus_ready,
-            .on_downlink_eos   = on_downlink_eos,
-            .user_data         = NULL,
-        };
-        ret = audio_pipeline_init(&cb);
-        if (ret != ESP_OK)
-            ESP_LOGE(TAG, "Audio pipeline init failed — continuing without audio");
-        else
-            s_audio_pipeline_ok = true;
+    /* Initialize AudioService */
+    s_audio_service = new AudioService();
+    s_audio_service->Initialize(s_audio_codec);
+    if (s_models) {
+        s_audio_service->SetModelsList(s_models);
     }
+
+    /* Register callbacks */
+    AudioServiceCallbacks cbs = {};
+    cbs.on_send_queue_available = on_audio_send_queue;
+    cbs.on_wake_word_detected   = on_audio_wake_word;
+    cbs.on_vad_change           = [](bool speaking) {
+        ESP_LOGI(TAG, "VAD: %s", speaking ? "SPEECH" : "SILENCE");
+    };
+    s_audio_service->SetCallbacks(cbs);
+
+    /* Start audio pipeline */
+    s_audio_service->Start();
+    s_audio_service->EnableWakeWordDetection(true);
+    s_audio_ok = true;
+    ESP_LOGI(TAG, "Audio pipeline started (AudioService + BoxAudioCodec + AfeWakeWord)");
 
     /* Button task */
     BaseType_t btn_ret = xTaskCreate(button_task, "button", 5120, NULL, 3, NULL);
@@ -944,9 +1056,10 @@ void app_main(void)
     /* Idle */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(30000));
-        ESP_LOGI(TAG, "Uptime: %lld s, cam=%s, mqtt=%s",
+        ESP_LOGI(TAG, "Uptime: %lld s, cam=%s, mqtt=%s, audio=%s",
                  esp_timer_get_time() / 1000000LL,
                  camera_is_ready() ? "OK" : "NONE",
-                 s_mqtt_connected ? "UP" : "DOWN");
+                 s_mqtt_connected ? "UP" : "DOWN",
+                 s_audio_ok ? "OK" : "NONE");
     }
 }

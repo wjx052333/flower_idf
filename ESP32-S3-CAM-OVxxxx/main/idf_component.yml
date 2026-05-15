@@ -5,5 +5,6 @@ dependencies:
   espressif/esp_new_jpeg: '>=1.0.0'
   idf: '>=5.5'
   espressif/esp_audio_codec: ^2.5.0
+  espressif/esp_audio_effects: ~1.2.1
   espressif/esp-sr: ^2.4.3
   espressif/esp_codec_dev: ^1.5.9
