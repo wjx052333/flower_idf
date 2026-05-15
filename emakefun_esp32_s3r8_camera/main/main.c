@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <time.h>
 #include "camera.h"
+#include "ds18b20.h"
 #include "build_info.h"
 
 #include "freertos/FreeRTOS.h"
@@ -48,7 +49,7 @@
 
 #include "pb_encode.h"
 #include "pb_decode.h"
-#include "proto/flower.pb.h"
+#include "flower.pb.h"
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
@@ -71,6 +72,11 @@ static char s_topic_cmd_resp[96];
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
 #define STATUS_INTERVAL_MS  30000
+#define STATUS_BUF_SIZE     256
+
+#ifndef CONFIG_DS18B20_GPIO
+#define CONFIG_DS18B20_GPIO  46
+#endif
 
 #define TAG "CamMqtt"
 
@@ -141,21 +147,50 @@ build_topics:
 }
 
 /* ── Status report ───────────────────────────────────────────────────────── */
+static flower_metric_t s_metrics[1];
+
+static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field,
+                           void *const *arg)
+{
+    flower_metric_t *metrics = (flower_metric_t *)(*arg);
+    for (int i = 0; i < 1; i++) {
+        if (!pb_encode_tag_for_field(stream, field))
+            return false;
+        if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
+            return false;
+    }
+    return true;
+}
+
 static void publish_status_report(void)
 {
+    float temp = ds18b20_read_temperature();
+
+    if (temp > -273.0f) {
+        strcpy(s_metrics[0].key, "temp");
+        s_metrics[0].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+        s_metrics[0].value.double_value = (double)temp;
+    } else {
+        strcpy(s_metrics[0].key, "temp");
+        s_metrics[0].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+        s_metrics[0].value.int64_value = 0;
+    }
+
     if (!s_mqtt_connected) return;
 
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
-    sr.signal_dbm    = 0;
-    sr.timestamp     = (int64_t)now * 1000;
-    sr.has_version   = true;
-    sr.version.major = 1;
-    sr.version.minor = 0;
-    sr.version.patch = 0;
+    sr.timestamp       = (int64_t)now * 1000;
+    sr.has_version     = true;
+    sr.version.major   = 1;
+    sr.version.minor   = 0;
+    sr.version.patch   = 0;
+    strcpy(sr.device_type, "camera");
+    sr.metrics.arg = s_metrics;
+    sr.metrics.funcs.encode = encode_metrics;
 
-    uint8_t buf[FLOWER_STATUS_REPORT_SIZE];
+    uint8_t buf[STATUS_BUF_SIZE];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
     if (!pb_encode(&stream, &flower_status_report_t_msg, &sr)) {
         ESP_LOGE(TAG, "Status encode: %s", PB_GET_ERROR(&stream));
@@ -163,7 +198,11 @@ static void publish_status_report(void)
     }
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
-    ESP_LOGI(TAG, "Status published (signal_dbm=0)");
+
+    if (temp > -273.0f)
+        ESP_LOGI(TAG, "Status published (temp=%.1f C)", temp);
+    else
+        ESP_LOGI(TAG, "Status published (temp=n/a)");
 }
 
 /* ── Snapshot ────────────────────────────────────────────────────────────── */
@@ -594,6 +633,11 @@ void app_main(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed (%s) — continuing without camera",
                  esp_err_to_name(ret));
+    }
+
+    /* DS18B20 temperature sensor */
+    if (CONFIG_DS18B20_GPIO >= 0) {
+        ds18b20_init((gpio_num_t)CONFIG_DS18B20_GPIO);
     }
 
     /* Snapshot queue + task */

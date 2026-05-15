@@ -2,11 +2,12 @@ idf_component_register(
     SRCS
         "main.c"
         "camera.c"
+        "ds18b20.c"
         "build_info.c"
-        "proto/flower.pb.c"
+        "../../nanopb_gen/proto/flower.pb.c"
     INCLUDE_DIRS
         "."
-        "proto"
+        "../../nanopb_gen/proto"
     REQUIRES
         esp_wifi
         esp_event

@@ -119,4 +119,9 @@ menu "Camera DVP Pin Configuration"
 
 endmenu
 
+    config DS18B20_GPIO
+        int "DS18B20 OneWire GPIO pin (-1 = none)"
+        default 46
+        range -1 48
+
 endmenu
