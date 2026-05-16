@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 #include <time.h>
 #include "camera.h"
 #include "ds18b20.h"
@@ -36,6 +37,9 @@
 #include "esp_timer.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
+
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
 
 #include "mqtt_client.h"
 #include "mqtt5_client.h"
@@ -71,6 +75,14 @@ static char s_topic_status[96];
 static char s_topic_cmd_resp[96];
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
+#define LED_PIN              2
+#define RELAY_PIN            48
+#define HUMIDITY_ADC_CHANNEL ADC_CHANNEL_0  /* GPIO1 */
+#define BREATH_PERIOD_MS     3000
+#define APP_TIMER_INTERVAL_MS 50
+#define BREATH_STEPS         (BREATH_PERIOD_MS / APP_TIMER_INTERVAL_MS)
+#define RELAY_DEFAULT_DURATION_MS 10000
+
 #define STATUS_INTERVAL_MS  30000
 #define STATUS_BUF_SIZE     256
 
@@ -96,6 +108,10 @@ typedef struct {
 
 static QueueHandle_t     s_snap_queue;
 static volatile bool     s_snap_in_progress = false;
+
+static volatile bool            s_relay_on       = false;
+static volatile int64_t         s_relay_on_us    = 0;
+static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
 static void calc_signature(int64_t ts_ms, const char *device_id,
@@ -146,14 +162,83 @@ build_topics:
     snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
 }
 
+/* ── Breathing LED ───────────────────────────────────────────────────────── */
+static esp_timer_handle_t s_app_timer = NULL;
+static int64_t            s_app_tick  = 0;
+
+static void app_timer_cb(void *arg)
+{
+    s_app_tick++;
+    float phase = (float)(s_app_tick % BREATH_STEPS) / (float)BREATH_STEPS
+                  * 2.0f * (float)M_PI;
+    uint32_t duty = (uint32_t)(((sinf(phase - (float)M_PI / 2.0f) + 1.0f) / 2.0f) * 255.0f);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+
+    /* Relay auto-off */
+    if (s_relay_on) {
+        int64_t elapsed_ms = (esp_timer_get_time() - s_relay_on_us) / 1000LL;
+        if (elapsed_ms >= (int64_t)s_relay_duration) {
+            gpio_set_level(RELAY_PIN, 1);
+            s_relay_on = false;
+        }
+    }
+}
+
+/* ── ADC ─────────────────────────────────────────────────────────────────── */
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+
+static void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten    = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, HUMIDITY_ADC_CHANNEL, &chan_cfg));
+}
+
+static int adc_read_raw(adc_channel_t channel)
+{
+    int raw = 0;
+    adc_oneshot_read(s_adc_handle, channel, &raw);
+    return raw;
+}
+
+/* ── Relay control helpers ───────────────────────────────────────────────── */
+static void publish_resp(const flower_command_response_t *resp)
+{
+    uint8_t buf[FLOWER_COMMAND_RESPONSE_SIZE];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, &flower_command_response_t_msg, resp)) {
+        ESP_LOGE(TAG, "resp encode: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_cmd_resp,
+                            (const char *)buf, (int)stream.bytes_written, 1, 0);
+}
+
+static void send_relay_resp(bool success)
+{
+    flower_command_response_t resp = FLOWER_COMMAND_RESPONSE_INIT_ZERO;
+    resp.which_payload = FLOWER_COMMAND_RESPONSE_RELAY_CONTROL_TAG;
+    resp.payload.relay_control.result =
+        success ? FLOWER_CMD_RESULT_OK : FLOWER_CMD_RESULT_BUSY;
+    publish_resp(&resp);
+}
+
 /* ── Status report ───────────────────────────────────────────────────────── */
-static flower_metric_t s_metrics[1];
+static flower_metric_t s_metrics[2];
 
 static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field,
                            void *const *arg)
 {
     flower_metric_t *metrics = (flower_metric_t *)(*arg);
-    for (int i = 0; i < 1; i++) {
+    for (int i = 0; i < 2; i++) {
         if (!pb_encode_tag_for_field(stream, field))
             return false;
         if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
@@ -175,6 +260,12 @@ static void publish_status_report(void)
         s_metrics[0].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
         s_metrics[0].value.int64_value = 0;
     }
+
+    int raw_humi = adc_read_raw(HUMIDITY_ADC_CHANNEL);
+    float humi_pct = raw_humi * 100.0f / 4096.0f;
+    strcpy(s_metrics[1].key, "humi");
+    s_metrics[1].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[1].value.double_value = (double)humi_pct;
 
     if (!s_mqtt_connected) return;
 
@@ -200,9 +291,9 @@ static void publish_status_report(void)
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
 
     if (temp > -273.0f)
-        ESP_LOGI(TAG, "Status published (temp=%.1f C)", temp);
+        ESP_LOGI(TAG, "Status published (temp=%.1f C, humi=%.1f%%)", temp, (double)humi_pct);
     else
-        ESP_LOGI(TAG, "Status published (temp=n/a)");
+        ESP_LOGI(TAG, "Status published (temp=n/a, humi=%.1f%%)", (double)humi_pct);
 }
 
 /* ── Snapshot ────────────────────────────────────────────────────────────── */
@@ -380,6 +471,23 @@ static void ota_task(void *arg)
 /* ── HTTP server ──────────────────────────────────────────────────────────── */
 static httpd_handle_t s_httpd = NULL;
 
+static esp_err_t http_view_handler(httpd_req_t *req)
+{
+    const char *html =
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Camera</title>"
+        "<style>body{margin:0;background:#000;display:flex;justify-content:center;"
+        "align-items:center;min-height:100vh}"
+        "img{max-width:100vw;max-height:100vh}</style></head>"
+        "<body><img id='snap' src='/snapshot' onload=\""
+        "var s=this;setTimeout(function(){s.src='/snapshot?'+Date.now()},100)"
+        "\"></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, html);
+    return ESP_OK;
+}
+
 static esp_err_t http_snapshot_handler(httpd_req_t *req)
 {
     const uint8_t *jpeg = NULL;
@@ -408,6 +516,23 @@ static esp_err_t http_root_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t http_relay_handler(httpd_req_t *req)
+{
+    char query[64] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16] = {};
+        if (httpd_query_key_value(query, "duration", val, sizeof(val)) == ESP_OK) {
+            uint32_t d = (uint32_t)atoi(val);
+            if (d > 0) s_relay_duration = d;
+        }
+    }
+    gpio_set_level(RELAY_PIN, 0);
+    s_relay_on_us = esp_timer_get_time();
+    s_relay_on    = true;
+    httpd_resp_send(req, "0", 1);
+    return ESP_OK;
+}
+
 static void http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -415,10 +540,14 @@ static void http_server_start(void)
         ESP_LOGE(TAG, "HTTP server start failed");
         return;
     }
-    httpd_uri_t root_uri = { .uri = "/",         .method = HTTP_GET, .handler = http_root_handler };
-    httpd_uri_t snap_uri = { .uri = "/snapshot", .method = HTTP_GET, .handler = http_snapshot_handler };
+    httpd_uri_t root_uri  = { .uri = "/",              .method = HTTP_GET, .handler = http_root_handler };
+    httpd_uri_t view_uri  = { .uri = "/view",          .method = HTTP_GET, .handler = http_view_handler };
+    httpd_uri_t snap_uri  = { .uri = "/snapshot",      .method = HTTP_GET, .handler = http_snapshot_handler };
+    httpd_uri_t relay_uri = { .uri = "/change_relay1", .method = HTTP_GET, .handler = http_relay_handler };
     httpd_register_uri_handler(s_httpd, &root_uri);
+    httpd_register_uri_handler(s_httpd, &view_uri);
     httpd_register_uri_handler(s_httpd, &snap_uri);
+    httpd_register_uri_handler(s_httpd, &relay_uri);
     ESP_LOGI(TAG, "HTTP server started on port %d", cfg.server_port);
 }
 
@@ -439,6 +568,31 @@ static void handle_mqtt_data(const char *topic, int topic_len,
         return;
     }
     switch (s_cmd.which_payload) {
+    case FLOWER_COMMAND_RELAY_CONTROL_TAG: {
+        flower_relay_control_t *rc = &s_cmd.payload.relay_control;
+        if (rc->on) {
+            if (s_relay_on) {
+                ESP_LOGW(TAG, "Relay already ON, ignoring command");
+                send_relay_resp(false);
+                break;
+            }
+            gpio_set_level(RELAY_PIN, 0);
+            s_relay_on_us = esp_timer_get_time();
+            if (rc->duration_ms > 0) {
+                s_relay_duration = rc->duration_ms;
+                s_relay_on = true;
+            } else {
+                s_relay_on = false;
+            }
+        } else {
+            gpio_set_level(RELAY_PIN, 1);
+            s_relay_on = false;
+        }
+        send_relay_resp(true);
+        ESP_LOGI(TAG, "Relay %s via MQTT (duration=%u ms)",
+                 rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
+        break;
+    }
     case FLOWER_COMMAND_OTA_TAG: {
         if (s_ota_in_progress) {
             ESP_LOGW(TAG, "OTA already in progress, ignoring");
@@ -584,7 +738,8 @@ static void wifi_init_sta(void)
     s_wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(netif, g_device_id);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -628,6 +783,9 @@ void app_main(void)
     nvs_flash_init_partition("fctry");
     device_identity_init();
 
+    /* ADC: humidity sensor on IO1 */
+    adc_init();
+
     /* Camera init (creates own I2C bus using Kconfig pins) */
     ret = camera_init();
     if (ret != ESP_OK) {
@@ -639,6 +797,45 @@ void app_main(void)
     if (CONFIG_DS18B20_GPIO >= 0) {
         ds18b20_init((gpio_num_t)CONFIG_DS18B20_GPIO);
     }
+
+    /* LEDC: breathing LED on IO2 */
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_TIMER_8_BIT,
+        .freq_hz          = 1000,
+        .clk_cfg          = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_ch = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .timer_sel  = LEDC_TIMER_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = LED_PIN,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_ch));
+
+    /* GPIO: relay (output, default off, active-low) */
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
+    io_conf.mode         = GPIO_MODE_OUTPUT;
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    gpio_set_level(RELAY_PIN, 1);
+
+    /* App timer: 50ms breathing LED */
+    esp_timer_create_args_t app_args = {
+        .callback              = app_timer_cb,
+        .dispatch_method       = ESP_TIMER_TASK,
+        .name                  = "app",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&app_args, &s_app_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_app_timer,
+                        (uint64_t)APP_TIMER_INTERVAL_MS * 1000ULL));
 
     /* Snapshot queue + task */
     s_snap_queue = xQueueCreate(1, sizeof(snap_req_t));

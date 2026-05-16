@@ -19,6 +19,7 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -56,6 +57,15 @@ static struct v4l2_buffer s_vbuf;
 
 /* Flash LED GPIO (-1 = not configured) */
 static int s_led_gpio = -1;
+
+/* LED off-delay timer — each capture restarts it, so continuous capture keeps LED on */
+static esp_timer_handle_t s_led_timer = NULL;
+#define LED_OFF_DELAY_US  (1000 * 1000)
+
+static void led_off_timer_cb(void *arg)
+{
+    gpio_set_level(s_led_gpio, 0);
+}
 
 esp_err_t camera_init_with_i2c(i2c_master_bus_handle_t i2c_handle)
 {
@@ -225,8 +235,20 @@ esp_err_t camera_init_with_i2c(i2c_master_bus_handle_t i2c_handle)
     };
     gpio_config(&led_cfg);
     gpio_set_level(s_led_gpio, 0);
-    ESP_LOGI(TAG, "Flash LED on GPIO %d", s_led_gpio);
+    ESP_LOGI(TAG, "Flash LED on GPIO %d, off-delay %d ms", s_led_gpio,
+             (int)(LED_OFF_DELAY_US / 1000));
 #endif
+
+    /* Create LED off-delay timer */
+    if (s_led_gpio >= 0) {
+        esp_timer_create_args_t targs = {
+            .callback              = led_off_timer_cb,
+            .dispatch_method       = ESP_TIMER_TASK,
+            .name                  = "led_off",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&targs, &s_led_timer);
+    }
 
     ESP_LOGI(TAG, "Camera stream started (fd=%d)", s_cam_fd);
     return ESP_OK;
@@ -274,14 +296,20 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
     s_vbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     s_vbuf.memory = V4L2_MEMORY_MMAP;
     if (ioctl(s_cam_fd, VIDIOC_DQBUF, &s_vbuf) < 0) {
-        if (s_led_gpio >= 0) gpio_set_level(s_led_gpio, 0);
+        if (s_led_gpio >= 0) {
+            gpio_set_level(s_led_gpio, 0);
+            if (s_led_timer) esp_timer_stop(s_led_timer);
+        }
         xSemaphoreGive(s_cam_sem);
         ESP_LOGE(TAG, "VIDIOC_DQBUF failed (errno=%d)", errno);
         return ESP_FAIL;
     }
 
-    /* Flash LED off after frame is in buffer */
-    if (s_led_gpio >= 0) gpio_set_level(s_led_gpio, 0);
+    /* Restart off-delay timer: LED stays on during continuous capture */
+    if (s_led_gpio >= 0) {
+        esp_timer_stop(s_led_timer);
+        esp_timer_start_once(s_led_timer, LED_OFF_DELAY_US);
+    }
 
     *data = s_cam_buf[s_vbuf.index];
     *size = s_vbuf.bytesused;
