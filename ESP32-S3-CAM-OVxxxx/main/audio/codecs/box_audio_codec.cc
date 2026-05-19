@@ -23,6 +23,7 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
         .port = I2S_NUM_0,
         .rx_handle = rx_handle_,
         .tx_handle = tx_handle_,
+        .clk_src = I2S_CLK_SRC_DEFAULT,
     };
     data_if_ = audio_codec_new_i2s_data(&i2s_cfg);
     assert(data_if_ != NULL);
@@ -101,6 +102,7 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
         .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
+        .allow_pd = false,
         .intr_priority = 0,
     };
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &rx_handle_));
@@ -110,7 +112,8 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
             .sample_rate_hz = (uint32_t)output_sample_rate_,
             .clk_src = I2S_CLK_SRC_DEFAULT,
             .ext_clk_freq_hz = 0,
-            .mclk_multiple = I2S_MCLK_MULTIPLE_256
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+            .bclk_div = 8,
         },
         .slot_cfg = {
             .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,

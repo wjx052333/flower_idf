@@ -2,11 +2,19 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
+# CPU frequency — 240MHz required for AFE real-time DSP (AEC + NS)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # PSRAM (ESP32-S3R8: 16MB flash + 8MB PSRAM, needed for UYVY framebuffers)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+
+# Match xiaozhi-esp32 PSRAM alloc thresholds
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # OTA: allow plain HTTP firmware URLs (for local dev server)
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
@@ -35,6 +43,17 @@ CONFIG_MQTT_TASK_STACK_SIZE=16384
 # MQTT out-buffer large enough to hold a full JPEG snapshot (VGA~30KB + margin)
 CONFIG_MQTT_BUFFER_SIZE=65536
 
+# WiFi/LWIP memory optimizations (reduce internal DRAM pressure)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_RX_BA_WIN=3
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+# Cache optimizations
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
 # SR models — auto-packed by esp-sr's movemodel.py during build
 CONFIG_SR_WN_WN9_MIAOMIAOTONGXUE_TTS=y
 CONFIG_SR_NSN_NSNET2=y
@@ -42,18 +61,20 @@ CONFIG_SR_NSN_NSNET2=y
 # Auto-test (disabled by default; set =y to enable MQTT voice test on boot)
 # CONFIG_AUTO_TEST=y
 
-# FreeRTOS stack overflow detection (canary method — logs task name + overflowed bytes)
-CONFIG_FREERTOS_CHECK_STACKOVERFLOW=2
+# AFE audio processor (AEC + noise suppression)
+CONFIG_USE_AUDIO_PROCESSOR=y
+
+# Compiler optimization (required for AFE real-time DSP: AEC + NS)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# Heap corruption detection — comprehensive poisoning adds canaries around
-# every heap block; caught at free/malloc time if overwritten.
-CONFIG_HEAP_POISONING_COMPREHENSIVE=y
-
 # Target
 CONFIG_IDF_TARGET="esp32s3"
+
+# Enable C++ RTTI (required for dynamic_cast in AudioService)
+CONFIG_COMPILER_CXX_RTTI=y
 
 # DVP camera — enable DVP device in esp_video
 CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=y
@@ -95,7 +116,6 @@ CONFIG_ESP_SCCB_TRANS_TIMEOUT_DEFAULT=500
 # Video parameter checking
 CONFIG_ESP_VIDEO_CHECK_PARAMETERS=y
 
-# Match xiaozhi-esp32 PSRAM alloc thresholds
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
-CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Main task stack (event loop runs protobuf encode + audio draining)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 

@@ -6,14 +6,21 @@ set(SRCS
 
 # C++ audio subsystem (from xiaozhi-esp32)
 list(APPEND SRCS
-    "audio/codecs/audio_codec.cc"
+    "audio/audio_codec.cc"
     "audio/codecs/box_audio_codec.cc"
     "audio/wake_words/afe_wake_word.cc"
-    "audio/processors/no_audio_processor.cc"
+    "audio/wake_words/custom_wake_word.cc"
     "audio/audio_service.cc"
     "audio/demuxer/ogg_demuxer.cc"
     "settings.cc"
 )
+
+# Select audio processor according to Kconfig
+if(CONFIG_USE_AUDIO_PROCESSOR)
+    list(APPEND SRCS "audio/processors/afe_audio_processor.cc")
+else()
+    list(APPEND SRCS "audio/processors/no_audio_processor.cc")
+endif()
 
 if(CONFIG_AUTO_TEST)
     list(APPEND SRCS "auto_test.c" "test_opus_data.c")
@@ -22,11 +29,11 @@ endif()
 idf_component_register(
     SRCS
         ${SRCS}
-        "proto/flower.pb.c"
-        "proto/mqtt_agent.pb.c"
+        "../../nanopb_gen/proto/flower.pb.c"
+        "../../nanopb_gen/proto/mqtt_agent.pb.c"
     INCLUDE_DIRS
         "."
-        "proto"
+        "../../nanopb_gen/proto"
         "stubs"
         "audio"
         "audio/codecs"

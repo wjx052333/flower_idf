@@ -1,5 +1,4 @@
 #include "audio_codec.h"
-#include "board_stub.h"
 #include "settings.h"
 
 #include <esp_log.h>

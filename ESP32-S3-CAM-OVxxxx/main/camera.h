@@ -4,6 +4,10 @@
 #include "esp_err.h"
 #include "driver/i2c_master.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Init camera with existing I2C bus (shared with audio codecs).
  * Pass NULL i2c to use default port-0 internal bus. */
 esp_err_t camera_init_with_i2c(i2c_master_bus_handle_t i2c_handle);
@@ -15,3 +19,7 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size);
 
 /* Return the buffer to the driver (must be called after every successful capture). */
 void      camera_release_jpeg(void);
+
+#ifdef __cplusplus
+}
+#endif

@@ -29,7 +29,7 @@ config AUTO_TEST
 
 config USE_AUDIO_PROCESSOR
     bool "Enable AFE audio processor (AEC+NS)"
-    default n
+    default y
     help
         Enable AfeAudioProcessor for echo cancellation and noise suppression
         during voice calls. Disable to use NoAudioProcessor (pass-through).

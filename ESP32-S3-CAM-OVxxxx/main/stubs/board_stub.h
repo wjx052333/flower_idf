@@ -1,7 +1,8 @@
 #pragma once
 
 /* Minimal Board singleton stub — provides GetAudioCodec() for AudioService. */
-#include "audio_codec.h"
+
+class AudioCodec;
 
 class Board {
 public:

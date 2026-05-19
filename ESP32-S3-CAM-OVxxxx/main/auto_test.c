@@ -22,7 +22,7 @@
 #include "esp_timer.h"
 
 #include "pb_encode.h"
-#include "proto/mqtt_agent.pb.h"
+#include "mqtt_agent.pb.h"
 
 #define TAG "AutoTest"
 
