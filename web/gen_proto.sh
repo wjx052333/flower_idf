@@ -6,7 +6,7 @@
 #   mqtt.min.js      — MQTT.js browser bundle
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROTO="$SCRIPT_DIR/../../../../protocol/flower.proto"
+PROTO="$SCRIPT_DIR/../../../../protocol/ovo_iot_protocol/iot/protocol/flower.proto"
 PROTO_DIR="$(dirname "$PROTO")"
 
 # ── Python ────────────────────────────────────────────────────────────────────

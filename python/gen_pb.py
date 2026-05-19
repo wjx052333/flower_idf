@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROTO_FILE = os.path.join(HERE, "..", "..", "..", "..", "protocol", "flower.proto")
+PROTO_FILE = os.path.join(HERE, "..", "..", "..", "..", "protocol", "ovo_iot_protocol", "iot", "protocol", "flower.proto")
 PROTO_DIR = os.path.dirname(PROTO_FILE)
 OUT_DIR = HERE
 

@@ -10,7 +10,7 @@ NANOPB_VERSION="0.4.9"
 NANOPB_CACHE="$SCRIPT_DIR/.nanopb"
 NANOPB_COMP="$SCRIPT_DIR/components/nanopb"
 PROTO_OUT="$SCRIPT_DIR/proto"
-PROTO_DIR="$REPO_ROOT/protocol"
+PROTO_DIR="$REPO_ROOT/protocol/ovo_iot_protocol/iot/protocol"
 PROTO_SRC="$PROTO_DIR/flower.proto"
 AGENT_PROTO_SRC="$PROTO_DIR/mqtt_agent.proto"
 
