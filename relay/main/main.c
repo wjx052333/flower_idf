@@ -50,7 +50,7 @@
 
 #include "pb_encode.h"
 #include "pb_decode.h"
-#include "proto/flower.pb.h"
+#include "flower.pb.h"
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
@@ -89,6 +89,9 @@ static char s_topic_status[96];
 #define BREATH_PERIOD_MS          3000
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
 
+#define SCHEDULE_ON_HOUR   20   /* 20:00 relay auto-on  */
+#define SCHEDULE_OFF_HOUR  22   /* 22:00 relay auto-off */
+
 #define TAG "Flower"
 
 /* ── Device identity ─────────────────────────────────────────────────────── */
@@ -126,6 +129,7 @@ static volatile int64_t         s_relay_on_us    = 0;   /* esp_timer_get_time() 
 static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
 
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
+static volatile bool            s_schedule_relay_on = false;
 
 /* Static to avoid large stack allocation */
 static flower_command_t          s_cmd;
@@ -482,8 +486,31 @@ static void reconnect_timer_cb(void *arg)
     mqtt_start();
 }
 
+static void check_schedule(void)
+{
+    time_t now; time(&now);
+    if (now < 1700000000LL) return; /* NTP not synced yet */
+
+    struct tm t;
+    localtime_r(&now, &t);
+    bool in_window = (t.tm_hour >= SCHEDULE_ON_HOUR && t.tm_hour < SCHEDULE_OFF_HOUR);
+
+    if (in_window && !s_schedule_relay_on) {
+        gpio_set_level(RELAY_PIN, 0);
+        s_relay_on = false; /* no auto-off */
+        s_schedule_relay_on = true;
+        ESP_LOGI(TAG, "Schedule: relay ON (%02d:%02d)", t.tm_hour, t.tm_min);
+    } else if (!in_window && s_schedule_relay_on) {
+        gpio_set_level(RELAY_PIN, 1);
+        s_relay_on = false;
+        s_schedule_relay_on = false;
+        ESP_LOGI(TAG, "Schedule: relay OFF (%02d:%02d)", t.tm_hour, t.tm_min);
+    }
+}
+
 static void status_timer_cb(void *arg)
 {
+    check_schedule();
     publish_status_report();
 }
 
@@ -787,6 +814,10 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "NTP %s (ts=%lld)", now > 1700000000LL ? "OK" : "FAILED",
              (long long)now);
+
+    /* Timezone: CST (UTC+8) — required for schedule hour comparison */
+    setenv("TZ", "CST-8", 1);
+    tzset();
 
     /* MQTT */
     mqtt_start();

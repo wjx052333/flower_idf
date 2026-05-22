@@ -39,6 +39,7 @@
 #include "nvs_flash.h"
 
 #include "driver/ledc.h"
+#include "driver/uart.h"
 #include "esp_adc/adc_oneshot.h"
 
 #include "mqtt_client.h"
@@ -85,6 +86,11 @@ static char s_topic_cmd_resp[96];
 
 #define STATUS_INTERVAL_MS  30000
 #define STATUS_BUF_SIZE     256
+
+#define MODBUS_UART_PORT  UART_NUM_0
+#define MODBUS_UART_TXD   GPIO_NUM_43
+#define MODBUS_UART_RXD   GPIO_NUM_44
+#define MODBUS_BAUD       9600
 
 #ifndef CONFIG_DS18B20_GPIO
 #define CONFIG_DS18B20_GPIO  46
@@ -231,14 +237,70 @@ static void send_relay_resp(bool success)
     publish_resp(&resp);
 }
 
+/* ── Modbus-RTU illuminance ───────────────────────────────────────────────── */
+static uint16_t modbus_crc16(const uint8_t *data, int len)
+{
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xA001;
+            else
+                crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+static void modbus_init(void)
+{
+    uart_config_t uart_cfg = {
+        .baud_rate = MODBUS_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(MODBUS_UART_PORT, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(MODBUS_UART_PORT, MODBUS_UART_TXD, MODBUS_UART_RXD,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(MODBUS_UART_PORT, 256, 0, 0, NULL, 0));
+}
+
+static float modbus_read_illuminance(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x02, 0x00, 0x02};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[9];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 9) {
+        ESP_LOGW(TAG, "Modbus illuminance: expected 9 bytes, got %d", len);
+        return -1.0f;
+    }
+
+    uint32_t raw = ((uint32_t)rx_buf[3] << 24) | ((uint32_t)rx_buf[4] << 16)
+                 | ((uint32_t)rx_buf[5] << 8) | rx_buf[6];
+    return (float)raw / 1000.0f;
+}
+
 /* ── Status report ───────────────────────────────────────────────────────── */
-static flower_metric_t s_metrics[2];
+static flower_metric_t s_metrics[3];
 
 static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field,
                            void *const *arg)
 {
     flower_metric_t *metrics = (flower_metric_t *)(*arg);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (!pb_encode_tag_for_field(stream, field))
             return false;
         if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
@@ -266,6 +328,13 @@ static void publish_status_report(void)
     strcpy(s_metrics[1].key, "humi");
     s_metrics[1].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
     s_metrics[1].value.double_value = (double)humi_pct;
+
+    float lux = modbus_read_illuminance();
+    if (lux >= 0)
+        ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
+    strcpy(s_metrics[2].key, "lux");
+    s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
 
     if (!s_mqtt_connected) return;
 
@@ -785,6 +854,9 @@ void app_main(void)
 
     /* ADC: humidity sensor on IO1 */
     adc_init();
+
+    /* Modbus-RTU: illuminance sensor (IO43=TXD, IO44=RXD) via UART0 */
+    modbus_init();
 
     /* Camera init (creates own I2C bus using Kconfig pins) */
     ret = camera_init();
