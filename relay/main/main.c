@@ -405,12 +405,12 @@ static void handle_mqtt_data(const char *data, int data_len)
 
 }
 
-static flower_metric_t s_metrics[3];
+static flower_metric_t s_metrics[4];
 
 static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
 {
     flower_metric_t *metrics = (flower_metric_t *)(*arg);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         if (!pb_encode_tag_for_field(stream, field))
             return false;
         if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
@@ -446,6 +446,10 @@ static void publish_status_report(void)
     s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
     s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
 
+    strcpy(s_metrics[3].key, "relay");
+    s_metrics[3].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+    s_metrics[3].value.int64_value = gpio_get_level(RELAY_PIN);
+
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
@@ -466,8 +470,10 @@ static void publish_status_report(void)
     }
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
-    ESP_LOGI(TAG, "Status published (humiL=%.1f, humiD=%.1f, lux=%.1f)",
-             humidity_low, humidity_deep, (double)(lux >= 0 ? lux : 0));
+    
+    ESP_LOGI(TAG, "Status published (humiL=%.1f, humiD=%.1f, lux=%.1f, relay=%d)",
+             humidity_low, humidity_deep, (double)(lux >= 0 ? lux : 0),
+             (int)s_metrics[3].value.int64_value);
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -493,6 +499,7 @@ static void check_schedule(void)
 
     struct tm t;
     localtime_r(&now, &t);
+    ESP_LOGI(TAG, "Schedule check: local time %02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
     bool in_window = (t.tm_hour >= SCHEDULE_ON_HOUR && t.tm_hour < SCHEDULE_OFF_HOUR);
 
     if (in_window && !s_schedule_relay_on) {
@@ -598,6 +605,7 @@ static esp_err_t handle_change_relay1(httpd_req_t *req)
         }
     }
     gpio_set_level(RELAY_PIN, 0);
+    ESP_LOGI(TAG, "relay:%d\n", gpio_get_level(RELAY_PIN));
     s_relay_on_us = esp_timer_get_time();
     s_relay_on    = true;
     httpd_resp_send(req, "0", 1);
@@ -732,9 +740,10 @@ void app_main(void)
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
-    io_conf.mode         = GPIO_MODE_OUTPUT;
+    io_conf.mode         = GPIO_MODE_INPUT_OUTPUT; /* input_output so gpio_get_level reads back correctly */
+    io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+    gpio_set_level(RELAY_PIN, 1);          /* set before config so pin goes high atomically */
     ESP_ERROR_CHECK(gpio_config(&io_conf));
-    gpio_set_level(RELAY_PIN, 1);
 
     /* GPIO: button (input pull-up) */
     io_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
@@ -801,6 +810,9 @@ void app_main(void)
     wifi_init_sta();
 
     /* NTP (UTC+8) — needed for HMAC timestamp */
+    /* Set timezone first so localtime_r is correct as soon as NTP syncs */
+    setenv("TZ", "CST-8", 1);
+    tzset();
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_setservername(1, "time.nist.gov");
@@ -814,10 +826,6 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "NTP %s (ts=%lld)", now > 1700000000LL ? "OK" : "FAILED",
              (long long)now);
-
-    /* Timezone: CST (UTC+8) — required for schedule hour comparison */
-    setenv("TZ", "CST-8", 1);
-    tzset();
 
     /* MQTT */
     mqtt_start();
