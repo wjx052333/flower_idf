@@ -6,7 +6,7 @@
  *   2. HMAC-SHA256 MQTT credentials (clientId{id}timestamp{ms})
  *   3. MQTT 5.0 with User Property {"project","flower"} on CONNECT
  *   4. nanopb: receives relay_control/ota commands; sends status_report + cmd_response
- *   5. GPIO: relay (pin 4, active-low), button (pin 9), breathing LED (pin 3)
+ *   5. GPIO: relay (pin 4, active-low), button (pin 9), breathing LED (pin 3), DS18B20 temp (pin 1)
  *   6. HTTP server: GET /change_relay1[?duration=ms]
  *   7. OTA: HTTPS firmware update triggered via MQTT OtaCommand
  *
@@ -51,6 +51,7 @@
 #include "pb_encode.h"
 #include "pb_decode.h"
 #include "flower.pb.h"
+#include "ds18b20.h"
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
@@ -77,7 +78,7 @@ static char s_topic_status[96];
 #define RELAY_PIN   4
 #define LED_PIN     3
 #define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_0   /* GPIO0 */
-#define ADC_PIN_DEEP_HUMIDITY ADC_CHANNEL_1   /* GPIO1 */
+#define DS18B20_PIN GPIO_NUM_1                /* GPIO1 */
 
 #define MODBUS_UART_PORT  UART_NUM_1
 #define MODBUS_UART_TXD   GPIO_NUM_6
@@ -88,9 +89,6 @@ static char s_topic_status[96];
 #define RELAY_DEFAULT_DURATION_MS 10000
 #define BREATH_PERIOD_MS          3000
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
-
-#define SCHEDULE_ON_HOUR   20   /* 20:00 relay auto-on  */
-#define SCHEDULE_OFF_HOUR  22   /* 22:00 relay auto-off */
 
 #define TAG "Flower"
 
@@ -129,7 +127,6 @@ static volatile int64_t         s_relay_on_us    = 0;   /* esp_timer_get_time() 
 static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
 
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
-static volatile bool            s_schedule_relay_on = false;
 
 /* Static to avoid large stack allocation */
 static flower_command_t          s_cmd;
@@ -150,7 +147,6 @@ static void adc_init(void)
         .atten    = ADC_ATTEN_DB_12,   /* 0 ~ 3.3 V */
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_LOW_HUMIDITY, &chan_cfg));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_DEEP_HUMIDITY, &chan_cfg));
 }
 
 static int adc_read_raw(adc_channel_t channel)
@@ -368,7 +364,7 @@ static void handle_mqtt_data(const char *data, int data_len)
                 send_relay_resp(false);
                 break;
             }
-            gpio_set_level(RELAY_PIN, 0);
+            gpio_set_level(RELAY_PIN, 1);
             s_relay_on_us = esp_timer_get_time();
             if (rc->duration_ms > 0) {
                 s_relay_duration = rc->duration_ms;
@@ -377,7 +373,7 @@ static void handle_mqtt_data(const char *data, int data_len)
                 s_relay_on = false; /* duration_ms=0: no auto-off */
             }
         } else {
-            gpio_set_level(RELAY_PIN, 1);
+            gpio_set_level(RELAY_PIN, 0);
             s_relay_on = false;
         }
         send_relay_resp(true);
@@ -405,12 +401,12 @@ static void handle_mqtt_data(const char *data, int data_len)
 
 }
 
-static flower_metric_t s_metrics[4];
+static flower_metric_t s_metrics[3];
 
 static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
 {
     flower_metric_t *metrics = (flower_metric_t *)(*arg);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         if (!pb_encode_tag_for_field(stream, field))
             return false;
         if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
@@ -422,11 +418,12 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
 static void publish_status_report(void)
 {
     int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    int raw_deep = adc_read_raw(ADC_PIN_DEEP_HUMIDITY);
-    float humidity_low = raw_low*100.0f/4096;
-    float humidity_deep = raw_deep*100.0f/4096;
-    ESP_LOGI(TAG, "ADC low_humidity(GPIO0)=%d,%f deep_humidity(GPIO1)=%d,%f",
-        raw_low, humidity_low, raw_deep, humidity_deep);
+    float humidity = raw_low * 100.0f / 4096;
+    ESP_LOGI(TAG, "ADC humidity(GPIO0)=%d,%.1f%%", raw_low, humidity);
+
+    float temp = ds18b20_read_temperature();
+    if (temp > -273.0f)
+        ESP_LOGI(TAG, "Temperature(GPIO1)=%.2f°C", temp);
 
     float lux = modbus_read_illuminance();
     if (lux >= 0)
@@ -434,21 +431,17 @@ static void publish_status_report(void)
 
     if (!s_mqtt_connected) return;
 
-    strcpy(s_metrics[0].key, "humiL");
+    strcpy(s_metrics[0].key, "humidity");
     s_metrics[0].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
-    s_metrics[0].value.double_value = humidity_low;
+    s_metrics[0].value.double_value = humidity;
 
-    strcpy(s_metrics[1].key, "humiD");
+    strcpy(s_metrics[1].key, "temperature");
     s_metrics[1].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
-    s_metrics[1].value.double_value = humidity_deep;
+    s_metrics[1].value.double_value = (double)(temp > -273.0f ? temp : 0);
 
     strcpy(s_metrics[2].key, "lux");
     s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
     s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
-
-    strcpy(s_metrics[3].key, "relay");
-    s_metrics[3].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
-    s_metrics[3].value.int64_value = gpio_get_level(RELAY_PIN);
 
     time_t now; time(&now);
 
@@ -458,7 +451,7 @@ static void publish_status_report(void)
     sr.version.major   = 1;
     sr.version.minor   = 0;
     sr.version.patch   = 2;
-    strcpy(sr.device_type, "humidityX2_lux");
+    strcpy(sr.device_type, "humidity_temp_lux");
     sr.metrics.arg = s_metrics;
     sr.metrics.funcs.encode = encode_metrics;
 
@@ -470,10 +463,9 @@ static void publish_status_report(void)
     }
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
-    
-    ESP_LOGI(TAG, "Status published (humiL=%.1f, humiD=%.1f, lux=%.1f, relay=%d)",
-             humidity_low, humidity_deep, (double)(lux >= 0 ? lux : 0),
-             (int)s_metrics[3].value.int64_value);
+
+    ESP_LOGI(TAG, "Status published (humidity=%.1f%%, temp=%.2f°C, lux=%.1f)",
+             humidity, (double)(temp > -273.0f ? temp : 0), (double)(lux >= 0 ? lux : 0));
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -492,32 +484,8 @@ static void reconnect_timer_cb(void *arg)
     mqtt_start();
 }
 
-static void check_schedule(void)
-{
-    time_t now; time(&now);
-    if (now < 1700000000LL) return; /* NTP not synced yet */
-
-    struct tm t;
-    localtime_r(&now, &t);
-    ESP_LOGI(TAG, "Schedule check: local time %02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-    bool in_window = (t.tm_hour >= SCHEDULE_ON_HOUR && t.tm_hour < SCHEDULE_OFF_HOUR);
-
-    if (in_window && !s_schedule_relay_on) {
-        gpio_set_level(RELAY_PIN, 0);
-        s_relay_on = false; /* no auto-off */
-        s_schedule_relay_on = true;
-        ESP_LOGI(TAG, "Schedule: relay ON (%02d:%02d)", t.tm_hour, t.tm_min);
-    } else if (!in_window && s_schedule_relay_on) {
-        gpio_set_level(RELAY_PIN, 1);
-        s_relay_on = false;
-        s_schedule_relay_on = false;
-        ESP_LOGI(TAG, "Schedule: relay OFF (%02d:%02d)", t.tm_hour, t.tm_min);
-    }
-}
-
 static void status_timer_cb(void *arg)
 {
-    check_schedule();
     publish_status_report();
 }
 
@@ -604,8 +572,7 @@ static esp_err_t handle_change_relay1(httpd_req_t *req)
             if (d > 0) s_relay_duration = d;
         }
     }
-    gpio_set_level(RELAY_PIN, 0);
-    ESP_LOGI(TAG, "relay:%d\n", gpio_get_level(RELAY_PIN));
+    gpio_set_level(RELAY_PIN, 1);
     s_relay_on_us = esp_timer_get_time();
     s_relay_on    = true;
     httpd_resp_send(req, "0", 1);
@@ -662,7 +629,7 @@ static void app_timer_cb(void *arg)
     if (s_relay_on) {
         int64_t elapsed_ms = (esp_timer_get_time() - s_relay_on_us) / 1000LL;
         if (elapsed_ms >= (int64_t)s_relay_duration) {
-            gpio_set_level(RELAY_PIN, 1);
+            gpio_set_level(RELAY_PIN, 0);
             s_relay_on = false;
         }
     }
@@ -731,8 +698,11 @@ void app_main(void)
     nvs_flash_init_partition("fctry");
     device_identity_init();
 
-    /* ADC: low_humidity (IO0) + deep_humidity (IO1) */
+    /* ADC: humidity (IO0) */
     adc_init();
+
+    /* DS18B20: temperature sensor (IO1) */
+    ds18b20_init(DS18B20_PIN);
 
     /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
     modbus_init();
@@ -740,9 +710,10 @@ void app_main(void)
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
-    io_conf.mode         = GPIO_MODE_INPUT_OUTPUT; /* input_output so gpio_get_level reads back correctly */
-    io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
-    gpio_set_level(RELAY_PIN, 1);          /* set before config so pin goes high atomically */
+    io_conf.mode         = GPIO_MODE_INPUT_OUTPUT;
+    io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    gpio_set_level(RELAY_PIN, 0);          /* set before config so pin goes low atomically */
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
     /* GPIO: button (input pull-up) */

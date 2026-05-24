@@ -44,7 +44,7 @@ factory/
 ```bash
 cd relay
 
-python factory/gen_factory_nvs.py --id     flr003  --secret f7f168b240b774e53c314a26d4c185a6114d3a54eb0c90c494e216d5083612ea   --out    factory/factory_flr003.bin
+python factory/gen_factory_nvs.py --id     flr004  --secret f2999604efa2d4d9556313f5316cfb2d80de1761dd47d9b92607506d96b16092   --out    factory/factory_flr004.bin
 ```
 
 成功后输出：
@@ -65,7 +65,7 @@ Flash with: esptool.py write_flash 0x10000 factory_dev-001.bin
 idf.py -p COM3 flash
 
 # 2. 烧设备身份（单独写 fctry 分区）
-esptool.py -p COM7 write_flash 0x10000 factory/factory_flr001.bin
+esptool.py -p COM7 write_flash 0x10000 factory/factory_flr004.bin
 ```
 
 ### 方式 B：批量烧写（生产线，只烧 factory，固件已在）
