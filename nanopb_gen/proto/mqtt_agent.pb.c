@@ -21,19 +21,30 @@ PB_BIND(MQTT_AGENT_AUDIO_FRAME, mqtt_agent_audio_frame_t, AUTO)
 PB_BIND(MQTT_AGENT_APP_MSG, mqtt_agent_app_msg_t, AUTO)
 
 
-PB_BIND(MQTT_AGENT_CHIP_RESPONSE, mqtt_agent_chip_response_t, AUTO)
+PB_BIND(MQTT_AGENT_CHOICE_RESPONSE, mqtt_agent_choice_response_t, AUTO)
 
 
-PB_BIND(MQTT_AGENT_CHIP, mqtt_agent_chip_t, AUTO)
+PB_BIND(MQTT_AGENT_CHOICE, mqtt_agent_choice_t, AUTO)
 
 
-PB_BIND(MQTT_AGENT_CHIP_GROUP, mqtt_agent_chip_group_t, AUTO)
+PB_BIND(MQTT_AGENT_CHOICE_GROUP, mqtt_agent_choice_group_t, AUTO)
 
 
-PB_BIND(MQTT_AGENT_CARD, mqtt_agent_card_t, AUTO)
+PB_BIND(MQTT_AGENT_MULTI_CHOICE_GROUP, mqtt_agent_multi_choice_group_t, AUTO)
+
+
+PB_BIND(MQTT_AGENT_ALERT_MSG, mqtt_agent_alert_msg_t, AUTO)
+
+
+PB_BIND(MQTT_AGENT_HINT, mqtt_agent_hint_t, AUTO)
+
+
+PB_BIND(MQTT_AGENT_AGENT_TEXT, mqtt_agent_agent_text_t, AUTO)
 
 
 PB_BIND(MQTT_AGENT_AGENT_MSG, mqtt_agent_agent_msg_t, AUTO)
+
+
 
 
 

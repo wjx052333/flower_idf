@@ -17,7 +17,7 @@ typedef enum mqtt_agent_agent_action {
     MQTT_AGENT_AGENT_ACTION_AGENT_ACTION_INTERRUPT = 3
 } mqtt_agent_agent_action_t;
 
-/* ── downlink: {prefix}/{device_id}/down/agent_response ─────────────
+/* ── downlink: {prefix}/{user_id}/{device_id}/down/agent_response ─────────────
              {prefix}/{user_id}/down/agent_response (App channel) */
 typedef enum mqtt_agent_agent_response_code {
     MQTT_AGENT_AGENT_RESPONSE_CODE_AGENT_RESPONSE_CODE_UNSPECIFIED = 0,
@@ -27,8 +27,15 @@ typedef enum mqtt_agent_agent_response_code {
     MQTT_AGENT_AGENT_RESPONSE_CODE_AGENT_RESPONSE_CODE_ERROR = 4 /* rejected (e.g. device not found, internal error) */
 } mqtt_agent_agent_response_code_t;
 
+typedef enum mqtt_agent_agent_state {
+    MQTT_AGENT_AGENT_STATE_AGENT_STATE_IDLE = 0,
+    MQTT_AGENT_AGENT_STATE_AGENT_STATE_THINKING = 1,
+    MQTT_AGENT_AGENT_STATE_AGENT_STATE_SPEAKING = 2,
+    MQTT_AGENT_AGENT_STATE_AGENT_STATE_WAITING_INPUT = 3
+} mqtt_agent_agent_state_t;
+
 /* Struct definitions */
-/* ── uplink: {prefix}/{device_id}/up/agent_request ──────────────────
+/* ── uplink: {prefix}/{user_id}/{device_id}/up/agent_request ──────────────────
  Session control only; voice travels via up/opus, App text via {user_id}/up/agent_msg */
 typedef struct mqtt_agent_agent_request {
     mqtt_agent_agent_action_t action;
@@ -40,8 +47,8 @@ typedef struct mqtt_agent_agent_response {
     pb_callback_t reason; /* human-readable detail, optional */
 } mqtt_agent_agent_response_t;
 
-/* ── Device uplink: {prefix}/{device_id}/up/opus ───────────────────────
- ── Device downlink: {prefix}/{device_id}/down/opus ─────────────────────── */
+/* ── Device uplink: {prefix}/{user_id}/{device_id}/up/opus ───────────────────────
+ ── Device downlink: {prefix}/{user_id}/{device_id}/down/opus ─────────────────────── */
 typedef struct mqtt_agent_audio_stats {
     pb_callback_t transcript; /* STT result */
     pb_callback_t llm_response; /* LLM text (streaming) */
@@ -58,49 +65,64 @@ typedef struct mqtt_agent_audio_frame {
     mqtt_agent_audio_stats_t stats;
 } mqtt_agent_audio_frame_t;
 
-typedef struct mqtt_agent_chip_response {
+typedef struct mqtt_agent_choice_response {
     pb_callback_t group_id;
     pb_callback_t label;
-} mqtt_agent_chip_response_t;
+    pb_callback_t question;
+} mqtt_agent_choice_response_t;
 
 /* ── App uplink: {prefix}/{user_id}/up/agent_msg ─────────────────────────── */
 typedef struct mqtt_agent_app_msg {
     pb_size_t which_input;
     union {
         pb_callback_t text; /* free-text input */
-        mqtt_agent_chip_response_t chip; /* chip selection */
+        mqtt_agent_choice_response_t choice; /* choice selection */
     } input;
 } mqtt_agent_app_msg_t;
 
 /* ── App downlink: {prefix}/{user_id}/down/agent_msg ─────────────────────── */
-typedef struct mqtt_agent_chip {
+typedef struct mqtt_agent_choice {
     pb_callback_t label;
     pb_callback_t description;
     pb_callback_t payload;
-} mqtt_agent_chip_t;
+} mqtt_agent_choice_t;
 
-typedef struct mqtt_agent_chip_group {
+typedef struct mqtt_agent_choice_group {
     pb_callback_t group_id;
     pb_callback_t question;
     bool multi_select;
-    pb_callback_t chips;
-} mqtt_agent_chip_group_t;
+    pb_callback_t choices;
+} mqtt_agent_choice_group_t;
 
-typedef struct mqtt_agent_card {
-    pb_callback_t title;
-    pb_callback_t body;
-    pb_callback_t action_url;
-} mqtt_agent_card_t;
+typedef struct mqtt_agent_multi_choice_group {
+    pb_callback_t choice_groups;
+} mqtt_agent_multi_choice_group_t;
+
+typedef struct mqtt_agent_alert_msg {
+    pb_callback_t text;
+    pb_callback_t alert_id;
+    pb_callback_t task_id; /* task that triggered this alert (empty if not task-driven) */
+} mqtt_agent_alert_msg_t;
+
+typedef struct mqtt_agent_hint {
+    pb_callback_t label; /* button text, 1-4 chars */
+    pb_callback_t text; /* sent as AppMsg(text=...) when tapped */
+} mqtt_agent_hint_t;
+
+typedef struct mqtt_agent_agent_text {
+    pb_callback_t text;
+    pb_callback_t hints;
+} mqtt_agent_agent_text_t;
 
 typedef struct mqtt_agent_agent_msg {
     uint64_t seq_id;
-    pb_callback_t text;
-    bool is_eos;
-    pb_callback_t state; /* idle | thinking | speaking | waiting_input */
-    pb_callback_t chip_groups;
-    bool has_card;
-    mqtt_agent_card_t card;
-    pb_callback_t alert_id; /* non-empty → links to vision_events.id */
+    mqtt_agent_agent_state_t state;
+    pb_size_t which_agent;
+    union {
+        mqtt_agent_agent_text_t chat;
+        mqtt_agent_multi_choice_group_t choices;
+        mqtt_agent_alert_msg_t alert;
+    } agent;
 } mqtt_agent_agent_msg_t;
 
 
@@ -117,6 +139,10 @@ extern "C" {
 #define _MQTT_AGENT_AGENT_RESPONSE_CODE_MAX MQTT_AGENT_AGENT_RESPONSE_CODE_AGENT_RESPONSE_CODE_ERROR
 #define _MQTT_AGENT_AGENT_RESPONSE_CODE_ARRAYSIZE ((mqtt_agent_agent_response_code_t)(MQTT_AGENT_AGENT_RESPONSE_CODE_AGENT_RESPONSE_CODE_ERROR+1))
 
+#define _MQTT_AGENT_AGENT_STATE_MIN MQTT_AGENT_AGENT_STATE_AGENT_STATE_IDLE
+#define _MQTT_AGENT_AGENT_STATE_MAX MQTT_AGENT_AGENT_STATE_AGENT_STATE_WAITING_INPUT
+#define _MQTT_AGENT_AGENT_STATE_ARRAYSIZE ((mqtt_agent_agent_state_t)(MQTT_AGENT_AGENT_STATE_AGENT_STATE_WAITING_INPUT+1))
+
 #define mqtt_agent_agent_request_t_action_ENUMTYPE mqtt_agent_agent_action_t
 
 #define mqtt_agent_agent_response_t_code_ENUMTYPE mqtt_agent_agent_response_code_t
@@ -130,27 +156,37 @@ extern "C" {
 
 
 
+
+#define mqtt_agent_agent_msg_t_state_ENUMTYPE mqtt_agent_agent_state_t
+
+
 /* Initializer values for message structs */
 #define MQTT_AGENT_AGENT_REQUEST_INIT_DEFAULT    {_MQTT_AGENT_AGENT_ACTION_MIN, {{NULL}, NULL}}
 #define MQTT_AGENT_AGENT_RESPONSE_INIT_DEFAULT   {_MQTT_AGENT_AGENT_RESPONSE_CODE_MIN, {{NULL}, NULL}}
 #define MQTT_AGENT_AUDIO_STATS_INIT_DEFAULT      {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}, 0}
 #define MQTT_AGENT_AUDIO_FRAME_INIT_DEFAULT      {0, 0, {{NULL}, NULL}, 0, false, MQTT_AGENT_AUDIO_STATS_INIT_DEFAULT}
 #define MQTT_AGENT_APP_MSG_INIT_DEFAULT          {0, {{{NULL}, NULL}}}
-#define MQTT_AGENT_CHIP_RESPONSE_INIT_DEFAULT    {{{NULL}, NULL}, {{NULL}, NULL}}
-#define MQTT_AGENT_CHIP_INIT_DEFAULT             {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
-#define MQTT_AGENT_CHIP_GROUP_INIT_DEFAULT       {{{NULL}, NULL}, {{NULL}, NULL}, 0, {{NULL}, NULL}}
-#define MQTT_AGENT_CARD_INIT_DEFAULT             {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
-#define MQTT_AGENT_AGENT_MSG_INIT_DEFAULT        {0, {{NULL}, NULL}, 0, {{NULL}, NULL}, {{NULL}, NULL}, false, MQTT_AGENT_CARD_INIT_DEFAULT, {{NULL}, NULL}}
+#define MQTT_AGENT_CHOICE_RESPONSE_INIT_DEFAULT  {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_CHOICE_INIT_DEFAULT           {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_CHOICE_GROUP_INIT_DEFAULT     {{{NULL}, NULL}, {{NULL}, NULL}, 0, {{NULL}, NULL}}
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_INIT_DEFAULT {{{NULL}, NULL}}
+#define MQTT_AGENT_ALERT_MSG_INIT_DEFAULT        {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_HINT_INIT_DEFAULT             {{{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_AGENT_TEXT_INIT_DEFAULT       {{{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_AGENT_MSG_INIT_DEFAULT        {0, _MQTT_AGENT_AGENT_STATE_MIN, 0, {MQTT_AGENT_AGENT_TEXT_INIT_DEFAULT}}
 #define MQTT_AGENT_AGENT_REQUEST_INIT_ZERO       {_MQTT_AGENT_AGENT_ACTION_MIN, {{NULL}, NULL}}
 #define MQTT_AGENT_AGENT_RESPONSE_INIT_ZERO      {_MQTT_AGENT_AGENT_RESPONSE_CODE_MIN, {{NULL}, NULL}}
 #define MQTT_AGENT_AUDIO_STATS_INIT_ZERO         {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}, 0}
 #define MQTT_AGENT_AUDIO_FRAME_INIT_ZERO         {0, 0, {{NULL}, NULL}, 0, false, MQTT_AGENT_AUDIO_STATS_INIT_ZERO}
 #define MQTT_AGENT_APP_MSG_INIT_ZERO             {0, {{{NULL}, NULL}}}
-#define MQTT_AGENT_CHIP_RESPONSE_INIT_ZERO       {{{NULL}, NULL}, {{NULL}, NULL}}
-#define MQTT_AGENT_CHIP_INIT_ZERO                {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
-#define MQTT_AGENT_CHIP_GROUP_INIT_ZERO          {{{NULL}, NULL}, {{NULL}, NULL}, 0, {{NULL}, NULL}}
-#define MQTT_AGENT_CARD_INIT_ZERO                {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
-#define MQTT_AGENT_AGENT_MSG_INIT_ZERO           {0, {{NULL}, NULL}, 0, {{NULL}, NULL}, {{NULL}, NULL}, false, MQTT_AGENT_CARD_INIT_ZERO, {{NULL}, NULL}}
+#define MQTT_AGENT_CHOICE_RESPONSE_INIT_ZERO     {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_CHOICE_INIT_ZERO              {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_CHOICE_GROUP_INIT_ZERO        {{{NULL}, NULL}, {{NULL}, NULL}, 0, {{NULL}, NULL}}
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_INIT_ZERO  {{{NULL}, NULL}}
+#define MQTT_AGENT_ALERT_MSG_INIT_ZERO           {{{NULL}, NULL}, {{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_HINT_INIT_ZERO                {{{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_AGENT_TEXT_INIT_ZERO          {{{NULL}, NULL}, {{NULL}, NULL}}
+#define MQTT_AGENT_AGENT_MSG_INIT_ZERO           {0, _MQTT_AGENT_AGENT_STATE_MIN, 0, {MQTT_AGENT_AGENT_TEXT_INIT_ZERO}}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define MQTT_AGENT_AGENT_REQUEST_ACTION_TAG      1
@@ -166,27 +202,31 @@ extern "C" {
 #define MQTT_AGENT_AUDIO_FRAME_OPUS_DATA_TAG     3
 #define MQTT_AGENT_AUDIO_FRAME_IS_EOS_TAG        4
 #define MQTT_AGENT_AUDIO_FRAME_STATS_TAG         5
-#define MQTT_AGENT_CHIP_RESPONSE_GROUP_ID_TAG    1
-#define MQTT_AGENT_CHIP_RESPONSE_LABEL_TAG       2
+#define MQTT_AGENT_CHOICE_RESPONSE_GROUP_ID_TAG  1
+#define MQTT_AGENT_CHOICE_RESPONSE_LABEL_TAG     2
+#define MQTT_AGENT_CHOICE_RESPONSE_QUESTION_TAG  3
 #define MQTT_AGENT_APP_MSG_TEXT_TAG              1
-#define MQTT_AGENT_APP_MSG_CHIP_TAG              2
-#define MQTT_AGENT_CHIP_LABEL_TAG                1
-#define MQTT_AGENT_CHIP_DESCRIPTION_TAG          2
-#define MQTT_AGENT_CHIP_PAYLOAD_TAG              3
-#define MQTT_AGENT_CHIP_GROUP_GROUP_ID_TAG       1
-#define MQTT_AGENT_CHIP_GROUP_QUESTION_TAG       2
-#define MQTT_AGENT_CHIP_GROUP_MULTI_SELECT_TAG   3
-#define MQTT_AGENT_CHIP_GROUP_CHIPS_TAG          4
-#define MQTT_AGENT_CARD_TITLE_TAG                1
-#define MQTT_AGENT_CARD_BODY_TAG                 2
-#define MQTT_AGENT_CARD_ACTION_URL_TAG           3
+#define MQTT_AGENT_APP_MSG_CHOICE_TAG            2
+#define MQTT_AGENT_CHOICE_LABEL_TAG              1
+#define MQTT_AGENT_CHOICE_DESCRIPTION_TAG        2
+#define MQTT_AGENT_CHOICE_PAYLOAD_TAG            3
+#define MQTT_AGENT_CHOICE_GROUP_GROUP_ID_TAG     1
+#define MQTT_AGENT_CHOICE_GROUP_QUESTION_TAG     2
+#define MQTT_AGENT_CHOICE_GROUP_MULTI_SELECT_TAG 3
+#define MQTT_AGENT_CHOICE_GROUP_CHOICES_TAG      4
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_CHOICE_GROUPS_TAG 1
+#define MQTT_AGENT_ALERT_MSG_TEXT_TAG            1
+#define MQTT_AGENT_ALERT_MSG_ALERT_ID_TAG        2
+#define MQTT_AGENT_ALERT_MSG_TASK_ID_TAG         3
+#define MQTT_AGENT_HINT_LABEL_TAG                1
+#define MQTT_AGENT_HINT_TEXT_TAG                 2
+#define MQTT_AGENT_AGENT_TEXT_TEXT_TAG           1
+#define MQTT_AGENT_AGENT_TEXT_HINTS_TAG          2
 #define MQTT_AGENT_AGENT_MSG_SEQ_ID_TAG          1
-#define MQTT_AGENT_AGENT_MSG_TEXT_TAG            2
-#define MQTT_AGENT_AGENT_MSG_IS_EOS_TAG          3
-#define MQTT_AGENT_AGENT_MSG_STATE_TAG           4
-#define MQTT_AGENT_AGENT_MSG_CHIP_GROUPS_TAG     5
-#define MQTT_AGENT_AGENT_MSG_CARD_TAG            6
-#define MQTT_AGENT_AGENT_MSG_ALERT_ID_TAG        7
+#define MQTT_AGENT_AGENT_MSG_STATE_TAG           3
+#define MQTT_AGENT_AGENT_MSG_CHAT_TAG            4
+#define MQTT_AGENT_AGENT_MSG_CHOICES_TAG         5
+#define MQTT_AGENT_AGENT_MSG_ALERT_TAG           6
 
 /* Struct field encoding specification for nanopb */
 #define MQTT_AGENT_AGENT_REQUEST_FIELDLIST(X, a) \
@@ -221,62 +261,84 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  stats,             5)
 
 #define MQTT_AGENT_APP_MSG_FIELDLIST(X, a) \
 X(a, CALLBACK, ONEOF,    STRING,   (input,text,input.text),   1) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (input,chip,input.chip),   2)
+X(a, STATIC,   ONEOF,    MESSAGE,  (input,choice,input.choice),   2)
 #define MQTT_AGENT_APP_MSG_CALLBACK pb_default_field_callback
 #define MQTT_AGENT_APP_MSG_DEFAULT NULL
-#define mqtt_agent_app_msg_t_input_chip_MSGTYPE mqtt_agent_chip_response_t
+#define mqtt_agent_app_msg_t_input_choice_MSGTYPE mqtt_agent_choice_response_t
 
-#define MQTT_AGENT_CHIP_RESPONSE_FIELDLIST(X, a) \
+#define MQTT_AGENT_CHOICE_RESPONSE_FIELDLIST(X, a) \
 X(a, CALLBACK, SINGULAR, STRING,   group_id,          1) \
-X(a, CALLBACK, SINGULAR, STRING,   label,             2)
-#define MQTT_AGENT_CHIP_RESPONSE_CALLBACK pb_default_field_callback
-#define MQTT_AGENT_CHIP_RESPONSE_DEFAULT NULL
+X(a, CALLBACK, SINGULAR, STRING,   label,             2) \
+X(a, CALLBACK, SINGULAR, STRING,   question,          3)
+#define MQTT_AGENT_CHOICE_RESPONSE_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_CHOICE_RESPONSE_DEFAULT NULL
 
-#define MQTT_AGENT_CHIP_FIELDLIST(X, a) \
+#define MQTT_AGENT_CHOICE_FIELDLIST(X, a) \
 X(a, CALLBACK, SINGULAR, STRING,   label,             1) \
 X(a, CALLBACK, SINGULAR, STRING,   description,       2) \
 X(a, CALLBACK, SINGULAR, STRING,   payload,           3)
-#define MQTT_AGENT_CHIP_CALLBACK pb_default_field_callback
-#define MQTT_AGENT_CHIP_DEFAULT NULL
+#define MQTT_AGENT_CHOICE_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_CHOICE_DEFAULT NULL
 
-#define MQTT_AGENT_CHIP_GROUP_FIELDLIST(X, a) \
+#define MQTT_AGENT_CHOICE_GROUP_FIELDLIST(X, a) \
 X(a, CALLBACK, SINGULAR, STRING,   group_id,          1) \
 X(a, CALLBACK, SINGULAR, STRING,   question,          2) \
 X(a, STATIC,   SINGULAR, BOOL,     multi_select,      3) \
-X(a, CALLBACK, REPEATED, MESSAGE,  chips,             4)
-#define MQTT_AGENT_CHIP_GROUP_CALLBACK pb_default_field_callback
-#define MQTT_AGENT_CHIP_GROUP_DEFAULT NULL
-#define mqtt_agent_chip_group_t_chips_MSGTYPE mqtt_agent_chip_t
+X(a, CALLBACK, REPEATED, MESSAGE,  choices,           4)
+#define MQTT_AGENT_CHOICE_GROUP_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_CHOICE_GROUP_DEFAULT NULL
+#define mqtt_agent_choice_group_t_choices_MSGTYPE mqtt_agent_choice_t
 
-#define MQTT_AGENT_CARD_FIELDLIST(X, a) \
-X(a, CALLBACK, SINGULAR, STRING,   title,             1) \
-X(a, CALLBACK, SINGULAR, STRING,   body,              2) \
-X(a, CALLBACK, SINGULAR, STRING,   action_url,        3)
-#define MQTT_AGENT_CARD_CALLBACK pb_default_field_callback
-#define MQTT_AGENT_CARD_DEFAULT NULL
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_FIELDLIST(X, a) \
+X(a, CALLBACK, REPEATED, MESSAGE,  choice_groups,     1)
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_DEFAULT NULL
+#define mqtt_agent_multi_choice_group_t_choice_groups_MSGTYPE mqtt_agent_choice_group_t
+
+#define MQTT_AGENT_ALERT_MSG_FIELDLIST(X, a) \
+X(a, CALLBACK, SINGULAR, STRING,   text,              1) \
+X(a, CALLBACK, SINGULAR, STRING,   alert_id,          2) \
+X(a, CALLBACK, SINGULAR, STRING,   task_id,           3)
+#define MQTT_AGENT_ALERT_MSG_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_ALERT_MSG_DEFAULT NULL
+
+#define MQTT_AGENT_HINT_FIELDLIST(X, a) \
+X(a, CALLBACK, SINGULAR, STRING,   label,             1) \
+X(a, CALLBACK, SINGULAR, STRING,   text,              2)
+#define MQTT_AGENT_HINT_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_HINT_DEFAULT NULL
+
+#define MQTT_AGENT_AGENT_TEXT_FIELDLIST(X, a) \
+X(a, CALLBACK, SINGULAR, STRING,   text,              1) \
+X(a, CALLBACK, REPEATED, MESSAGE,  hints,             2)
+#define MQTT_AGENT_AGENT_TEXT_CALLBACK pb_default_field_callback
+#define MQTT_AGENT_AGENT_TEXT_DEFAULT NULL
+#define mqtt_agent_agent_text_t_hints_MSGTYPE mqtt_agent_hint_t
 
 #define MQTT_AGENT_AGENT_MSG_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT64,   seq_id,            1) \
-X(a, CALLBACK, SINGULAR, STRING,   text,              2) \
-X(a, STATIC,   SINGULAR, BOOL,     is_eos,            3) \
-X(a, CALLBACK, SINGULAR, STRING,   state,             4) \
-X(a, CALLBACK, REPEATED, MESSAGE,  chip_groups,       5) \
-X(a, STATIC,   OPTIONAL, MESSAGE,  card,              6) \
-X(a, CALLBACK, SINGULAR, STRING,   alert_id,          7)
-#define MQTT_AGENT_AGENT_MSG_CALLBACK pb_default_field_callback
+X(a, STATIC,   SINGULAR, UENUM,    state,             3) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (agent,chat,agent.chat),   4) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (agent,choices,agent.choices),   5) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (agent,alert,agent.alert),   6)
+#define MQTT_AGENT_AGENT_MSG_CALLBACK NULL
 #define MQTT_AGENT_AGENT_MSG_DEFAULT NULL
-#define mqtt_agent_agent_msg_t_chip_groups_MSGTYPE mqtt_agent_chip_group_t
-#define mqtt_agent_agent_msg_t_card_MSGTYPE mqtt_agent_card_t
+#define mqtt_agent_agent_msg_t_agent_chat_MSGTYPE mqtt_agent_agent_text_t
+#define mqtt_agent_agent_msg_t_agent_choices_MSGTYPE mqtt_agent_multi_choice_group_t
+#define mqtt_agent_agent_msg_t_agent_alert_MSGTYPE mqtt_agent_alert_msg_t
 
 extern const pb_msgdesc_t mqtt_agent_agent_request_t_msg;
 extern const pb_msgdesc_t mqtt_agent_agent_response_t_msg;
 extern const pb_msgdesc_t mqtt_agent_audio_stats_t_msg;
 extern const pb_msgdesc_t mqtt_agent_audio_frame_t_msg;
 extern const pb_msgdesc_t mqtt_agent_app_msg_t_msg;
-extern const pb_msgdesc_t mqtt_agent_chip_response_t_msg;
-extern const pb_msgdesc_t mqtt_agent_chip_t_msg;
-extern const pb_msgdesc_t mqtt_agent_chip_group_t_msg;
-extern const pb_msgdesc_t mqtt_agent_card_t_msg;
+extern const pb_msgdesc_t mqtt_agent_choice_response_t_msg;
+extern const pb_msgdesc_t mqtt_agent_choice_t_msg;
+extern const pb_msgdesc_t mqtt_agent_choice_group_t_msg;
+extern const pb_msgdesc_t mqtt_agent_multi_choice_group_t_msg;
+extern const pb_msgdesc_t mqtt_agent_alert_msg_t_msg;
+extern const pb_msgdesc_t mqtt_agent_hint_t_msg;
+extern const pb_msgdesc_t mqtt_agent_agent_text_t_msg;
 extern const pb_msgdesc_t mqtt_agent_agent_msg_t_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
@@ -285,10 +347,13 @@ extern const pb_msgdesc_t mqtt_agent_agent_msg_t_msg;
 #define MQTT_AGENT_AUDIO_STATS_FIELDS &mqtt_agent_audio_stats_t_msg
 #define MQTT_AGENT_AUDIO_FRAME_FIELDS &mqtt_agent_audio_frame_t_msg
 #define MQTT_AGENT_APP_MSG_FIELDS &mqtt_agent_app_msg_t_msg
-#define MQTT_AGENT_CHIP_RESPONSE_FIELDS &mqtt_agent_chip_response_t_msg
-#define MQTT_AGENT_CHIP_FIELDS &mqtt_agent_chip_t_msg
-#define MQTT_AGENT_CHIP_GROUP_FIELDS &mqtt_agent_chip_group_t_msg
-#define MQTT_AGENT_CARD_FIELDS &mqtt_agent_card_t_msg
+#define MQTT_AGENT_CHOICE_RESPONSE_FIELDS &mqtt_agent_choice_response_t_msg
+#define MQTT_AGENT_CHOICE_FIELDS &mqtt_agent_choice_t_msg
+#define MQTT_AGENT_CHOICE_GROUP_FIELDS &mqtt_agent_choice_group_t_msg
+#define MQTT_AGENT_MULTI_CHOICE_GROUP_FIELDS &mqtt_agent_multi_choice_group_t_msg
+#define MQTT_AGENT_ALERT_MSG_FIELDS &mqtt_agent_alert_msg_t_msg
+#define MQTT_AGENT_HINT_FIELDS &mqtt_agent_hint_t_msg
+#define MQTT_AGENT_AGENT_TEXT_FIELDS &mqtt_agent_agent_text_t_msg
 #define MQTT_AGENT_AGENT_MSG_FIELDS &mqtt_agent_agent_msg_t_msg
 
 /* Maximum encoded size of messages (where known) */
@@ -297,10 +362,13 @@ extern const pb_msgdesc_t mqtt_agent_agent_msg_t_msg;
 /* mqtt_agent_AudioStats_size depends on runtime parameters */
 /* mqtt_agent_AudioFrame_size depends on runtime parameters */
 /* mqtt_agent_AppMsg_size depends on runtime parameters */
-/* mqtt_agent_ChipResponse_size depends on runtime parameters */
-/* mqtt_agent_Chip_size depends on runtime parameters */
-/* mqtt_agent_ChipGroup_size depends on runtime parameters */
-/* mqtt_agent_Card_size depends on runtime parameters */
+/* mqtt_agent_ChoiceResponse_size depends on runtime parameters */
+/* mqtt_agent_Choice_size depends on runtime parameters */
+/* mqtt_agent_ChoiceGroup_size depends on runtime parameters */
+/* mqtt_agent_MultiChoiceGroup_size depends on runtime parameters */
+/* mqtt_agent_AlertMsg_size depends on runtime parameters */
+/* mqtt_agent_Hint_size depends on runtime parameters */
+/* mqtt_agent_AgentText_size depends on runtime parameters */
 /* mqtt_agent_AgentMsg_size depends on runtime parameters */
 
 #ifdef __cplusplus

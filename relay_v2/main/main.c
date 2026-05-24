@@ -126,6 +126,9 @@ static volatile bool            s_relay_on       = false;
 static volatile int64_t         s_relay_on_us    = 0;   /* esp_timer_get_time() at relay-on */
 static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
 
+static volatile int64_t         s_last_on_utc_s  = 0;   /* UTC seconds when relay last turned on */
+static volatile uint32_t        s_last_on_dur_ms = 0;   /* duration_ms of that activation */
+
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
 
 /* Static to avoid large stack allocation */
@@ -366,6 +369,9 @@ static void handle_mqtt_data(const char *data, int data_len)
             }
             gpio_set_level(RELAY_PIN, 1);
             s_relay_on_us = esp_timer_get_time();
+            time_t _now; time(&_now);
+            s_last_on_utc_s  = (int64_t)_now;
+            s_last_on_dur_ms = rc->duration_ms;
             if (rc->duration_ms > 0) {
                 s_relay_duration = rc->duration_ms;
                 s_relay_on = true;
@@ -401,12 +407,12 @@ static void handle_mqtt_data(const char *data, int data_len)
 
 }
 
-static flower_metric_t s_metrics[3];
+static flower_metric_t s_metrics[5];
 
 static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
 {
     flower_metric_t *metrics = (flower_metric_t *)(*arg);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         if (!pb_encode_tag_for_field(stream, field))
             return false;
         if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
@@ -443,15 +449,23 @@ static void publish_status_report(void)
     s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
     s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
 
+    strcpy(s_metrics[3].key, "relayLastOnTs");
+    s_metrics[3].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+    s_metrics[3].value.int64_value = s_last_on_utc_s;
+
+    strcpy(s_metrics[4].key, "relayLastOnDur");
+    s_metrics[4].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+    s_metrics[4].value.int64_value = (int64_t)s_last_on_dur_ms;
+
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
     sr.timestamp       = (int64_t)now * 1000;
     sr.has_version     = true;
     sr.version.major   = 1;
-    sr.version.minor   = 0;
-    sr.version.patch   = 2;
-    strcpy(sr.device_type, "humidity_temp_lux");
+    sr.version.minor   = 1;
+    sr.version.patch   = 1;
+    strcpy(sr.device_type, "C3V2_humi_temp_lux_relay");
     sr.metrics.arg = s_metrics;
     sr.metrics.funcs.encode = encode_metrics;
 
@@ -575,6 +589,9 @@ static esp_err_t handle_change_relay1(httpd_req_t *req)
     gpio_set_level(RELAY_PIN, 1);
     s_relay_on_us = esp_timer_get_time();
     s_relay_on    = true;
+    time_t _now; time(&_now);
+    s_last_on_utc_s  = (int64_t)_now;
+    s_last_on_dur_ms = s_relay_duration;
     httpd_resp_send(req, "0", 1);
     return ESP_OK;
 }
@@ -656,7 +673,8 @@ static void wifi_init_sta(void)
     s_wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(netif, g_device_id);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
