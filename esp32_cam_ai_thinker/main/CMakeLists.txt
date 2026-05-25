@@ -22,5 +22,5 @@ idf_component_register(
         esp_https_ota
         app_update
         spi_flash
-        esp32_camera
+        espressif__esp32-camera
 )
