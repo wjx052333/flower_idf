@@ -97,7 +97,10 @@ esp_err_t camera_init(void)
         .name                  = "led_off",
         .skip_unhandled_events = true,
     };
-    esp_timer_create(&targs, &s_led_timer);
+    if (esp_timer_create(&targs, &s_led_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "LED timer create failed — flash LED disabled");
+        s_led_timer = NULL;
+    }
 
     s_cam_sem = xSemaphoreCreateBinary();
     xSemaphoreGive(s_cam_sem);
@@ -134,8 +137,10 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
         return ESP_FAIL;
     }
 
-    esp_timer_stop(s_led_timer);
-    esp_timer_start_once(s_led_timer, LED_OFF_DELAY_US);
+    if (s_led_timer) {
+        esp_timer_stop(s_led_timer);
+        esp_timer_start_once(s_led_timer, LED_OFF_DELAY_US);
+    }
 
     *data = s_fb->buf;
     *size = s_fb->len;
@@ -144,6 +149,7 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
 
 void camera_release_jpeg(void)
 {
+    /* Must only be called after a successful camera_capture_jpeg(). */
     if (s_fb) {
         esp_camera_fb_return(s_fb);
         s_fb = NULL;
