@@ -206,3 +206,10 @@ len = sizeof(g_device_secret);
 nvs_get_str(h, "device_secret", g_device_secret, &len);
 nvs_close(h);
 ```
+
+# web
+## change_relay1
+http://192.168.0.102/change_relay1?duration=60000
+
+# ota
+python ..\web\ota_cli.py flr004 .\build\flower.bin --backend https://58.87.80.78:8080 --insecure
