@@ -26,7 +26,9 @@
 
 #include "esp_video_init.h"
 #include "esp_video_device.h"
+#include "esp_video_ioctl.h"
 #include "esp_cam_ctlr.h"
+#include "esp_cam_sensor_types.h"
 
 #include "esp_jpeg_enc.h"
 
@@ -250,6 +252,14 @@ esp_err_t camera_init_with_i2c(i2c_master_bus_handle_t i2c_handle)
         esp_timer_create(&targs, &s_led_timer);
     }
 
+    /* JPEG quality: 1 = max quality for OV3660 (range 1–63, lower = better) */
+    {
+        struct v4l2_ext_control ctrl  = { .id = V4L2_CID_JPEG_COMPRESSION_QUALITY, .value = 1 };
+        struct v4l2_ext_controls ctrls = { .count = 1, .controls = &ctrl };
+        if (ioctl(s_cam_fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0)
+            ESP_LOGW(TAG, "JPEG quality init failed (errno=%d)", errno);
+    }
+
     ESP_LOGI(TAG, "Camera stream started (fd=%d)", s_cam_fd);
     return ESP_OK;
 }
@@ -333,4 +343,106 @@ void camera_release_jpeg(void)
 {
     ioctl(s_cam_fd, VIDIOC_QBUF, &s_vbuf);
     xSemaphoreGive(s_cam_sem);
+}
+
+/* ── Runtime sensor controls ─────────────────────────────────────────────── */
+
+static esp_err_t set_v4l2_ctrl(uint32_t cid, int32_t value)
+{
+    struct v4l2_ext_control  ctrl  = { .id = cid, .value = value };
+    struct v4l2_ext_controls ctrls = { .count = 1, .controls = &ctrl };
+    if (ioctl(s_cam_fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0) {
+        ESP_LOGE(TAG, "set_v4l2_ctrl cid=0x%x val=%d failed (errno=%d)", cid, value, errno);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t sensor_write_reg(uint16_t reg, uint8_t val)
+{
+    esp_cam_sensor_reg_val_t rv = { .regaddr = reg, .value = val };
+    struct v4l2_ext_control  ctrl  = {
+        .id   = ESP_CAM_SENSOR_IOC_S_REG,
+        .p_u8 = (uint8_t *)&rv,
+        .size = sizeof(rv),
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_ESP_CAM_IOCTL,
+        .count      = 1,
+        .controls   = &ctrl,
+    };
+    if (ioctl(s_cam_fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0) {
+        ESP_LOGE(TAG, "sensor_write_reg 0x%04x=0x%02x failed (errno=%d)", reg, val, errno);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t camera_set_hmirror(int enable)
+{
+    return set_v4l2_ctrl(V4L2_CID_HFLIP, enable ? 1 : 0);
+}
+
+esp_err_t camera_set_vflip(int enable)
+{
+    return set_v4l2_ctrl(V4L2_CID_VFLIP, enable ? 1 : 0);
+}
+
+esp_err_t camera_set_contrast(int level)
+{
+    if (level < -2 || level > 2) return ESP_ERR_INVALID_ARG;
+    /* OV3660: reg 0x5586 = (level+4) << 3 */
+    return sensor_write_reg(0x5586, (uint8_t)((level + 4) << 3));
+}
+
+esp_err_t camera_set_saturation(int level)
+{
+    if (level < -2 || level > 2) return ESP_ERR_INVALID_ARG;
+    /* OV3660 color matrix registers 0x5381–0x538B (11 regs), levels −2..+2 */
+    static const uint8_t sat[5][11] = {
+        {0x1d,0x60,0x03,0x0a,0x60,0x6a,0x64,0x56,0x0e,0x01,0x98}, /* -2 */
+        {0x1d,0x60,0x03,0x0b,0x6c,0x77,0x70,0x60,0x10,0x01,0x98}, /* -1 */
+        {0x1d,0x60,0x03,0x0c,0x78,0x84,0x7d,0x6b,0x12,0x01,0x98}, /*  0 */
+        {0x1d,0x60,0x03,0x0d,0x84,0x91,0x8a,0x76,0x14,0x01,0x98}, /* +1 */
+        {0x1d,0x60,0x03,0x0e,0x90,0x9e,0x96,0x80,0x16,0x01,0x98}, /* +2 */
+    };
+    const uint8_t *row = sat[level + 2];
+    for (int i = 0; i < 11; i++) {
+        esp_err_t ret = sensor_write_reg(0x5381 + i, row[i]);
+        if (ret != ESP_OK) return ret;
+    }
+    return ESP_OK;
+}
+
+esp_err_t camera_set_wb_mode(int mode)
+{
+    if (mode < 0 || mode > 4) return ESP_ERR_INVALID_ARG;
+    /* reg 0x3406: 0 = AWB auto, 1 = manual gains */
+    sensor_write_reg(0x3406, mode != 0 ? 1 : 0);
+    /* 12-bit gains: reg N = high nibble, reg N+1 = low byte */
+    switch (mode) {
+    case 1: /* Sunny */
+        sensor_write_reg(0x3400,0x05); sensor_write_reg(0x3401,0xe0); /* R 0x5e0 */
+        sensor_write_reg(0x3402,0x04); sensor_write_reg(0x3403,0x10); /* G 0x410 */
+        sensor_write_reg(0x3404,0x05); sensor_write_reg(0x3405,0x40); /* B 0x540 */
+        break;
+    case 2: /* Cloudy */
+        sensor_write_reg(0x3400,0x06); sensor_write_reg(0x3401,0x50); /* R 0x650 */
+        sensor_write_reg(0x3402,0x04); sensor_write_reg(0x3403,0x10); /* G 0x410 */
+        sensor_write_reg(0x3404,0x04); sensor_write_reg(0x3405,0xf0); /* B 0x4f0 */
+        break;
+    case 3: /* Office */
+        sensor_write_reg(0x3400,0x05); sensor_write_reg(0x3401,0x20); /* R 0x520 */
+        sensor_write_reg(0x3402,0x04); sensor_write_reg(0x3403,0x10); /* G 0x410 */
+        sensor_write_reg(0x3404,0x06); sensor_write_reg(0x3405,0x60); /* B 0x660 */
+        break;
+    case 4: /* Home */
+        sensor_write_reg(0x3400,0x04); sensor_write_reg(0x3401,0x20); /* R 0x420 */
+        sensor_write_reg(0x3402,0x03); sensor_write_reg(0x3403,0xf0); /* G 0x3f0 */
+        sensor_write_reg(0x3404,0x07); sensor_write_reg(0x3405,0x10); /* B 0x710 */
+        break;
+    default: /* Auto (0) — AWB already enabled via 0x3406=0 */
+        break;
+    }
+    return ESP_OK;
 }

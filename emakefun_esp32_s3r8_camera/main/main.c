@@ -543,18 +543,80 @@ static httpd_handle_t s_httpd = NULL;
 static esp_err_t http_view_handler(httpd_req_t *req)
 {
     const char *html =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Camera</title>"
-        "<style>body{margin:0;background:#000;display:flex;justify-content:center;"
-        "align-items:center;min-height:100vh}"
-        "img{max-width:100vw;max-height:100vh}</style></head>"
-        "<body><img id='snap' src='/snapshot' onload=\""
-        "var s=this;setTimeout(function(){s.src='/snapshot?'+Date.now()},100)"
-        "\"></body></html>";
+        "<title>Camera Tuning</title>"
+        "<style>"
+        "body{margin:0;background:#111;color:#ddd;font:14px sans-serif}"
+        "img{display:block;max-width:100%}"
+        ".p{padding:8px 12px;display:grid;grid-template-columns:110px 1fr 36px;"
+        "align-items:center;gap:5px 8px}"
+        "label{text-align:right;font-size:12px;color:#aaa}"
+        "select,input[type=range]{width:100%;background:#222;color:#ddd;"
+        "border:1px solid #444;padding:2px}"
+        ".val{text-align:center;font-size:12px}"
+        "</style></head>"
+        "<body>"
+        "<img id='s' src='/snapshot' "
+        "onload=\"setTimeout(function(){document.getElementById('s').src='/snapshot?'+Date.now()},1500)\">"
+        "<div class='p'>"
+        "<label>H-Mirror</label>"
+        "<input type='checkbox' onchange=\"ctrl('hmirror',this.checked?1:0)\"><span></span>"
+        "<label>V-Flip</label>"
+        "<input type='checkbox' onchange=\"ctrl('vflip',this.checked?1:0)\"><span></span>"
+        "<label>White Balance</label>"
+        "<select onchange=\"ctrl('wb',this.value)\">"
+        "<option value='0'>Auto</option>"
+        "<option value='1'>Sunny</option>"
+        "<option value='2'>Cloudy</option>"
+        "<option value='3'>Office</option>"
+        "<option value='4'>Home</option>"
+        "</select><span></span>"
+        "<label>Contrast</label>"
+        "<input type='range' min='-2' max='2' value='0' "
+        "oninput=\"document.getElementById('cv').textContent=this.value;ctrl('contrast',this.value)\">"
+        "<span id='cv' class='val'>0</span>"
+        "<label>Saturation</label>"
+        "<input type='range' min='-2' max='2' value='0' "
+        "oninput=\"document.getElementById('sv').textContent=this.value;ctrl('saturation',this.value)\">"
+        "<span id='sv' class='val'>0</span>"
+        "</div>"
+        "<script>function ctrl(n,v){fetch('/cam_ctrl?var='+n+'&val='+v)}</script>"
+        "</body></html>";
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, html);
     return ESP_OK;
+}
+
+static esp_err_t http_cam_ctrl_handler(httpd_req_t *req)
+{
+    char query[64] = {};
+    char var[16]   = {};
+    char val[8]    = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "var", var, sizeof(var))  != ESP_OK ||
+        httpd_query_key_value(query, "val", val, sizeof(val))  != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, NULL);
+        return ESP_FAIL;
+    }
+    int v = atoi(val);
+    esp_err_t ret;
+    if      (!strcmp(var, "hmirror"))    ret = camera_set_hmirror(v);
+    else if (!strcmp(var, "vflip"))      ret = camera_set_vflip(v);
+    else if (!strcmp(var, "contrast"))   ret = camera_set_contrast(v);
+    else if (!strcmp(var, "saturation")) ret = camera_set_saturation(v);
+    else if (!strcmp(var, "wb"))         ret = camera_set_wb_mode(v);
+    else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown var");
+        return ESP_FAIL;
+    }
+    if (ret != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static esp_err_t http_snapshot_handler(httpd_req_t *req)
@@ -609,14 +671,16 @@ static void http_server_start(void)
         ESP_LOGE(TAG, "HTTP server start failed");
         return;
     }
-    httpd_uri_t root_uri  = { .uri = "/",              .method = HTTP_GET, .handler = http_root_handler };
-    httpd_uri_t view_uri  = { .uri = "/view",          .method = HTTP_GET, .handler = http_view_handler };
-    httpd_uri_t snap_uri  = { .uri = "/snapshot",      .method = HTTP_GET, .handler = http_snapshot_handler };
-    httpd_uri_t relay_uri = { .uri = "/change_relay1", .method = HTTP_GET, .handler = http_relay_handler };
+    httpd_uri_t root_uri     = { .uri = "/",              .method = HTTP_GET, .handler = http_root_handler };
+    httpd_uri_t view_uri     = { .uri = "/view",          .method = HTTP_GET, .handler = http_view_handler };
+    httpd_uri_t snap_uri     = { .uri = "/snapshot",      .method = HTTP_GET, .handler = http_snapshot_handler };
+    httpd_uri_t relay_uri    = { .uri = "/change_relay1", .method = HTTP_GET, .handler = http_relay_handler };
+    httpd_uri_t cam_ctrl_uri = { .uri = "/cam_ctrl",      .method = HTTP_GET, .handler = http_cam_ctrl_handler };
     httpd_register_uri_handler(s_httpd, &root_uri);
     httpd_register_uri_handler(s_httpd, &view_uri);
     httpd_register_uri_handler(s_httpd, &snap_uri);
     httpd_register_uri_handler(s_httpd, &relay_uri);
+    httpd_register_uri_handler(s_httpd, &cam_ctrl_uri);
     ESP_LOGI(TAG, "HTTP server started on port %d", cfg.server_port);
 }
 

@@ -14,3 +14,10 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size);
 
 /* Return the buffer to the driver (must be called after every successful capture). */
 void      camera_release_jpeg(void);
+
+/* Runtime sensor parameter adjustment (safe to call while streaming). */
+esp_err_t camera_set_hmirror(int enable);   /* 0 or 1 */
+esp_err_t camera_set_vflip(int enable);     /* 0 or 1 */
+esp_err_t camera_set_contrast(int level);   /* -2 to +2 */
+esp_err_t camera_set_saturation(int level); /* -2 to +2 */
+esp_err_t camera_set_wb_mode(int mode);     /* 0=auto 1=sunny 2=cloudy 3=office 4=home */
