@@ -193,6 +193,78 @@ static void modbus_init(void)
     ESP_ERROR_CHECK(uart_driver_install(MODBUS_UART_PORT, 256, 0, 0, NULL, 0));
 }
 
+static void modbus_reset(void)
+{
+    uint8_t cmd[] = {0xFF, 0x06, 0x00, 0xF0, 0x00, 0x00};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[8];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 8) {
+        ESP_LOGW(TAG, "Modbus reset: expected 8 bytes, got %d", len);
+        return;
+    }
+    ESP_LOGI(TAG, "modbus_reset:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,",
+            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]);
+    return;
+}
+
+static void modbus_read_calc_enable(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x47, 0x00, 0x01};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[7];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 7) {
+        ESP_LOGW(TAG, "modbus_read_calc: expected 7 bytes, got %d", len);
+        return;
+    }
+    ESP_LOGI(TAG, "modbus_read_calc:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
+            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]);
+    return;
+}
+
+static void modbus_read_calc(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x48, 0x00, 0x01};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[7];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 7) {
+        ESP_LOGW(TAG, "modbus_read_calc: expected 7 bytes, got %d", len);
+        return;
+    }
+    ESP_LOGI(TAG, "modbus_read_calc:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
+            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]);
+    return;
+}
+
 static float modbus_read_illuminance(void)
 {
     uint8_t cmd[] = {0x01, 0x03, 0x00, 0x02, 0x00, 0x02};
@@ -864,6 +936,8 @@ void app_main(void)
 
     /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
     modbus_init();
+    modbus_read_calc_enable();
+    modbus_read_calc();//modbus_reset();
 
     /* Sensor mutex — serializes HTTP handler vs status_timer reads */
     g_sensor_mutex = xSemaphoreCreateMutex();
