@@ -128,7 +128,7 @@ static void device_identity_init(void)
     len = sizeof(g_device_secret);
     nvs_get_str(h, "device_secret", g_device_secret, &len);
     nvs_close(h);
-    ESP_LOGI(TAG, "Identity loaded: id=%s", g_device_id);
+    ESP_LOGI(TAG, "Identity loaded: id=%s, secret=%.4s****", g_device_id, g_device_secret);
 
 build_topics:
     snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
@@ -207,7 +207,7 @@ static void snapshot_task(void *arg)
 
         const uint8_t *jpeg  = NULL;
         uint32_t       jsize = 0;
-        esp_err_t cerr = camera_capture_jpeg(&jpeg, &jsize);
+        esp_err_t cerr = camera_capture_jpeg(&jpeg, &jsize, false);
         if (cerr != ESP_OK) {
             publish_snapshot_response(req.role,
                 FLOWER_SNAPSHOT_RESULT_CODE_SNAPSHOT_CAPTURE_FAILED, 0, "capture failed");
@@ -368,7 +368,7 @@ static esp_err_t http_view_handler(httpd_req_t *req)
         "</style></head>"
         "<body>"
         "<img id='s' src='/snapshot' "
-        "onload=\"setTimeout(function(){document.getElementById('s').src='/snapshot?'+Date.now()},1500)\">"
+        "onload=\"document.getElementById('s').src='/snapshot?'+Date.now()\">"
         "<div class='p'>"
         "<label>H-Mirror</label>"
         "<input type='checkbox' onchange=\"ctrl('hmirror',this.checked?1:0)\"><span></span>"
@@ -432,15 +432,26 @@ static esp_err_t http_snapshot_handler(httpd_req_t *req)
 {
     const uint8_t *jpeg = NULL;
     uint32_t jsize = 0;
-    esp_err_t ret = camera_capture_jpeg(&jpeg, &jsize);
+    esp_err_t ret = camera_capture_jpeg(&jpeg, &jsize, false);
     if (ret != ESP_OK) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "Captured %u B JPEG", jsize);
     httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_send(req, (const char *)jpeg, (int)jsize);
+    const uint8_t *p = jpeg;
+    int32_t remaining = (int32_t)jsize;
+    while (remaining > 0 && ret == ESP_OK) {
+        int32_t chunk = remaining > 4096 ? 4096 : remaining;
+        ret = httpd_resp_send_chunk(req, (const char *)p, chunk);
+        p += chunk;
+        remaining -= chunk;
+    }
     camera_release_jpeg();
-    return ESP_OK;
+    if (ret == ESP_OK) {
+        httpd_resp_send_chunk(req, NULL, 0);
+    }
+    return ret == ESP_OK ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t http_root_handler(httpd_req_t *req)
@@ -459,6 +470,7 @@ static esp_err_t http_root_handler(httpd_req_t *req)
 static void http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.send_wait_timeout = 30;
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server start failed");
         return;
@@ -589,15 +601,17 @@ static void mqtt_start(void)
              "%s|%lld", g_device_id, (long long)ts_ms);
     calc_signature(ts_ms, g_device_id, g_device_secret, s_mqtt_password);
 
+    ESP_LOGI(TAG, "MQTT broker: %s", CONFIG_MQTT_BROKER_URI);
     esp_mqtt_client_config_t mqtt_cfg = {};
     mqtt_cfg.broker.address.uri                              = CONFIG_MQTT_BROKER_URI;
     mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
     mqtt_cfg.credentials.client_id                           = g_device_id;
     mqtt_cfg.credentials.username                            = s_mqtt_username;
     mqtt_cfg.credentials.authentication.password             = s_mqtt_password;
-    mqtt_cfg.session.keepalive                               = 60;
+    mqtt_cfg.session.keepalive                               = 120;
     mqtt_cfg.session.protocol_ver                            = MQTT_PROTOCOL_V_5;
     mqtt_cfg.network.disable_auto_reconnect                  = true;
+    mqtt_cfg.network.timeout_ms                              = 30000;
     mqtt_cfg.buffer.out_size = 65536;
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -657,6 +671,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    ESP_LOGI(TAG, "Connecting to SSID: [%s]", CONFIG_WIFI_SSID);
     ESP_LOGI(TAG, "Waiting for WiFi...");
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
@@ -723,13 +738,14 @@ void app_main(void)
 
     /* NTP */
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.nist.gov");
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "ntp.tencent.com");
+    esp_sntp_setservername(2, "cn.pool.ntp.org");
     esp_sntp_init();
 
     ESP_LOGI(TAG, "Waiting for NTP sync...");
     time_t now = 0;
-    for (int i = 0; i < 40 && now < 1700000000LL; i++) {
+    for (int i = 0; i < 120 && now < 1700000000LL; i++) {
         vTaskDelay(pdMS_TO_TICKS(500));
         time(&now);
     }

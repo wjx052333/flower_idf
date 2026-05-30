@@ -19,3 +19,5 @@ managed_components
 # Generated audio verification files
 main/*.wav
 scripts/*.wav
+sdkconfig.defaults.private
+sdkconfig

@@ -66,8 +66,8 @@ esp_err_t camera_init(void)
         .ledc_timer   = LEDC_TIMER_1,
         .ledc_channel = LEDC_CHANNEL_1,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_VGA,
-        .jpeg_quality = 12,
+        .frame_size   = FRAMESIZE_UXGA,
+        .jpeg_quality = 6,
         .fb_count     = 2,
         .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
         .fb_location  = CAMERA_FB_IN_PSRAM,
@@ -104,6 +104,13 @@ esp_err_t camera_init(void)
 
     s_cam_sem = xSemaphoreCreateBinary();
     xSemaphoreGive(s_cam_sem);
+
+    /* Discard first few frames while AEC/AWB stabilizes */
+    for (int i = 0; i < 5; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+    }
+
     return ESP_OK;
 }
 
@@ -119,7 +126,7 @@ bool camera_is_ready(void)
     return s_cam_ok;
 }
 
-esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
+esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size, bool use_flash)
 {
     if (!s_cam_ok) {
         ESP_LOGE(TAG, "camera_capture_jpeg: camera not ready");
@@ -127,7 +134,9 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
     }
     xSemaphoreTake(s_cam_sem, portMAX_DELAY);
 
-    gpio_set_level(CAM_FLASH_LED, 1);
+    if (use_flash) {
+        gpio_set_level(CAM_FLASH_LED, 1);
+    }
 
     s_fb = esp_camera_fb_get();
     if (!s_fb) {
@@ -137,7 +146,7 @@ esp_err_t camera_capture_jpeg(const uint8_t **data, uint32_t *size)
         return ESP_FAIL;
     }
 
-    if (s_led_timer) {
+    if (use_flash && s_led_timer) {
         esp_timer_stop(s_led_timer);
         esp_timer_start_once(s_led_timer, LED_OFF_DELAY_US);
     }

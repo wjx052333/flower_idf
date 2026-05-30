@@ -25,6 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -118,6 +119,8 @@ build_topics:
 /* ── State ───────────────────────────────────────────────────────────────── */
 static EventGroupHandle_t       s_wifi_event_group;
 #define WIFI_CONNECTED_BIT      BIT0
+
+static SemaphoreHandle_t g_sensor_mutex = NULL;
 
 static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
 static volatile bool            s_mqtt_connected = false;
@@ -423,6 +426,7 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
 
 static void publish_status_report(void)
 {
+    xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
     int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
     float humidity = raw_low * 100.0f / 4096;
     ESP_LOGI(TAG, "ADC humidity(GPIO0)=%d,%.1f%%", raw_low, humidity);
@@ -434,6 +438,7 @@ static void publish_status_report(void)
     float lux = modbus_read_illuminance();
     if (lux >= 0)
         ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
+    xSemaphoreGive(g_sensor_mutex);
 
     if (!s_mqtt_connected) return;
 
@@ -570,6 +575,129 @@ static void mqtt_start(void)
 }
 
 /* ── HTTP server ─────────────────────────────────────────────────────────── */
+static const char STATUS_HTML[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"zh\">\n"
+    "<head>\n"
+    "<meta charset=\"UTF-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    "<title>传感器状态</title>\n"
+    "<script src=\"https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js\"></script>\n"
+    "<style>\n"
+    "body{font-family:sans-serif;margin:0;padding:16px;background:#111;color:#eee}\n"
+    "h2{margin:0 0 8px;font-size:18px}\n"
+    ".relay{margin-bottom:12px;font-size:13px;color:#aaa;padding:8px;background:#1e1e1e;border-radius:6px}\n"
+    ".vals{display:flex;gap:10px;margin-bottom:16px}\n"
+    ".val{flex:1;padding:10px;background:#1e1e1e;border-radius:6px;text-align:center}\n"
+    ".val .num{font-size:22px;font-weight:bold;color:#eee}\n"
+    ".val .lbl{font-size:11px;color:#666;margin-top:2px}\n"
+    ".chart-wrap{margin-bottom:20px}\n"
+    "canvas{background:#1a1a1a;border-radius:8px;width:100%!important}\n"
+    "#status{font-size:11px;color:#555;margin-top:4px}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h2>传感器实时数据</h2>\n"
+    "<div class=\"relay\" id=\"relay-info\">继电器：加载中...</div>\n"
+    "<div class=\"vals\">\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
+    "</div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-temp\" height=\"100\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-lux\"  height=\"100\"></canvas></div>\n"
+    "<div id=\"status\">正在连接...</div>\n"
+    "<script>\n"
+    "const p=new URLSearchParams(location.search);\n"
+    "const IV=parseInt(p.get('interval')||'2000',10);\n"
+    "const MX=parseInt(p.get('points')||'120',10);\n"
+    "const t0=Date.now();\n"
+    "function fmt(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;\n"
+    "  return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`}\n"
+    "function mk(id,lbl,unit,clr){\n"
+    "  return new Chart(document.getElementById(id),{\n"
+    "    type:'line',\n"
+    "    data:{labels:[],datasets:[{label:`${lbl} (${unit})`,data:[],\n"
+    "      borderColor:clr,backgroundColor:clr+'22',borderWidth:1.5,\n"
+    "      pointRadius:0,tension:0.3,fill:true}]},\n"
+    "    options:{animation:false,responsive:true,\n"
+    "      scales:{\n"
+    "        x:{ticks:{color:'#888',maxTicksLimit:8},grid:{color:'#333'}},\n"
+    "        y:{ticks:{color:'#888'},grid:{color:'#333'}}},\n"
+    "      plugins:{legend:{labels:{color:'#ccc'}}}}})}\n"
+    "const C={h:mk('c-humi','湿度','%','#4fc3f7'),\n"
+    "         t:mk('c-temp','温度','°C','#ef9a9a'),\n"
+    "         l:mk('c-lux','照度','lx','#fff176')};\n"
+    "function push(c,x,y){c.data.labels.push(x);c.data.datasets[0].data.push(y);\n"
+    "  if(c.data.labels.length>MX){c.data.labels.shift();c.data.datasets[0].data.shift()}\n"
+    "  c.update('none')}\n"
+    "async function poll(){\n"
+    "  const t=fmt(Date.now()-t0);\n"
+    "  try{\n"
+    "    const r=await fetch('/api/sensors');\n"
+    "    if(!r.ok)throw new Error('HTTP '+r.status);\n"
+    "    const d=await r.json();\n"
+    "    const hv=d.humidity.toFixed(1),tv=d.temperature.toFixed(1),lv=d.lux.toFixed(0);\n"
+    "    document.getElementById('v-humi').textContent=hv;\n"
+    "    document.getElementById('v-temp').textContent=tv;\n"
+    "    document.getElementById('v-lux').textContent=lv;\n"
+    "    push(C.h,t,parseFloat(hv));\n"
+    "    push(C.t,t,parseFloat(tv));\n"
+    "    push(C.l,t,parseFloat(lv));\n"
+    "    const el=document.getElementById('relay-info');\n"
+    "    if(d.relay_last_on_ts>0){\n"
+    "      const dt=new Date(d.relay_last_on_ts*1000).toLocaleString();\n"
+    "      const dur=(d.relay_last_on_dur_ms/1000).toFixed(1);\n"
+    "      el.textContent=`继电器最后触发：${dt}（持续 ${dur} 秒）`;\n"
+    "    }else{el.textContent='继电器：从未触发'}\n"
+    "    document.getElementById('status').textContent=\n"
+    "      `最后更新：${new Date().toLocaleTimeString()}  轮询间隔：${IV}ms  保留点数：${MX}`;\n"
+    "  }catch(e){\n"
+    "    document.getElementById('status').textContent=`错误：${e.message}，重试中...`;\n"
+    "  }\n"
+    "}\n"
+    "poll();\n"
+    "setInterval(poll,IV);\n"
+    "</script>\n"
+    "</body>\n"
+    "</html>\n";
+
+static esp_err_t handle_status(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, STATUS_HTML, sizeof(STATUS_HTML) - 1);
+    return ESP_OK;
+}
+
+static esp_err_t handle_api_sensors(httpd_req_t *req)
+{
+    xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
+
+    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+    float humidity = raw_low * 100.0f / 4096.0f;
+
+    float temp = ds18b20_read_temperature();
+
+    float lux = modbus_read_illuminance();
+
+    xSemaphoreGive(g_sensor_mutex);
+
+    char json[160];
+    snprintf(json, sizeof(json),
+        "{\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,"
+        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%u}",
+        humidity,
+        (double)(temp > -273.0f ? temp : -273.0f),
+        (double)(lux >= 0.0f ? lux : -1.0f),
+        (long long)s_last_on_utc_s,
+        (unsigned)s_last_on_dur_ms);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
 static esp_err_t handle_root(httpd_req_t *req)
 {
     httpd_resp_send(req, "1", 1);
@@ -614,8 +742,20 @@ static void http_server_start(void)
         .method  = HTTP_GET,
         .handler = handle_change_relay1,
     };
+    static const httpd_uri_t uri_api_sensors = {
+        .uri     = "/api/sensors",
+        .method  = HTTP_GET,
+        .handler = handle_api_sensors,
+    };
+    static const httpd_uri_t uri_status = {
+        .uri     = "/status",
+        .method  = HTTP_GET,
+        .handler = handle_status,
+    };
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_relay);
+    httpd_register_uri_handler(server, &uri_api_sensors);
+    httpd_register_uri_handler(server, &uri_status);
     ESP_LOGI(TAG, "HTTP server started on port 80");
 }
 
@@ -724,6 +864,10 @@ void app_main(void)
 
     /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
     modbus_init();
+
+    /* Sensor mutex — serializes HTTP handler vs status_timer reads */
+    g_sensor_mutex = xSemaphoreCreateMutex();
+    assert(g_sensor_mutex != NULL);
 
     /* GPIO: relay (output, default off) */
     gpio_config_t io_conf = {};
