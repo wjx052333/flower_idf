@@ -39,6 +39,7 @@
 #include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
 #include "driver/uart.h"
+#include "driver/i2c_master.h"
 
 #include "esp_http_server.h"
 #include "esp_https_ota.h"
@@ -81,10 +82,16 @@ static char s_topic_status[96];
 #define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_0   /* GPIO0 */
 #define DS18B20_PIN GPIO_NUM_1                /* GPIO1 */
 
+/* ── Lux sensor select: define USE_BH1750 for BH1750FVI I2C,
+ *                       undefine for Modbus-RTU sensor ─────────────── */
+#define USE_BH1750
+
+#ifndef USE_BH1750
 #define MODBUS_UART_PORT  UART_NUM_1
 #define MODBUS_UART_TXD   GPIO_NUM_6
 #define MODBUS_UART_RXD   GPIO_NUM_7
 #define MODBUS_BAUD       9600
+#endif /* !USE_BH1750 */
 
 #define STATUS_INTERVAL_MS        30000
 #define RELAY_DEFAULT_DURATION_MS 10000
@@ -162,7 +169,9 @@ static int adc_read_raw(adc_channel_t channel)
     return raw;
 }
 
-/* ── Modbus-RTU illuminance ───────────────────────────────────────────────── */
+/* ── Illuminance sensor ──────────────────────────────────────────────────── */
+#ifndef USE_BH1750
+/* -- Modbus-RTU path -- */
 static uint16_t modbus_crc16(const uint8_t *data, int len)
 {
     uint16_t crc = 0xFFFF;
@@ -289,6 +298,52 @@ static float modbus_read_illuminance(void)
                  | ((uint32_t)rx_buf[5] << 8) | rx_buf[6];
     return (float)raw / 1000.0f;
 }
+#else /* USE_BH1750 */
+/* -- BH1750FVI I2C path (SCL=IO6, SDA=IO7) -- */
+#define BH1750_SCL_IO   GPIO_NUM_6
+#define BH1750_SDA_IO   GPIO_NUM_7
+#define BH1750_ADDR     0x23
+#define BH1750_CONT_H   0x10   /* Continuous H-Resolution Mode (~120 ms/sample) */
+
+static i2c_master_bus_handle_t s_i2c_bus    = NULL;
+static i2c_master_dev_handle_t s_bh1750_dev = NULL;
+
+static void bh1750_init(void)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port             = I2C_NUM_0,
+        .sda_io_num           = BH1750_SDA_IO,
+        .scl_io_num           = BH1750_SCL_IO,
+        .clk_source           = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt    = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c_bus));
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = BH1750_ADDR,
+        .scl_speed_hz    = 400000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_bh1750_dev));
+
+    uint8_t cmd = BH1750_CONT_H;
+    ESP_ERROR_CHECK(i2c_master_transmit(s_bh1750_dev, &cmd, 1, 100));
+    vTaskDelay(pdMS_TO_TICKS(200)); /* wait for first measurement */
+}
+
+static float bh1750_read_illuminance(void)
+{
+    uint8_t buf[2];
+    esp_err_t err = i2c_master_receive(s_bh1750_dev, buf, 2, 200);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BH1750 read error: %s", esp_err_to_name(err));
+        return -1.0f;
+    }
+    uint16_t raw = ((uint16_t)buf[0] << 8) | buf[1];
+    return (float)raw / 1.2f;
+}
+#endif /* USE_BH1750 */
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
 static void calc_signature(int64_t ts_ms, const char *device_id,
@@ -516,7 +571,11 @@ static void publish_status_report(void)
     if (temp > -273.0f)
         ESP_LOGI(TAG, "Temperature(GPIO1)=%.2f°C", temp);
 
+#ifdef USE_BH1750
+    float lux = bh1750_read_illuminance();
+#else
     float lux = modbus_read_illuminance();
+#endif
     if (lux >= 0)
         ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
     xSemaphoreGive(g_sensor_mutex);
@@ -759,7 +818,11 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     float temp = ds18b20_read_temperature();
 
+#ifdef USE_BH1750
+    float lux = bh1750_read_illuminance();
+#else
     float lux = modbus_read_illuminance();
+#endif
 
     xSemaphoreGive(g_sensor_mutex);
 
@@ -942,10 +1005,15 @@ void app_main(void)
     /* DS18B20: temperature sensor (IO1) */
     ds18b20_init(DS18B20_PIN);
 
+#ifdef USE_BH1750
+    /* BH1750FVI: illuminance sensor (IO6=SCL, IO7=SDA) */
+    bh1750_init();
+#else
     /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
     modbus_init();
     modbus_read_calc_enable();
-    modbus_read_calc();//modbus_reset();
+    modbus_read_calc(); /* modbus_reset(); */
+#endif
 
     /* Sensor mutex — serializes HTTP handler vs status_timer reads */
     g_sensor_mutex = xSemaphoreCreateMutex();

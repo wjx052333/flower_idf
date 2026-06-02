@@ -19,6 +19,7 @@ idf_component_register(
         esp_driver_ledc
         esp_adc
         esp_driver_uart
+        esp_driver_i2c
         lwip
         nanopb
         esp_https_ota
