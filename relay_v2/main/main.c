@@ -496,12 +496,21 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
     return true;
 }
 
+float get_humidity(void) {
+    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+    float humidity_cap = raw_low * 100.0f / 4096;
+    const float humidity_max = 98;
+    const float humidity_min = 30;
+    float humidity = 100 * (humidity_max - humidity_cap)/(humidity_max-humidity_min);
+    ESP_LOGI(TAG, "ADC humidity(GPIO0)=%d,%.1f%%,%.1f%%", raw_low, humidity_cap, humidity);
+
+    return humidity;
+}
+
 static void publish_status_report(void)
 {
     xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
-    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    float humidity = raw_low * 100.0f / 4096;
-    ESP_LOGI(TAG, "ADC humidity(GPIO0)=%d,%.1f%%", raw_low, humidity);
+    float humidity = get_humidity();
 
     float temp = ds18b20_read_temperature();
     if (temp > -273.0f)
@@ -746,8 +755,7 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 {
     xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
 
-    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    float humidity = raw_low * 100.0f / 4096.0f;
+    float humidity = get_humidity();
 
     float temp = ds18b20_read_temperature();
 
