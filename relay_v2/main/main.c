@@ -98,6 +98,11 @@ static char s_topic_status[96];
 #define BREATH_PERIOD_MS          3000
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
 
+/* Auto watering at noon */
+#define AUTO_WATER_HUMIDITY_THRESHOLD 40.0f  /* % */
+#define AUTO_WATER_DURATION_MS        10000  /* ms */
+#define AUTO_WATER_HOUR               12     /* noon */
+
 #define TAG "Flower"
 
 /* ── Device identity ─────────────────────────────────────────────────────── */
@@ -140,6 +145,7 @@ static volatile int64_t         s_last_on_utc_s  = 0;   /* UTC seconds when rela
 static volatile uint32_t        s_last_on_dur_ms = 0;   /* duration_ms of that activation */
 
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
+static volatile bool            s_auto_water_triggered_today = false;
 
 /* Static to avoid large stack allocation */
 static flower_command_t          s_cmd;
@@ -627,6 +633,49 @@ static void publish_status_report(void)
              humidity, (double)(temp > -273.0f ? temp : 0), (double)(lux >= 0 ? lux : 0));
 }
 
+/* ── Auto watering ───────────────────────────────────────────────────────── */
+static void check_auto_water(void)
+{
+    time_t now;
+    time(&now);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+
+    /* Reset flag at midnight */
+    if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0) {
+        s_auto_water_triggered_today = false;
+    }
+
+    /* Check at noon (12:00) */
+    if (timeinfo.tm_hour == AUTO_WATER_HOUR && timeinfo.tm_min == 0) {
+        if (s_auto_water_triggered_today) return;
+
+        xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
+        float humidity = get_humidity();
+        xSemaphoreGive(g_sensor_mutex);
+
+        if (humidity < AUTO_WATER_HUMIDITY_THRESHOLD) {
+            if (!s_relay_on) {
+                ESP_LOGI(TAG, "Auto watering: humidity=%.1f%% < %.1f%%, opening relay for %d ms",
+                         humidity, AUTO_WATER_HUMIDITY_THRESHOLD, AUTO_WATER_DURATION_MS);
+                gpio_set_level(RELAY_PIN, 1);
+                s_relay_on_us = esp_timer_get_time();
+                s_relay_on = true;
+                s_relay_duration = AUTO_WATER_DURATION_MS;
+                s_last_on_utc_s = (int64_t)now;
+                s_last_on_dur_ms = AUTO_WATER_DURATION_MS;
+                s_auto_water_triggered_today = true;
+            } else {
+                ESP_LOGW(TAG, "Auto watering: relay already on, skipping");
+            }
+        } else {
+            ESP_LOGI(TAG, "Auto watering: humidity=%.1f%% >= %.1f%%, no action needed",
+                     humidity, AUTO_WATER_HUMIDITY_THRESHOLD);
+            s_auto_water_triggered_today = true;
+        }
+    }
+}
+
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
 static esp_timer_handle_t s_reconnect_timer = NULL;
 static esp_timer_handle_t s_status_timer    = NULL;
@@ -645,6 +694,7 @@ static void reconnect_timer_cb(void *arg)
 
 static void status_timer_cb(void *arg)
 {
+    check_auto_water();
     publish_status_report();
 }
 
@@ -734,11 +784,22 @@ static const char STATUS_HTML[] =
     ".chart-wrap{margin-bottom:20px}\n"
     "canvas{background:#1a1a1a;border-radius:8px;width:100%!important}\n"
     "#status{font-size:11px;color:#555;margin-top:4px}\n"
+    ".btn-relay{margin-bottom:12px;padding:10px 20px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}\n"
+    ".btn-relay:active{background:#1b5e20}\n"
+    ".relay-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}\n"
+    ".relay-row input{width:80px;padding:8px;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:6px;font-size:14px;text-align:center}\n"
+    ".relay-row label{font-size:13px;color:#aaa}\n"
     "</style>\n"
     "</head>\n"
     "<body>\n"
     "<h2>传感器实时数据</h2>\n"
     "<div class=\"relay\" id=\"relay-info\">继电器：加载中...</div>\n"
+    "<div class=\"relay-row\">\n"
+    "  <button class=\"btn-relay\" onclick=\"openRelay()\">开继电器</button>\n"
+    "  <input type=\"number\" id=\"relay-dur\" value=\"10\" min=\"1\" max=\"3600\">\n"
+    "  <label>秒</label>\n"
+    "</div>\n"
+    "<div class=\"relay\" style=\"font-size:12px;color:#888\">自动浇水：每天中午12点检测湿度，若低于40%则自动开启继电器10秒</div>\n"
     "<div class=\"vals\">\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
@@ -797,18 +858,20 @@ static const char STATUS_HTML[] =
     "    document.getElementById('status').textContent=`错误：${e.message}，重试中...`;\n"
     "  }\n"
     "}\n"
+    "async function openRelay(){\n"
+    "  const sec=parseInt(document.getElementById('relay-dur').value||'10',10);\n"
+    "  const ms=Math.max(1,sec)*1000;\n"
+    "  try{\n"
+    "    await fetch('/change_relay1?duration='+ms);\n"
+    "  }catch(e){\n"
+    "    document.getElementById('status').textContent=`开继电器失败：${e.message}`;\n"
+    "  }\n"
+    "}\n"
     "poll();\n"
     "setInterval(poll,IV);\n"
     "</script>\n"
     "</body>\n"
     "</html>\n";
-
-static esp_err_t handle_status(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, STATUS_HTML, sizeof(STATUS_HTML) - 1);
-    return ESP_OK;
-}
 
 static esp_err_t handle_api_sensors(httpd_req_t *req)
 {
@@ -843,7 +906,8 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
 static esp_err_t handle_root(httpd_req_t *req)
 {
-    httpd_resp_send(req, "1", 1);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, STATUS_HTML, sizeof(STATUS_HTML) - 1);
     return ESP_OK;
 }
 
@@ -890,15 +954,9 @@ static void http_server_start(void)
         .method  = HTTP_GET,
         .handler = handle_api_sensors,
     };
-    static const httpd_uri_t uri_status = {
-        .uri     = "/status",
-        .method  = HTTP_GET,
-        .handler = handle_status,
-    };
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_relay);
     httpd_register_uri_handler(server, &uri_api_sensors);
-    httpd_register_uri_handler(server, &uri_status);
     ESP_LOGI(TAG, "HTTP server started on port 80");
 }
 
