@@ -21,6 +21,9 @@ Options:
 
 import argparse
 import http.server
+import sys as _sys
+import os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import json
 import os
 import socket
@@ -272,10 +275,10 @@ def main() -> None:
 
     final = ota_result["status"]
     if final == 2:
-        print("[OTA]  完成 ✓", flush=True)
+        print("[OTA]  完成 OK", flush=True)
         sys.exit(0)
     elif final == 3:
-        print("[OTA]  失败 ✗", flush=True)
+        print("[OTA]  失败 X", flush=True)
         sys.exit(1)
     elif args.wait == 0:
         print("[OTA]  指令已发送（未等待响应）", flush=True)

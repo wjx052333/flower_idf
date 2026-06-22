@@ -99,7 +99,7 @@ static char s_topic_status[96];
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
 
 /* Auto watering at noon */
-#define AUTO_WATER_HUMIDITY_THRESHOLD 40.0f  /* % */
+#define AUTO_WATER_HUMIDITY_THRESHOLD 60.0f  /* % */
 #define AUTO_WATER_DURATION_MS        10000  /* ms */
 #define AUTO_WATER_HOUR               12     /* noon */
 
@@ -799,7 +799,7 @@ static const char STATUS_HTML[] =
     "  <input type=\"number\" id=\"relay-dur\" value=\"10\" min=\"1\" max=\"3600\">\n"
     "  <label>秒</label>\n"
     "</div>\n"
-    "<div class=\"relay\" style=\"font-size:12px;color:#888\">自动浇水：每天中午12点检测湿度，若低于40%则自动开启继电器10秒</div>\n"
+    "<div class=\"relay\" style=\"font-size:12px;color:#888\">自动浇水：每天中午12点检测湿度，若低于60%则自动开启继电器10秒</div>\n"
     "<div class=\"vals\">\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
