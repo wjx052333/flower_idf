@@ -99,9 +99,7 @@ static char s_topic_status[96];
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
 
 /* Auto watering at noon */
-#define AUTO_WATER_HUMIDITY_THRESHOLD 60.0f  /* % */
-#define AUTO_WATER_DURATION_MS        10000  /* ms */
-#define AUTO_WATER_HOUR               12     /* noon */
+#define AUTO_WATER_HOUR  12  /* noon */
 
 #define TAG "Flower"
 
@@ -634,6 +632,15 @@ static void publish_status_report(void)
 }
 
 /* ── Auto watering ───────────────────────────────────────────────────────── */
+static uint32_t auto_water_duration_ms(float humidity)
+{
+    if      (humidity > 80.0f) return  360000;  /*  6 min → 300 ml */
+    else if (humidity > 70.0f) return  480000;  /*  8 min → 400 ml */
+    else if (humidity > 60.0f) return  600000;  /* 10 min → 500 ml */
+    else if (humidity > 50.0f) return  900000;  /* 15 min → 750 ml */
+    else                       return 1200000;  /* 20 min → 1000 ml */
+}
+
 static void check_auto_water(void)
 {
     time_t now;
@@ -654,24 +661,20 @@ static void check_auto_water(void)
         float humidity = get_humidity();
         xSemaphoreGive(g_sensor_mutex);
 
-        if (humidity < AUTO_WATER_HUMIDITY_THRESHOLD) {
-            if (!s_relay_on) {
-                ESP_LOGI(TAG, "Auto watering: humidity=%.1f%% < %.1f%%, opening relay for %d ms",
-                         humidity, AUTO_WATER_HUMIDITY_THRESHOLD, AUTO_WATER_DURATION_MS);
-                gpio_set_level(RELAY_PIN, 1);
-                s_relay_on_us = esp_timer_get_time();
-                s_relay_on = true;
-                s_relay_duration = AUTO_WATER_DURATION_MS;
-                s_last_on_utc_s = (int64_t)now;
-                s_last_on_dur_ms = AUTO_WATER_DURATION_MS;
-                s_auto_water_triggered_today = true;
-            } else {
-                ESP_LOGW(TAG, "Auto watering: relay already on, skipping");
-            }
+        s_auto_water_triggered_today = true;
+
+        if (!s_relay_on) {
+            uint32_t dur_ms = auto_water_duration_ms(humidity);
+            ESP_LOGI(TAG, "Auto watering: humidity=%.1f%%, opening relay for %u ms",
+                     humidity, (unsigned)dur_ms);
+            gpio_set_level(RELAY_PIN, 1);
+            s_relay_on_us    = esp_timer_get_time();
+            s_relay_on       = true;
+            s_relay_duration = dur_ms;
+            s_last_on_utc_s  = (int64_t)now;
+            s_last_on_dur_ms = dur_ms;
         } else {
-            ESP_LOGI(TAG, "Auto watering: humidity=%.1f%% >= %.1f%%, no action needed",
-                     humidity, AUTO_WATER_HUMIDITY_THRESHOLD);
-            s_auto_water_triggered_today = true;
+            ESP_LOGW(TAG, "Auto watering: relay already on, skipping");
         }
     }
 }
@@ -799,7 +802,7 @@ static const char STATUS_HTML[] =
     "  <input type=\"number\" id=\"relay-dur\" value=\"10\" min=\"1\" max=\"3600\">\n"
     "  <label>秒</label>\n"
     "</div>\n"
-    "<div class=\"relay\" style=\"font-size:12px;color:#888\">自动浇水：每天中午12点检测湿度，若低于60%则自动开启继电器10秒</div>\n"
+    "<div class=\"relay\" style=\"font-size:12px;color:#888\">自动浇水：每天中午12点检测湿度，阶梯式浇水：&gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min</div>\n"
     "<div class=\"vals\">\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
