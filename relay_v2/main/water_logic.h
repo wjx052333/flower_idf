@@ -74,3 +74,9 @@ void water_strategy_reset_state(void);
  * water=true it also consumes the cooldown / once-a-day flag, so a skipped
  * activation does not immediately re-trigger. */
 water_decision_t water_strategy_eval(time_t now, float humidity);
+
+/* A humidity reading outside the physically meaningful range means the sensor
+ * is disconnected, shorted or otherwise faulty. Such a reading must not drive
+ * a watering decision: a floating sensor reads permanently "dry" and would
+ * otherwise water on every cooldown, indefinitely. */
+bool water_humidity_valid(float humidity);

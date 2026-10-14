@@ -96,6 +96,7 @@ static char s_topic_status[96];
 #endif /* !USE_BH1750 */
 
 #define STATUS_INTERVAL_MS        30000
+#define SENSOR_MUTEX_TIMEOUT_MS   3000
 #define RELAY_DEFAULT_DURATION_MS 10000
 #define BREATH_PERIOD_MS          3000
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
@@ -566,7 +567,10 @@ float get_humidity(void) {
 
 static void publish_status_report(void)
 {
-    xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Status report: sensor busy, skipping this tick");
+        return;
+    }
     float humidity = get_humidity();
 
     float temp = ds18b20_read_temperature();
@@ -637,9 +641,18 @@ static void check_auto_water(void)
     time_t now;
     time(&now);
 
-    xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Auto watering: sensor busy, skipping this tick");
+        return;
+    }
     float humidity = get_humidity();
     xSemaphoreGive(g_sensor_mutex);
+
+    if (!water_humidity_valid(humidity)) {
+        ESP_LOGW(TAG, "Auto watering: humidity %.1f%% out of range, skipping",
+                 humidity);
+        return;
+    }
 
     water_decision_t d = water_strategy_eval(now, humidity);
     if (!d.water)
@@ -862,7 +875,12 @@ static const char STATUS_HTML[] =
 
 static esp_err_t handle_api_sensors(httpd_req_t *req)
 {
-    xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"sensor busy\"}");
+        return ESP_OK;
+    }
 
     float humidity = get_humidity();
 

@@ -265,6 +265,17 @@ static void test_strategy_names(void)
     CHECK(strcmp(water_strategy_name(WATER_STRATEGY_DEEP), "干了再浇透") == 0, "deep name");
 }
 
+static void test_humidity_validity(void)
+{
+    CHECK(water_humidity_valid(0.0f), "0%% rejected");
+    CHECK(water_humidity_valid(50.0f), "50%% rejected");
+    CHECK(water_humidity_valid(100.0f), "100%% rejected");
+    CHECK(!water_humidity_valid(-0.1f), "negative humidity accepted");
+    CHECK(!water_humidity_valid(100.1f), "humidity above 100%% accepted");
+    CHECK(!water_humidity_valid(-2.9f), "stuck-high sensor value accepted");
+    CHECK(!water_humidity_valid(144.1f), "stuck-low sensor value accepted");
+}
+
 int main(void)
 {
     setenv("TZ", "CST-8", 1);
@@ -278,6 +289,7 @@ int main(void)
     test_threshold_and_duration();
     test_cooldown();
     test_strategy_names();
+    test_humidity_validity();
 
     if (s_failures == 0) {
         printf("all tests passed\n");

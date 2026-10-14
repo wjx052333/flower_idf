@@ -189,6 +189,11 @@ void water_strategy_reset_state(void)
     s_last_auto_water = 0;
 }
 
+bool water_humidity_valid(float humidity)
+{
+    return humidity >= 0.0f && humidity <= 100.0f;
+}
+
 water_decision_t water_strategy_eval(time_t now, float humidity)
 {
     water_decision_t d = { .water = false, .duration_ms = 0 };
