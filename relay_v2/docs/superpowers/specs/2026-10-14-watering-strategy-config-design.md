@@ -85,6 +85,7 @@ NVS 默认分区（`app_main` 已调用 `nvs_flash_init()`），namespace `"wate
   - `bool water_config_apply_query(const char *query, char *err, size_t errlen)` —— 解析 `k=v&k=v` 形式的 query，逐项校验并更新；任一项非法则整体不生效并写 `err`
   - `int water_config_to_json(char *buf, size_t n)` —— 序列化为 JSON（含 `strategy_name`、`check_window`、`cooldown_s`）
   - `water_decision_t water_strategy_eval(time_t now, float humidity)` —— 纯决策函数，返回 `{bool water; uint32_t duration_ms;}`，内部维护「当天已触发」与「上次自动浇水时间戳」两个静态状态
+  - `bool water_humidity_valid(float humidity)` —— 读数是否落在 [0,100]，用于识别故障传感器
 
 - `relay_v2/main/water_store.c` / `water_store.h` —— 仅 NVS 读写：
   - `void water_store_load(void)`
@@ -111,7 +112,8 @@ NVS 默认分区（`app_main` 已调用 `nvs_flash_init()`），namespace `"wate
 ```
 time(&now)
 humidity = 读 ADC（持 g_sensor_mutex）
-d = water_strategy_eval(now, humidity)      // 内部含 NTP 保护
+if (!water_humidity_valid(humidity)) 仅记日志跳过      // 传感器故障
+d = water_strategy_eval(now, humidity)                 // 内部含 NTP 保护
 if (!d.water) return
 if (s_relay_on) 仅记日志跳过
 开继电器(d.duration_ms)，记录 s_last_on_utc_s / s_last_on_dur_ms
@@ -180,7 +182,28 @@ if (s_relay_on) 仅记日志跳过
 | NVS 写入失败 | 内存中配置仍生效，返回 HTTP 500 + 错误文本 |
 | query 参数非法 | 整体不生效，HTTP 400 + 具体哪个字段越界 |
 | NTP 未同步 | 跳过本轮自动浇水判断 |
+| 湿度读数落在 [0,100] 之外 | 视为传感器故障，跳过本轮自动浇水，记 `ESP_LOGW` |
 | 自动浇水触发时继电器已 ON | 跳过本轮，记 `ESP_LOGW`（沿用现有行为） |
+| 取传感器互斥锁超时 | 跳过本轮（HTTP 接口返回 503），记 `ESP_LOGW` |
+
+### 湿度读数合理性检查
+
+`get_humidity()` 把 ADC 原始值线性映射到 30%~98% 的窗口，窗口之外会产生不合理的结果：
+
+| 传感器状态 | 算出湿度 | 若不检查的后果 |
+|-----------|---------|---------------|
+| 悬空 / 读数偏高 | 约 -2.9% | 永远「很干」，每 30 分钟浇一次，无限持续 |
+| 短路 / 读数偏低 | 约 +144% | 安全，不浇 |
+
+旧逻辑只在 12:00 判断一次，影响有限；新逻辑每个 tick 都判断，若用户选了「干了再浇透」（阈值 10%、时长 20 分钟、冷却 30 分钟），卡死的传感器会让设备约 2/3 的时间都在浇水。
+
+因此在 `check_auto_water()` 里、调用 `water_strategy_eval()` 之前，先用 `water_humidity_valid()`（定义在 `water_logic.c`，可被主机端测试覆盖）过滤读数；超范围则跳过本轮并记日志。
+
+`publish_status_report()` 与 `/api/sensors` **不**过滤，照原样上报原始值——那正是用户发现传感器坏掉的途径。
+
+### 互斥锁获取失败的处理
+
+`check_auto_water()`、`publish_status_report()`、`handle_api_sensors()` 三处取 `g_sensor_mutex` 时必须检查返回值：超时（3 秒）就直接返回，不能继续读传感器、更不能 `xSemaphoreGive()` 一个自己没持有的锁——FreeRTOS 下那会释放别的任务仍持有的互斥锁，导致两个任务同时持锁，而这条路径上的 DS18B20 读取不可重入。超时时间用共享常量 `SENSOR_MUTEX_TIMEOUT_MS`。
 
 ## 测试
 
@@ -195,6 +218,7 @@ if (s_relay_on) 仅记日志跳过
 7. 湿度等于阈值 → 不浇（严格小于）
 8. query 解析：合法值生效；越界值（strategy=3、阈值=101、时长=0）整体不生效并返回错误
 9. JSON 序列化字段完整
+10. 湿度合理性：0/50/100 有效；-0.1/100.1 越界无效；-2.9（悬空传感器）与 144.1（短路传感器）无效
 
 NVS 持久化与 HTTP 接口在设备上手工验证：改配置 → 重启 → 配置仍在。
 
