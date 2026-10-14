@@ -894,15 +894,16 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     xSemaphoreGive(g_sensor_mutex);
 
-    char json[160];
+    char json[192];
     snprintf(json, sizeof(json),
         "{\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,"
-        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%u}",
+        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%u,\"strategy\":%u}",
         humidity,
         (double)(temp > -273.0f ? temp : -273.0f),
         (double)(lux >= 0.0f ? lux : -1.0f),
         (long long)s_last_on_utc_s,
-        (unsigned)s_last_on_dur_ms);
+        (unsigned)s_last_on_dur_ms,
+        (unsigned)water_config()->strategy);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
@@ -936,6 +937,46 @@ static esp_err_t handle_change_relay1(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/water/config            → current configuration as JSON
+ * GET /api/water/config?strategy=1 → apply the given fields, persist, return
+ *                                    the saved configuration as JSON */
+static esp_err_t handle_api_water_config(httpd_req_t *req)
+{
+    char query[192] = {};
+    esp_err_t qerr = httpd_req_get_url_query_str(req, query, sizeof(query));
+
+    if (qerr == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "query too long");
+        return ESP_OK;
+    }
+
+    if (qerr == ESP_OK && query[0] != '\0') {
+        char err[64] = {};
+        if (!water_config_apply_query(query, err, sizeof(err))) {
+            ESP_LOGW(TAG, "Water config rejected: %s", err);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "text/plain; charset=utf-8");
+            httpd_resp_sendstr(req, err);
+            return ESP_OK;
+        }
+        if (!water_store_save()) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "text/plain; charset=utf-8");
+            httpd_resp_sendstr(req, "save failed");
+            return ESP_OK;
+        }
+        ESP_LOGI(TAG, "Water config updated: %s", query);
+    }
+
+    char json[256];
+    water_config_to_json(json, sizeof(json));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
 static void http_server_start(void)
 {
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
@@ -959,9 +1000,15 @@ static void http_server_start(void)
         .method  = HTTP_GET,
         .handler = handle_api_sensors,
     };
+    static const httpd_uri_t uri_api_water = {
+        .uri     = "/api/water/config",
+        .method  = HTTP_GET,
+        .handler = handle_api_water_config,
+    };
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_relay);
     httpd_register_uri_handler(server, &uri_api_sensors);
+    httpd_register_uri_handler(server, &uri_api_water);
     ESP_LOGI(TAG, "HTTP server started on port 80");
 }
 
