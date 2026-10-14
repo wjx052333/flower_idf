@@ -171,12 +171,11 @@ static void test_midnight_rollover(void)
     CHECK(!water_strategy_eval(lt(2026, 6, 29, 12, 0), 10.0f).water,
           "eval() re-armed the noon flag on its own");
 
-    /* A tick at any other time of day changes nothing */
-    reset_all(WATER_STRATEGY_NOON);
-    CHECK(water_strategy_eval(lt(2026, 6, 28, 12, 0), 10.0f).water, "noon did not water");
-    water_strategy_tick(lt(2026, 6, 28, 23, 59));
-    CHECK(!water_strategy_eval(lt(2026, 6, 28, 23, 59), 10.0f).water,
-          "a 23:59 tick re-armed the noon strategy");
+    /* No case for "a non-midnight tick leaves the flag alone": it is not
+     * observable. A NOON eval outside the 12:00 minute returns no-water from
+     * the hour check before it ever reads the flag, and a clear at any other
+     * time of day cannot change an outcome, because the next eval that does
+     * read the flag is the following noon — already past a real midnight. */
 }
 
 static void test_clock_guard(void)
