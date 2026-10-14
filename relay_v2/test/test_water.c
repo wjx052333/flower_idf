@@ -146,9 +146,37 @@ static void test_noon_strategy(void)
           "humidity 50%% ladder");
 
     /* The next day's midnight tick re-arms it */
+    water_strategy_tick(lt(2026, 6, 29, 0, 0));
     CHECK(!water_strategy_eval(lt(2026, 6, 29, 0, 0), 10.0f).water, "watered at 00:00");
     CHECK(water_strategy_eval(lt(2026, 6, 29, 12, 0), 10.0f).water,
           "did not water the next day");
+}
+
+static void test_midnight_rollover(void)
+{
+    /* A bare rollover re-arms the noon strategy, with no eval() involved.
+     * This is the regression guard: the clear used to live inside eval(), so a
+     * tick that bailed out early (mutex timeout, unreadable sensor) skipped it
+     * and lost the whole day's watering. */
+    reset_all(WATER_STRATEGY_NOON);
+    CHECK(water_strategy_eval(lt(2026, 6, 28, 12, 0), 10.0f).water, "noon did not water");
+    water_strategy_tick(lt(2026, 6, 29, 0, 0));
+    CHECK(water_strategy_eval(lt(2026, 6, 29, 12, 0), 10.0f).water,
+          "a bare midnight rollover did not re-arm the noon strategy");
+
+    /* eval() alone must NOT re-arm — the rollover is the tick's job */
+    reset_all(WATER_STRATEGY_NOON);
+    CHECK(water_strategy_eval(lt(2026, 6, 28, 12, 0), 10.0f).water, "noon did not water");
+    CHECK(!water_strategy_eval(lt(2026, 6, 29, 0, 0), 10.0f).water, "watered at 00:00");
+    CHECK(!water_strategy_eval(lt(2026, 6, 29, 12, 0), 10.0f).water,
+          "eval() re-armed the noon flag on its own");
+
+    /* A tick at any other time of day changes nothing */
+    reset_all(WATER_STRATEGY_NOON);
+    CHECK(water_strategy_eval(lt(2026, 6, 28, 12, 0), 10.0f).water, "noon did not water");
+    water_strategy_tick(lt(2026, 6, 28, 23, 59));
+    CHECK(!water_strategy_eval(lt(2026, 6, 28, 23, 59), 10.0f).water,
+          "a 23:59 tick re-armed the noon strategy");
 }
 
 static void test_clock_guard(void)
@@ -284,6 +312,7 @@ int main(void)
     test_defaults_and_json();
     test_query_apply();
     test_noon_strategy();
+    test_midnight_rollover();
     test_clock_guard();
     test_window_boundaries();
     test_threshold_and_duration();

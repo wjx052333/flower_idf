@@ -75,6 +75,12 @@ void water_strategy_reset_state(void);
  * activation does not immediately re-trigger. */
 water_decision_t water_strategy_eval(time_t now, float humidity);
 
+/* Time-based housekeeping that must happen on every tick, before anything that
+ * can fail. Clears the noon strategy's once-a-day flag at midnight. Kept
+ * separate from water_strategy_eval() so a skipped or unreadable sensor tick
+ * cannot leave the flag set and silently skip the next day's watering. */
+void water_strategy_tick(time_t now);
+
 /* A humidity reading outside the physically meaningful range means the sensor
  * is disconnected, shorted or otherwise faulty. Such a reading must not drive
  * a watering decision: a floating sensor reads permanently "dry" and would

@@ -641,6 +641,8 @@ static void check_auto_water(void)
     time_t now;
     time(&now);
 
+    water_strategy_tick(now);
+
     if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "Auto watering: sensor busy, skipping this tick");
         return;

@@ -72,7 +72,7 @@ NVS 默认分区（`app_main` 已调用 `nvs_flash_init()`），namespace `"wate
 | `d_thresh` | u16 | `deep_thresh_pct` |
 | `d_dur`    | u16 | `deep_dur_s` |
 
-开机 `water_config_load()`：任一键读取失败则该字段保持默认值（逐字段读，不做全有全无）。web 保存时 `water_config_save()` 写入全部 5 个键并 `nvs_commit`。
+开机 `water_store_load()`：任一键读取失败则该字段保持默认值（逐字段读，不做全有全无）。web 保存时 `water_store_save()` 写入全部 5 个键并 `nvs_commit`。
 
 ### 文件划分
 
@@ -84,6 +84,7 @@ NVS 默认分区（`app_main` 已调用 `nvs_flash_init()`），namespace `"wate
   - `void water_config_reset(void)` —— 恢复默认值
   - `bool water_config_apply_query(const char *query, char *err, size_t errlen)` —— 解析 `k=v&k=v` 形式的 query，逐项校验并更新；任一项非法则整体不生效并写 `err`
   - `int water_config_to_json(char *buf, size_t n)` —— 序列化为 JSON（含 `strategy_name`、`check_window`、`cooldown_s`）
+  - `void water_strategy_tick(time_t now)` —— 每 tick 必做的时间维护（午夜清除策略 1 的「当天已触发」标志）。与 `water_strategy_eval()` 分开，是为了让它能在读传感器之前被无条件调用：否则互斥锁超时或读数非法导致的提前返回会连带跳过午夜重置，使当天中午不再浇水
   - `water_decision_t water_strategy_eval(time_t now, float humidity)` —— 纯决策函数，返回 `{bool water; uint32_t duration_ms;}`，内部维护「当天已触发」与「上次自动浇水时间戳」两个静态状态
   - `bool water_humidity_valid(float humidity)` —— 读数是否落在 [0,100]，用于识别故障传感器
 
@@ -111,6 +112,7 @@ NVS 默认分区（`app_main` 已调用 `nvs_flash_init()`），namespace `"wate
 
 ```
 time(&now)
+water_strategy_tick(now)                               // 午夜重置，无条件执行
 humidity = 读 ADC（持 g_sensor_mutex）
 if (!water_humidity_valid(humidity)) 仅记日志跳过      // 传感器故障
 d = water_strategy_eval(now, humidity)                 // 内部含 NTP 保护
@@ -214,6 +216,7 @@ if (s_relay_on) 仅记日志跳过
 3. 冷却：触发后 29 分钟不浇、30 分钟后可再浇
 4. 冷却跨策略共享：策略 2 触发后切到策略 3，冷却期内不浇
 5. 策略 1：12:00 触发一次，当天 12:00 再次调用不重复触发；次日 00:00 后复位
+5b. 午夜重置不被挡：单独调用 `water_strategy_tick()` 即可复位（不依赖 `water_strategy_eval()`）；反之 `eval()` 自己不负责复位；非午夜时刻的 tick 不改变状态
 6. 判定要浇时冷却立即消费：返回 `water=true` 后立刻再次调用返回 `water=false`
 7. 湿度等于阈值 → 不浇（严格小于）
 8. query 解析：合法值生效；越界值（strategy=3、阈值=101、时长=0）整体不生效并返回错误

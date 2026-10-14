@@ -194,6 +194,19 @@ bool water_humidity_valid(float humidity)
     return humidity >= 0.0f && humidity <= 100.0f;
 }
 
+void water_strategy_tick(time_t now)
+{
+    if ((int64_t)now < WATER_TIME_VALID_MIN)
+        return;   /* clock not synced yet */
+
+    struct tm t;
+    localtime_r(&now, &t);
+
+    /* Midnight rollover re-arms the noon strategy */
+    if (t.tm_hour == 0 && t.tm_min == 0)
+        s_noon_done_today = false;
+}
+
 water_decision_t water_strategy_eval(time_t now, float humidity)
 {
     water_decision_t d = { .water = false, .duration_ms = 0 };
@@ -203,10 +216,6 @@ water_decision_t water_strategy_eval(time_t now, float humidity)
 
     struct tm t = {0};
     localtime_r(&now, &t);
-
-    /* Midnight tick clears the once-a-day flag for the noon strategy */
-    if (t.tm_hour == 0 && t.tm_min == 0)
-        s_noon_done_today = false;
 
     if (s_cfg.strategy == WATER_STRATEGY_NOON) {
         if (t.tm_hour != NOON_HOUR || t.tm_min != 0 || s_noon_done_today)
