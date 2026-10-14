@@ -17,6 +17,11 @@
 
 #define NOON_HOUR              12
 
+/* Read by water_strategy_eval() on the 30 s status-timer task and written by
+ * water_config_apply_query() on the HTTP task. The write is a single struct
+ * assignment, so the worst case is one decision seeing a half-updated config,
+ * which is harmless here. No lock is used because this file must stay free of
+ * RTOS dependencies so it can also be built for the host test binary. */
 static water_config_t s_cfg = {
     .strategy           = WATER_STRATEGY_NOON,
     .surface_thresh_pct = DEF_SURFACE_THRESH_PCT,
@@ -114,7 +119,8 @@ static bool apply_pair(water_config_t *cfg, char *pair, char *err, size_t errlen
 
 bool water_config_apply_query(const char *query, char *err, size_t errlen)
 {
-    err[0] = '\0';
+    if (errlen > 0)
+        err[0] = '\0';
     if (query == NULL || query[0] == '\0')
         return true;
 
@@ -188,7 +194,7 @@ water_decision_t water_strategy_eval(time_t now, float humidity)
     if ((int64_t)now < WATER_TIME_VALID_MIN)
         return d;   /* clock not synced yet */
 
-    struct tm t;
+    struct tm t = {0};
     localtime_r(&now, &t);
 
     /* Midnight tick clears the once-a-day flag for the noon strategy */
@@ -198,7 +204,10 @@ water_decision_t water_strategy_eval(time_t now, float humidity)
     if (s_cfg.strategy == WATER_STRATEGY_NOON) {
         if (t.tm_hour != NOON_HOUR || t.tm_min != 0 || s_noon_done_today)
             return d;
+        /* Any watering starts the shared cooldown, regardless of strategy, so
+         * switching to SURFACE/DEEP right after noon cannot water again. */
         s_noon_done_today = true;
+        s_last_auto_water = now;
         d.water           = true;
         d.duration_ms     = noon_duration_ms(humidity);
         return d;

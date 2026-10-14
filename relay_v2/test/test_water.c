@@ -104,6 +104,19 @@ static void test_query_apply(void)
           "bad trailing field accepted");
     CHECK(c->strategy == WATER_STRATEGY_DEEP && c->surface_thresh_pct == 70,
           "rollback failed: strategy=%u s_thresh=%u", c->strategy, c->surface_thresh_pct);
+
+    /* A query longer than the internal buffer is rejected */
+    char big[300];
+    memset(big, 'a', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    CHECK(!water_config_apply_query(big, err, sizeof(err)), "oversized query accepted");
+
+    /* A pair without '=' is rejected */
+    CHECK(!water_config_apply_query("strategy", err, sizeof(err)), "pair without = accepted");
+
+    /* Empty segments between '&' are skipped */
+    CHECK(water_config_apply_query("surface_thresh_pct=60&&deep_dur_s=300", err, sizeof(err)),
+          "empty segment rejected: %s", err);
 }
 
 static void test_noon_strategy(void)
@@ -136,6 +149,28 @@ static void test_noon_strategy(void)
     CHECK(!water_strategy_eval(lt(2026, 6, 29, 0, 0), 10.0f).water, "watered at 00:00");
     CHECK(water_strategy_eval(lt(2026, 6, 29, 12, 0), 10.0f).water,
           "did not water the next day");
+}
+
+static void test_clock_guard(void)
+{
+    /* time() == 0 is 1970-01-01 08:00 in CST-8 — inside the watering window,
+     * so only the un-synced-clock guard can suppress this. */
+    reset_all(WATER_STRATEGY_SURFACE);
+    CHECK(!water_strategy_eval(0, 10.0f).water, "watered with an un-synced clock");
+
+    /* 1000000000 is 2001-09-09 09:46:40 in CST-8 — also inside the window,
+     * and still below WATER_TIME_VALID_MIN, so it must not water either. */
+    reset_all(WATER_STRATEGY_SURFACE);
+    CHECK(!water_strategy_eval((time_t)1000000000, 10.0f).water,
+          "watered before the clock was synced");
+
+    /* Past the guard, the same call does water — so the guard, and not some
+     * other condition, was what suppressed the two calls above.
+     * 1700013600 is 2023-11-15 10:00:00 CST-8 (hour 10), inside 08:00-16:00,
+     * and >= WATER_TIME_VALID_MIN (1700000000). */
+    reset_all(WATER_STRATEGY_SURFACE);
+    CHECK(water_strategy_eval((time_t)1700013600, 10.0f).water,
+          "did not water once the clock was valid");
 }
 
 static void test_window_boundaries(void)
@@ -210,6 +245,14 @@ static void test_cooldown(void)
     CHECK(!water_strategy_eval(t0, 90.0f).water, "watered at 90%% humidity");
     CHECK(water_strategy_eval(t0 + 60, 10.0f).water,
           "cooldown started even though nothing was watered");
+
+    /* Noon also starts the shared cooldown, so switching strategy right after
+     * noon does not water again immediately */
+    reset_all(WATER_STRATEGY_NOON);
+    CHECK(water_strategy_eval(lt(2026, 6, 28, 12, 0), 10.0f).water, "noon did not water");
+    water_config()->strategy = WATER_STRATEGY_SURFACE;
+    CHECK(!water_strategy_eval(lt(2026, 6, 28, 12, 5), 10.0f).water,
+          "watered again five minutes after noon");
 }
 
 static void test_strategy_names(void)
@@ -227,6 +270,7 @@ int main(void)
     test_defaults_and_json();
     test_query_apply();
     test_noon_strategy();
+    test_clock_guard();
     test_window_boundaries();
     test_threshold_and_duration();
     test_cooldown();
