@@ -22,6 +22,13 @@
  * watering window. */
 #define WATER_TIME_VALID_MIN   1700000000LL
 
+/* Accepted ranges for the configurable fields. Enforced both when parsing an
+ * HTTP query and when loading from NVS. */
+#define WATER_PCT_MIN  0
+#define WATER_PCT_MAX  100
+#define WATER_DUR_MIN  1
+#define WATER_DUR_MAX  65535
+
 typedef enum {
     WATER_STRATEGY_NOON    = 0,  /* 12:00 ladder watering, fixed parameters */
     WATER_STRATEGY_SURFACE = 1,  /* humidity < thresh → short fixed duration */

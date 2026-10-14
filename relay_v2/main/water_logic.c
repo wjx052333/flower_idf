@@ -60,8 +60,9 @@ const char *water_strategy_name(uint8_t strategy)
 /* ── Query parsing ───────────────────────────────────────────────────────── */
 static bool set_pct(const char *key, long v, uint16_t *dst, char *err, size_t errlen)
 {
-    if (v < 0 || v > 100) {
-        snprintf(err, errlen, "%s: 0-100 required", key);
+    if (v < WATER_PCT_MIN || v > WATER_PCT_MAX) {
+        snprintf(err, errlen, "%s: %d-%d required", key,
+                 WATER_PCT_MIN, WATER_PCT_MAX);
         return false;
     }
     *dst = (uint16_t)v;
@@ -70,8 +71,9 @@ static bool set_pct(const char *key, long v, uint16_t *dst, char *err, size_t er
 
 static bool set_dur(const char *key, long v, uint16_t *dst, char *err, size_t errlen)
 {
-    if (v < 1 || v > 65535) {
-        snprintf(err, errlen, "%s: 1-65535 required", key);
+    if (v < WATER_DUR_MIN || v > WATER_DUR_MAX) {
+        snprintf(err, errlen, "%s: %d-%d required", key,
+                 WATER_DUR_MIN, WATER_DUR_MAX);
         return false;
     }
     *dst = (uint16_t)v;
