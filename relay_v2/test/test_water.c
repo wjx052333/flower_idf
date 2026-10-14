@@ -154,18 +154,21 @@ static void test_noon_strategy(void)
 static void test_clock_guard(void)
 {
     /* time() == 0 is 1970-01-01 08:00 in CST-8 — inside the watering window,
-     * so only the un-synced-clock guard can suppress this. */
+     * so the window does not suppress this. (Like every fresh state, the
+     * cooldown would suppress it too, so this case alone does not prove the
+     * guard is what did it — the case below does.) */
     reset_all(WATER_STRATEGY_SURFACE);
     CHECK(!water_strategy_eval(0, 10.0f).water, "watered with an un-synced clock");
 
-    /* 1000000000 is 2001-09-09 09:46:40 in CST-8 — also inside the window,
-     * and still below WATER_TIME_VALID_MIN, so it must not water either. */
+    /* 1000000000 is 2001-09-09 09:46:40 in CST-8 — inside the window (hour 9),
+     * still below WATER_TIME_VALID_MIN, and far enough past the zero-initialised
+     * cooldown that the cooldown does NOT suppress it. Only the guard does. */
     reset_all(WATER_STRATEGY_SURFACE);
     CHECK(!water_strategy_eval((time_t)1000000000, 10.0f).water,
           "watered before the clock was synced");
 
-    /* Past the guard, the same call does water — so the guard, and not some
-     * other condition, was what suppressed the two calls above.
+    /* Past the guard, the same call does water — confirming the guard, and not
+     * some other condition, suppressed the call above.
      * 1700013600 is 2023-11-15 10:00:00 CST-8 (hour 10), inside 08:00-16:00,
      * and >= WATER_TIME_VALID_MIN (1700000000). */
     reset_all(WATER_STRATEGY_SURFACE);
