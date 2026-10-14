@@ -2,6 +2,8 @@ idf_component_register(
     SRCS
         "main.c"
         "ds18b20.c"
+        "water_logic.c"
+        "water_store.c"
         "../../nanopb_gen/proto/flower.pb.c"
     INCLUDE_DIRS
         "."
