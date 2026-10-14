@@ -54,6 +54,8 @@
 #include "pb_decode.h"
 #include "flower.pb.h"
 #include "ds18b20.h"
+#include "water_logic.h"
+#include "water_store.h"
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
@@ -98,9 +100,6 @@ static char s_topic_status[96];
 #define BREATH_PERIOD_MS          3000
 #define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
 
-/* Auto watering at noon */
-#define AUTO_WATER_HOUR  12  /* noon */
-
 #define TAG "Flower"
 
 /* ── Device identity ─────────────────────────────────────────────────────── */
@@ -143,7 +142,6 @@ static volatile int64_t         s_last_on_utc_s  = 0;   /* UTC seconds when rela
 static volatile uint32_t        s_last_on_dur_ms = 0;   /* duration_ms of that activation */
 
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
-static volatile bool            s_auto_water_triggered_today = false;
 
 /* Static to avoid large stack allocation */
 static flower_command_t          s_cmd;
@@ -632,51 +630,37 @@ static void publish_status_report(void)
 }
 
 /* ── Auto watering ───────────────────────────────────────────────────────── */
-static uint32_t auto_water_duration_ms(float humidity)
-{
-    if      (humidity > 80.0f) return  360000;  /*  6 min → 300 ml */
-    else if (humidity > 70.0f) return  480000;  /*  8 min → 400 ml */
-    else if (humidity > 60.0f) return  600000;  /* 10 min → 500 ml */
-    else if (humidity > 50.0f) return  900000;  /* 15 min → 750 ml */
-    else                       return 1200000;  /* 20 min → 1000 ml */
-}
-
+/* The strategy, thresholds and durations live in water_logic.c; this function
+ * only reads the sensor, asks for a decision and drives the relay. */
 static void check_auto_water(void)
 {
     time_t now;
     time(&now);
-    struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
 
-    /* Reset flag at midnight */
-    if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0) {
-        s_auto_water_triggered_today = false;
+    xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
+    float humidity = get_humidity();
+    xSemaphoreGive(g_sensor_mutex);
+
+    water_decision_t d = water_strategy_eval(now, humidity);
+    if (!d.water)
+        return;
+
+    if (s_relay_on) {
+        ESP_LOGW(TAG, "Auto watering [%s]: relay already on, skipping %u ms",
+                 water_strategy_name(water_config()->strategy),
+                 (unsigned)d.duration_ms);
+        return;
     }
 
-    /* Check at noon (12:00) */
-    if (timeinfo.tm_hour == AUTO_WATER_HOUR && timeinfo.tm_min == 0) {
-        if (s_auto_water_triggered_today) return;
-
-        xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(3000));
-        float humidity = get_humidity();
-        xSemaphoreGive(g_sensor_mutex);
-
-        s_auto_water_triggered_today = true;
-
-        if (!s_relay_on) {
-            uint32_t dur_ms = auto_water_duration_ms(humidity);
-            ESP_LOGI(TAG, "Auto watering: humidity=%.1f%%, opening relay for %u ms",
-                     humidity, (unsigned)dur_ms);
-            gpio_set_level(RELAY_PIN, 1);
-            s_relay_on_us    = esp_timer_get_time();
-            s_relay_on       = true;
-            s_relay_duration = dur_ms;
-            s_last_on_utc_s  = (int64_t)now;
-            s_last_on_dur_ms = dur_ms;
-        } else {
-            ESP_LOGW(TAG, "Auto watering: relay already on, skipping");
-        }
-    }
+    ESP_LOGI(TAG, "Auto watering [%s]: humidity=%.1f%%, opening relay for %u ms",
+             water_strategy_name(water_config()->strategy),
+             humidity, (unsigned)d.duration_ms);
+    gpio_set_level(RELAY_PIN, 1);
+    s_relay_on_us    = esp_timer_get_time();
+    s_relay_on       = true;
+    s_relay_duration = d.duration_ms;
+    s_last_on_utc_s  = (int64_t)now;
+    s_last_on_dur_ms = d.duration_ms;
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -1052,6 +1036,9 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+
+    /* Watering strategy + thresholds, restored from NVS (defaults if absent) */
+    water_store_load();
 
     /* PSA Crypto — must be called before any psa_* API */
     ESP_ERROR_CHECK(psa_crypto_init());
