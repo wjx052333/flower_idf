@@ -110,15 +110,16 @@ NVS 默认分区（`app_main` 已调用 `nvs_flash_init()`），namespace `"wate
 
 ```
 time(&now)
-if (now < 1700000000) return          // NTP 未同步，直接跳过
-localtime_r(&now, &t)
 humidity = 读 ADC（持 g_sensor_mutex）
-d = water_strategy_eval(now, humidity)
-if (d.water && !s_relay_on) 开继电器(d.duration_ms)，记录 s_last_on_utc_s / s_last_on_dur_ms
-if (d.water && s_relay_on)  仅记日志跳过
+d = water_strategy_eval(now, humidity)      // 内部含 NTP 保护
+if (!d.water) return
+if (s_relay_on) 仅记日志跳过
+开继电器(d.duration_ms)，记录 s_last_on_utc_s / s_last_on_dur_ms
 ```
 
-**NTP 保护（新增）**：`status_timer` 在 `app_main` 等待 NTP 同步之前就已启动，同步完成前 `time()` 返回 1970-01-01 附近的值。该时刻 UTC 00:00 在 `CST-8` 下正好是本地 08:00，会落进策略 2/3 的检测窗口，导致用未同步的时间去触发浇水。加 `now < 1700000000` 门槛（2023-11-14）即可避免。策略 1 因为要求 `tm_hour==12` 不受影响，但一并受保护。
+**NTP 保护（新增）**：`status_timer` 在 `app_main` 等待 NTP 同步之前就已启动，同步完成前 `time()` 返回 1970-01-01 附近的值。该时刻 UTC 00:00 在 `CST-8` 下正好是本地 08:00，会落进策略 2/3 的检测窗口，导致用未同步的时间去触发浇水。加 `now < 1700000000`（2023-11-14）门槛即可避免。策略 1 因为要求 `tm_hour==12` 不受影响，但一并受保护。
+
+这个门槛放在 `water_strategy_eval()` 内部而不是 `check_auto_water()` 里，这样它能被主机端测试覆盖（见测试第 1 条）。
 
 **时区**：`app_main` 已执行 `setenv("TZ", "CST-8", 1); tzset();`，`localtime_r()` 返回北京时间，窗口判断直接用本地时间，无需额外换算。
 
