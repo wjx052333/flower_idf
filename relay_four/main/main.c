@@ -406,7 +406,7 @@ static void publish_status_report(void)
 {
     if (s_status_mutex) xSemaphoreTake(s_status_mutex, portMAX_DELAY);
 
-    if (!s_mqtt_connected) {
+    if (!s_mqtt_connected || !s_mqtt_client) {
         if (s_status_mutex) xSemaphoreGive(s_status_mutex);
         return;
     }
@@ -926,6 +926,7 @@ void app_main(void)
     /* Mutexes */
     s_relay_mutex = xSemaphoreCreateMutex();
     s_status_mutex = xSemaphoreCreateMutex();
+    configASSERT(s_relay_mutex != NULL && s_status_mutex != NULL);
 
     /* Factory partition — device identity (id + secret) */
     nvs_flash_init_partition("fctry");
