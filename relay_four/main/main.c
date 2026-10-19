@@ -86,6 +86,7 @@ static char g_device_secret[128];
 static char s_topic_cmd[96];
 static char s_topic_cmd_resp[96];
 static char s_topic_status[96];
+static char s_host_name[96];
 
 /* ── Hardware & Channels ─────────────────────────────────────────────────── */
 #define LED_PIN                   GPIO_NUM_2
@@ -198,6 +199,8 @@ static esp_err_t device_identity_init(void)
     snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
     snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
     snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
+
+    snprintf(s_host_name,      sizeof(s_host_name),      "rel_%s",                    g_device_id);
     return ESP_OK;
 }
 
@@ -885,7 +888,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_t *netif = esp_netif_create_default_wifi_sta();
-    esp_netif_set_hostname(netif, g_device_id);
+    esp_netif_set_hostname(netif, s_host_name);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
