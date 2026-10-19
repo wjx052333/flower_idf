@@ -536,6 +536,7 @@ static void mqtt_start(void)
     mqtt_cfg.credentials.username                          = s_mqtt_username;
     mqtt_cfg.credentials.authentication.password           = s_mqtt_password;
     mqtt_cfg.session.keepalive                             = 60;
+    mqtt_cfg.session.message_retransmit_timeout            = 5000;
     mqtt_cfg.session.protocol_ver                          = MQTT_PROTOCOL_V_5;
     mqtt_cfg.network.disable_auto_reconnect                = true;
 
@@ -911,6 +912,9 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "Waiting for WiFi...");
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
+
+    /* Relay board is mains-powered: disable modem sleep to eliminate latency spikes and packet drops */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
