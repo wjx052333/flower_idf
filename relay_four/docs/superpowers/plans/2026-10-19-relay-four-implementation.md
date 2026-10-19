@@ -23,7 +23,7 @@
 - Create: `relay_four/main/Kconfig.projbuild`
 - Create: `relay_four/main/CMakeLists.txt`
 
-- [ ] **Step 1: 创建 `relay_four/CMakeLists.txt`**
+- [x] **Step 1: 创建 `relay_four/CMakeLists.txt`**
 
 ```cmake
 cmake_minimum_required(VERSION 3.16)
@@ -35,7 +35,7 @@ list(APPEND EXTRA_COMPONENT_DIRS
 project(flower)
 ```
 
-- [ ] **Step 2: 创建 `relay_four/partitions.csv`**
+- [x] **Step 2: 创建 `relay_four/partitions.csv`**
 
 ```csv
 # Name,   Type, SubType, Offset,   Size,     Flags
@@ -47,7 +47,7 @@ ota_0,    app,  ota_0,   0x20000,  0x1E0000,
 ota_1,    app,  ota_1,   0x200000, 0x1E0000,
 ```
 
-- [ ] **Step 3: 创建 `relay_four/sdkconfig.defaults`**
+- [x] **Step 3: 创建 `relay_four/sdkconfig.defaults`**
 
 ```ini
 # Flash size (ESP32-C3 standard module: 4MB)
@@ -85,7 +85,7 @@ CONFIG_MQTT_TASK_STACK_SIZE=6144
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 ```
 
-- [ ] **Step 4: 创建 `relay_four/main/Kconfig.projbuild`**
+- [x] **Step 4: 创建 `relay_four/main/Kconfig.projbuild`**
 
 ```kconfig
 menu "Flower Device Configuration"
@@ -105,7 +105,7 @@ config MQTT_BROKER_URI
 endmenu
 ```
 
-- [ ] **Step 5: 创建 `relay_four/main/CMakeLists.txt`**
+- [x] **Step 5: 创建 `relay_four/main/CMakeLists.txt`**
 
 ```cmake
 idf_component_register(
@@ -135,12 +135,12 @@ idf_component_register(
 target_link_libraries(${COMPONENT_LIB} m)
 ```
 
-- [ ] **Step 6: 校验文件创建与配置语法**
+- [x] **Step 6: 校验文件创建与配置语法**
 
 运行：`ls -la relay_four/ relay_four/main/`
 预期：5 个配置文件正确存在且非空。
 
-- [ ] **Step 7: 提交配置变更**
+- [x] **Step 7: 提交配置变更**
 
 ```bash
 git add relay_four/CMakeLists.txt relay_four/partitions.csv relay_four/sdkconfig.defaults relay_four/main/Kconfig.projbuild relay_four/main/CMakeLists.txt
@@ -154,7 +154,7 @@ git commit -m "chore(relay_four): initialize cmake, partitions and sdkconfig con
 **Files:**
 - Create: `relay_four/test/verify_html_json.js`
 
-- [ ] **Step 1: 创建测试用例 `verify_html_json.js`**
+- [x] **Step 1: 创建测试用例 `verify_html_json.js`**
 
 按照 `MEMORY.md` 指南，编写 Node.js 测试脚本提取 `main.c` 中的静态 `STATUS_HTML` 字符串和 JSON 响应构造，验证 HTML 语法树、DOM 元素完整性（4个继电器卡片、控制按钮）、以及 `/api/sensors` 返回 JSON 的有效性。
 
@@ -224,12 +224,12 @@ if (!mainContent.includes('"relays"') ||
 console.log("PASS: STATUS_HTML and API routes verification succeeded!");
 ```
 
-- [ ] **Step 2: 验证测试脚本初期应报错（由于 main.c 尚未就绪）**
+- [x] **Step 2: 验证测试脚本初期应报错（由于 main.c 尚未就绪）**
 
 运行：`node relay_four/test/verify_html_json.js`
 预期：报错退出，提示 `main.c does not exist yet`。
 
-- [ ] **Step 3: 提交测试脚本**
+- [x] **Step 3: 提交测试脚本**
 
 ```bash
 git add relay_four/test/verify_html_json.js
@@ -243,7 +243,7 @@ git commit -m "test(relay_four): add offline verification script for embedded we
 **Files:**
 - Create: `relay_four/main/main.c`
 
-- [ ] **Step 1: 编写 `main.c` 完整实现**
+- [x] **Step 1: 编写 `main.c` 完整实现**
 
 在 `relay_four/main/main.c` 中实现：
 1. **通道定义**：
@@ -266,17 +266,17 @@ git commit -m "test(relay_four): add offline verification script for embedded we
    - OTA 升级处理。
    - 30 秒定时发布 `flower_status_report_t`，上报 12 项 `metrics`（`relay1State`~`relay4State`、`relay1LastOnTs`~`relay4LastOnTs`、`relay1LastOnDur`~`relay4LastOnDur`）及 `device_type = "C3_relay_four"`。
 
-- [ ] **Step 2: 运行离线自动化测试验证 Web/JSON**
+- [x] **Step 2: 运行离线自动化测试验证 Web/JSON**
 
 运行：`node relay_four/test/verify_html_json.js`
 预期：输出 `PASS: STATUS_HTML and API routes verification succeeded!`。
 
-- [ ] **Step 3: 语法与静态规范检查**
+- [x] **Step 3: 语法与静态规范检查**
 
 检查 `main.c` 中没有遗留未声明的函数、头文件引用完整、宏定义准确。
 运行：`grep -n "RELAY\|BUTTON\|LED\|GPIO" relay_four/main/main.c` 检查引脚映射无误。
 
-- [ ] **Step 4: 提交 `main.c` 代码**
+- [x] **Step 4: 提交 `main.c` 代码**
 
 ```bash
 git add relay_four/main/main.c
@@ -290,16 +290,16 @@ git commit -m "feat(relay_four): implement 4-channel relay logic, web console an
 **Files:**
 - Modify: `relay_four/docs/superpowers/plans/2026-10-19-relay-four-implementation.md`
 
-- [ ] **Step 1: 运行全套测试**
+- [x] **Step 1: 运行全套测试**
 
 运行：`node relay_four/test/verify_html_json.js`
 预期：全部通过。
 
-- [ ] **Step 2: 完整性检查与分支状态检查**
+- [x] **Step 2: 完整性检查与分支状态检查**
 
 运行：`git status` 与 `git log -n 4 --oneline`
 确认所有代码已正确就绪，且 commit 历史干净工整。
 
-- [ ] **Step 3: 交付说明**
+- [x] **Step 3: 交付说明**
 
 在文档与回复中向用户提供烧录前检查事项及在目标机器上编译运行命令（如 `idf.py set-target esp32c3 && idf.py build`）。
