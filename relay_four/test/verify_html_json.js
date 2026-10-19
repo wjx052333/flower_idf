@@ -25,7 +25,7 @@ const mainContent = fs.readFileSync(mainPath, 'utf8');
  * 遍历字符，处理转义字符，忽略注释，并在字符串外的首个 ';' 处终止
  */
 function extractCStringDeclaration(content, varName) {
-  const declRegex = new RegExp(`(?:static\\s+const\\s+char|const\\s+char)\\s+${varName}\\s*\\[\\s*\\]\\s*=`);
+  const declRegex = new RegExp('(?:static\\s+const\\s+char|const\\s+char)\\s+' + varName + '\\s*\\[\\s*\\d*\\s*\\]\\s*=');
   const match = content.match(declRegex);
   if (!match) return null;
 
@@ -136,12 +136,13 @@ for (const [idx, sMatch] of scriptTags.entries()) {
 
 // 3. 检查 JSON 构造模板中的字段（兼容宏定义和字符串转义两种格式）
 const hasJsonKey = (key) => mainContent.includes(`"${key}"`) || mainContent.includes(`\\"${key}\\"`);
+const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms"];
 
-if (!hasJsonKey("relays") ||
-    !hasJsonKey("relay_last_on_ts") ||
-    !hasJsonKey("relay_last_on_dur_ms")) {
-  console.error("FAIL: JSON response format does not match specification");
-  process.exit(1);
+for (const key of requiredJsonKeys) {
+  if (!hasJsonKey(key)) {
+    console.error(`FAIL: JSON response missing required key: ${key}`);
+    process.exit(1);
+  }
 }
 
 console.log("PASS: STATUS_HTML and API routes verification succeeded!");
