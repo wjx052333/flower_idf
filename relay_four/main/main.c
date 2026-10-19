@@ -41,6 +41,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -104,20 +105,22 @@ typedef struct {
     volatile int64_t last_on_utc_s;
     volatile uint32_t last_on_dur_ms;
     bool             last_button_state;
+    uint8_t          btn_debounce_cnt;
 } relay_channel_t;
 
+static SemaphoreHandle_t s_relay_mutex  = NULL;
+static SemaphoreHandle_t s_status_mutex = NULL;
+
 static relay_channel_t s_relays[4] = {
-    { .relay_gpio = GPIO_NUM_3, .button_gpio = GPIO_NUM_10, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true },
-    { .relay_gpio = GPIO_NUM_4, .button_gpio = GPIO_NUM_9,  .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true },
-    { .relay_gpio = GPIO_NUM_5, .button_gpio = GPIO_NUM_6,  .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true },
-    { .relay_gpio = GPIO_NUM_7, .button_gpio = GPIO_NUM_8,  .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true },
+    { .relay_gpio = GPIO_NUM_3, .button_gpio = GPIO_NUM_10, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true, .btn_debounce_cnt = 0 },
+    { .relay_gpio = GPIO_NUM_4, .button_gpio = GPIO_NUM_9,  .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true, .btn_debounce_cnt = 0 },
+    { .relay_gpio = GPIO_NUM_5, .button_gpio = GPIO_NUM_6,  .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true, .btn_debounce_cnt = 0 },
+    { .relay_gpio = GPIO_NUM_7, .button_gpio = GPIO_NUM_8,  .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS, .last_button_state = true, .btn_debounce_cnt = 0 },
 };
 
-void relay_set(int ch, bool on, uint32_t duration_ms)
+static void relay_set_unlocked(int ch, bool on, uint32_t duration_ms)
 {
     if (ch < 0 || ch >= 4) return;
-    gpio_set_level(s_relays[ch].relay_gpio, on ? 1 : 0);
-    s_relays[ch].on = on;
     if (on) {
         s_relays[ch].on_us = esp_timer_get_time();
         s_relays[ch].duration_ms = duration_ms;
@@ -126,39 +129,76 @@ void relay_set(int ch, bool on, uint32_t duration_ms)
         s_relays[ch].last_on_utc_s = (int64_t)_now;
         s_relays[ch].last_on_dur_ms = duration_ms;
     }
+    s_relays[ch].on = on;
+    gpio_set_level(s_relays[ch].relay_gpio, on ? 1 : 0);
+}
+
+void relay_set(int ch, bool on, uint32_t duration_ms)
+{
+    if (ch < 0 || ch >= 4) return;
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    if (on) {
+        s_relays[ch].on_us = esp_timer_get_time();
+        s_relays[ch].duration_ms = duration_ms;
+        time_t _now;
+        time(&_now);
+        s_relays[ch].last_on_utc_s = (int64_t)_now;
+        s_relays[ch].last_on_dur_ms = duration_ms;
+    }
+    s_relays[ch].on = on;
+    gpio_set_level(s_relays[ch].relay_gpio, on ? 1 : 0);
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+}
+
+static void relay_toggle_unlocked(int ch)
+{
+    if (ch < 0 || ch >= 4) return;
+    if (s_relays[ch].on) {
+        relay_set_unlocked(ch, false, 0);
+    } else {
+        relay_set_unlocked(ch, true, s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS);
+    }
 }
 
 void relay_toggle(int ch)
 {
     if (ch < 0 || ch >= 4) return;
-    if (s_relays[ch].on) {
-        relay_set(ch, false, 0);
-    } else {
-        relay_set(ch, true, s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS);
-    }
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    relay_toggle_unlocked(ch);
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 }
 
 /* ── Device identity ─────────────────────────────────────────────────────── */
-static void device_identity_init(void)
+static esp_err_t device_identity_init(void)
 {
     nvs_handle_t h;
     esp_err_t err = nvs_open_from_partition("fctry", "identity", NVS_READONLY, &h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "fctry partition open failed (%s), identity unavailable",
                  esp_err_to_name(err));
-        goto build_topics;
+        return err;
     }
     size_t len = sizeof(g_device_id);
-    nvs_get_str(h, "device_id",     g_device_id,     &len);
+    err = nvs_get_str(h, "device_id", g_device_id, &len);
+    if (err != ESP_OK || g_device_id[0] == '\0') {
+        ESP_LOGE(TAG, "Failed to read valid device_id from fctry (%s)", esp_err_to_name(err));
+        nvs_close(h);
+        return (err != ESP_OK) ? err : ESP_ERR_NOT_FOUND;
+    }
     len = sizeof(g_device_secret);
-    nvs_get_str(h, "device_secret", g_device_secret, &len);
+    err = nvs_get_str(h, "device_secret", g_device_secret, &len);
+    if (err != ESP_OK || g_device_secret[0] == '\0') {
+        ESP_LOGE(TAG, "Failed to read valid device_secret from fctry (%s)", esp_err_to_name(err));
+        nvs_close(h);
+        return (err != ESP_OK) ? err : ESP_ERR_NOT_FOUND;
+    }
     nvs_close(h);
     ESP_LOGI(TAG, "Device identity loaded from fctry: id=%s", g_device_id);
 
-build_topics:
     snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
     snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
     snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
+    return ESP_OK;
 }
 
 /* ── State ───────────────────────────────────────────────────────────────── */
@@ -364,13 +404,19 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
 
 static void publish_status_report(void)
 {
-    if (!s_mqtt_connected) return;
+    if (s_status_mutex) xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+
+    if (!s_mqtt_connected) {
+        if (s_status_mutex) xSemaphoreGive(s_status_mutex);
+        return;
+    }
 
     /* 12 metrics:
      *   relay1State ... relay4State (INT64)
      *   relay1LastOnTs ... relay4LastOnTs (INT64)
      *   relay1LastOnDur ... relay4LastOnDur (INT64)
      */
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     for (int i = 0; i < 4; i++) {
         snprintf(s_metrics[i].key, sizeof(s_metrics[i].key), "relay%dState", i + 1);
         s_metrics[i].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
@@ -386,6 +432,9 @@ static void publish_status_report(void)
         s_metrics[8 + i].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
         s_metrics[8 + i].value.int64_value = (int64_t)s_relays[i].last_on_dur_ms;
     }
+    int r_on[4];
+    for (int i = 0; i < 4; i++) r_on[i] = s_relays[i].on ? 1 : 0;
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 
     time_t now;
     time(&now);
@@ -404,14 +453,16 @@ static void publish_status_report(void)
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
     if (!pb_encode(&stream, &flower_status_report_t_msg, &sr)) {
         ESP_LOGE(TAG, "Status encode: %s", PB_GET_ERROR(&stream));
+        if (s_status_mutex) xSemaphoreGive(s_status_mutex);
         return;
     }
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
 
     ESP_LOGI(TAG, "Status published (relays: %d,%d,%d,%d)",
-             s_relays[0].on ? 1 : 0, s_relays[1].on ? 1 : 0,
-             s_relays[2].on ? 1 : 0, s_relays[3].on ? 1 : 0);
+             r_on[0], r_on[1], r_on[2], r_on[3]);
+
+    if (s_status_mutex) xSemaphoreGive(s_status_mutex);
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -441,6 +492,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     switch (event->event_id) {
     case MQTT_EVENT_CONNECTED:
         s_mqtt_connected = true;
+        esp_timer_stop(s_reconnect_timer);
         esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd, 1);
         ESP_LOGI(TAG, "MQTT connected, sub: %s", s_topic_cmd);
         publish_status_report();
@@ -448,6 +500,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     case MQTT_EVENT_DISCONNECTED:
         s_mqtt_connected = false;
         ESP_LOGW(TAG, "MQTT disconnected, reconnect in 5 s");
+        esp_timer_stop(s_reconnect_timer);
         esp_timer_start_once(s_reconnect_timer, 5000000ULL);
         break;
     case MQTT_EVENT_DATA:
@@ -652,7 +705,12 @@ static esp_err_t handle_change_relay_ch(httpd_req_t *req, int ch)
     }
 
     char query[64] = {};
-    uint32_t dur = s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS;
+    uint32_t dur = RELAY_DEFAULT_DURATION_MS;
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    if (s_relays[ch].duration_ms > 0) {
+        dur = s_relays[ch].duration_ms;
+    }
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
     bool is_off = false;
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
@@ -686,6 +744,7 @@ static esp_err_t handle_change_relay4(httpd_req_t *req) { return handle_change_r
 static esp_err_t handle_api_sensors(httpd_req_t *req)
 {
     char json[512];
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
         "\"relays\":["
@@ -703,6 +762,7 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         s_relays[3].on ? 1 : 0, (long long)s_relays[3].last_on_utc_s, (unsigned long)s_relays[3].last_on_dur_ms,
         (long long)s_relays[0].last_on_utc_s,
         (unsigned long)s_relays[0].last_on_dur_ms);
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
@@ -775,22 +835,32 @@ static void app_timer_cb(void *arg)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 
     /* For ch = 0 to 3 */
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     for (int ch = 0; ch < 4; ch++) {
-        /* Scan button: active-low */
-        bool btn = (bool)gpio_get_level(s_relays[ch].button_gpio);
-        if (!btn && s_relays[ch].last_button_state) {
-            relay_toggle(ch);
+        /* Scan button with debounce: active-low */
+        bool raw_btn = (bool)gpio_get_level(s_relays[ch].button_gpio);
+        if (raw_btn != s_relays[ch].last_button_state) {
+            s_relays[ch].btn_debounce_cnt++;
+            if (s_relays[ch].btn_debounce_cnt >= 2) {
+                s_relays[ch].last_button_state = raw_btn;
+                s_relays[ch].btn_debounce_cnt = 0;
+                if (!raw_btn) {
+                    relay_toggle_unlocked(ch);
+                }
+            }
+        } else {
+            s_relays[ch].btn_debounce_cnt = 0;
         }
-        s_relays[ch].last_button_state = btn;
 
         /* Auto-off check */
         if (s_relays[ch].on && s_relays[ch].duration_ms > 0) {
             int64_t elapsed_ms = (esp_timer_get_time() - s_relays[ch].on_us) / 1000LL;
             if (elapsed_ms >= (int64_t)s_relays[ch].duration_ms) {
-                relay_set(ch, false, 0);
+                relay_set_unlocked(ch, false, 0);
             }
         }
     }
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 }
 
 /* ── WiFi ────────────────────────────────────────────────────────────────── */
@@ -853,9 +923,16 @@ void app_main(void)
     /* PSA Crypto — must be called before any psa_* API */
     ESP_ERROR_CHECK(psa_crypto_init());
 
+    /* Mutexes */
+    s_relay_mutex = xSemaphoreCreateMutex();
+    s_status_mutex = xSemaphoreCreateMutex();
+
     /* Factory partition — device identity (id + secret) */
     nvs_flash_init_partition("fctry");
-    device_identity_init();
+    if (device_identity_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Fatal: invalid or missing device identity, halting");
+        return;
+    }
 
     /* GPIO: 4 Relays (GPIO 3, 4, 5, 7: output, default off) */
     uint64_t relay_mask = (1ULL << GPIO_NUM_3) |
