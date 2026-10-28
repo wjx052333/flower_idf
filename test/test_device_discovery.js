@@ -11,6 +11,8 @@ function parseDiscoveryPacket(msg) {
     if (parts.length !== 4) return null;
     const [magic, hostname, ip, portStr] = parts;
     if (magic !== 'FLOWER') return null;
+    if (!hostname || hostname.trim().length === 0) return null;
+    if (!/^\d+$/.test(portStr)) return null;
     const port = parseInt(portStr, 10);
     if (isNaN(port) || port <= 0 || port > 65535) return null;
     // 简易 IPv4 格式检查
@@ -49,12 +51,25 @@ function runUnitTests() {
     console.log("PASS: Discovery protocol unit tests passed successfully!");
 }
 
-runUnitTests();
+if (require.main === module) {
+    runUnitTests();
+}
 
-// 3. 命令行参数驱动：若传入 --listen，则作为真实 UDP 监听器运行 3 秒测试
+module.exports = {
+    parseDiscoveryPacket,
+    runUnitTests
+};
+
+// 3. 命令行参数驱动：若传入 --listen，则作为真实 UDP 监听器运行测试
 if (process.argv.includes('--listen')) {
     const PORT = 3333;
     const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+    socket.on('error', (err) => {
+        console.error(`[Listener Error] ${err.message}`);
+        socket.close();
+        process.exit(1);
+    });
 
     socket.on('message', (msg, rinfo) => {
         const text = msg.toString();
