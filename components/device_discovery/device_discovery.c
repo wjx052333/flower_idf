@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -15,7 +16,8 @@
 #define TAG "Discovery"
 #define DISCOVERY_PROBE_CMD "FLOWER_DISCOVER"
 #define DISCOVERY_TASK_STACK_SIZE 3072
-#define DISCOVERY_INTERVAL_SEC 5
+#define DISCOVERY_INTERVAL_US (5ULL * 1000ULL * 1000ULL) /* 5 seconds */
+#define SOCKET_RECV_TIMEOUT_SEC 1
 
 static TaskHandle_t s_discovery_task_handle = NULL;
 static volatile bool s_running = false;
@@ -61,22 +63,23 @@ static void discovery_task(void *pvParameters)
         int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
         if (sock < 0) {
             ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            if (s_running) vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
 
-        // 允许广播
-        int broadcast_enable = 1;
-        if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        // 允许地址复用与广播
+        int opt_enable = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt_enable, sizeof(opt_enable));
+        if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt_enable, sizeof(opt_enable)) < 0) {
             ESP_LOGE(TAG, "Failed to set SO_BROADCAST: errno %d", errno);
             close(sock);
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            if (s_running) vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
 
-        // 设置接收超时时间为 5 秒
+        // 设置接收超时时间为 1 秒（解耦周期广播与接收超时，防止其他设备广播导致超时饿死）
         struct timeval timeout;
-        timeout.tv_sec = DISCOVERY_INTERVAL_SEC;
+        timeout.tv_sec = SOCKET_RECV_TIMEOUT_SEC;
         timeout.tv_usec = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
@@ -90,12 +93,11 @@ static void discovery_task(void *pvParameters)
         if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
             ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
             close(sock);
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            if (s_running) vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
 
-        ESP_LOGI(TAG, "Listening on UDP %d and broadcasting every %d s",
-                 DISCOVERY_DEFAULT_PORT, DISCOVERY_INTERVAL_SEC);
+        ESP_LOGI(TAG, "Listening on UDP %d and broadcasting every 5 s", DISCOVERY_DEFAULT_PORT);
 
         // 设置广播目标地址 255.255.255.255:3333
         struct sockaddr_in broadcast_dest;
@@ -104,45 +106,57 @@ static void discovery_task(void *pvParameters)
         broadcast_dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
         broadcast_dest.sin_port = htons(DISCOVERY_DEFAULT_PORT);
 
+        int64_t last_broadcast_us = 0; // 设为 0 确保启动后立即执行第一次广播公告
+
         // 3. 运行工作循环
         while (s_running) {
+            int64_t now_us = esp_timer_get_time();
+
+            // 检查 IP 是否仍然有效
+            if (get_local_ip_str(ip_str, sizeof(ip_str)) != ESP_OK) {
+                ESP_LOGW(TAG, "Local IP lost, closing socket to reconnect");
+                break;
+            }
+
+            int tx_len = snprintf(tx_buffer, sizeof(tx_buffer), "FLOWER:%s:%s:%u",
+                                  s_hostname, ip_str, s_http_port);
+
+            // 检查定时广播周期（启动即刻发送，随后每 5 秒广播一次）
+            if (now_us - last_broadcast_us >= DISCOVERY_INTERVAL_US) {
+                sendto(sock, tx_buffer, tx_len, 0,
+                       (struct sockaddr *)&broadcast_dest, sizeof(broadcast_dest));
+                last_broadcast_us = now_us;
+            }
+
+            // 接收探测指令或局域网数据
             struct sockaddr_in source_addr;
             socklen_t socklen = sizeof(source_addr);
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
                                (struct sockaddr *)&source_addr, &socklen);
 
-            // 获取最新 IP
-            if (get_local_ip_str(ip_str, sizeof(ip_str)) == ESP_OK) {
-                int tx_len = snprintf(tx_buffer, sizeof(tx_buffer), "FLOWER:%s:%s:%u",
-                                      s_hostname, ip_str, s_http_port);
-
-                if (len < 0) {
-                    // 超时：执行主动定时广播
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        sendto(sock, tx_buffer, tx_len, 0,
-                               (struct sockaddr *)&broadcast_dest, sizeof(broadcast_dest));
-                    } else {
-                        ESP_LOGW(TAG, "recvfrom failed: errno %d", errno);
-                        break; // 退出并重新建连
-                    }
-                } else if (len > 0) {
-                    rx_buffer[len] = '\0';
-                    // 收到搜索请求
-                    if (strncmp(rx_buffer, DISCOVERY_PROBE_CMD, strlen(DISCOVERY_PROBE_CMD)) == 0) {
-                        ESP_LOGI(TAG, "Received probe from %s:%d, replying",
-                                 inet_ntoa(source_addr.sin_addr), ntohs(source_addr.sin_port));
-                        // 回复给探测发送者
-                        sendto(sock, tx_buffer, tx_len, 0,
-                               (struct sockaddr *)&source_addr, sizeof(source_addr));
-                    }
+            if (len < 0) {
+                // 超时为正常现象，继续下一个循环
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ESP_LOGW(TAG, "recvfrom failed: errno %d", errno);
+                    break; // 套接字严重异常，退出并重新建连
                 }
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(1000));
+            } else if (len > 0) {
+                rx_buffer[len] = '\0';
+                // 收到搜索请求
+                if (strncmp(rx_buffer, DISCOVERY_PROBE_CMD, strlen(DISCOVERY_PROBE_CMD)) == 0) {
+                    ESP_LOGI(TAG, "Received probe from %s:%d, replying",
+                             inet_ntoa(source_addr.sin_addr), ntohs(source_addr.sin_port));
+                    // 单播回复探测发送者
+                    sendto(sock, tx_buffer, tx_len, 0,
+                           (struct sockaddr *)&source_addr, sizeof(source_addr));
+                }
             }
         }
 
         close(sock);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_running) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
 
     s_discovery_task_handle = NULL;
@@ -151,10 +165,10 @@ static void discovery_task(void *pvParameters)
 
 esp_err_t device_discovery_start(const char *hostname, uint16_t http_port)
 {
-    if (s_running) {
+    if (s_running || s_discovery_task_handle != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!hostname || strlen(hostname) == 0) {
+    if (!hostname || strlen(hostname) == 0 || strchr(hostname, ':') != NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     strncpy(s_hostname, hostname, sizeof(s_hostname) - 1);
@@ -167,6 +181,7 @@ esp_err_t device_discovery_start(const char *hostname, uint16_t http_port)
                                  &s_discovery_task_handle);
     if (ret != pdPASS) {
         s_running = false;
+        s_discovery_task_handle = NULL;
         ESP_LOGE(TAG, "Failed to create discovery task");
         return ESP_ERR_NO_MEM;
     }
