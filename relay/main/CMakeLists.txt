@@ -22,6 +22,7 @@ idf_component_register(
         nanopb
         esp_https_ota
         app_update
+        device_discovery
 )
 
 target_link_libraries(${COMPONENT_LIB} m)

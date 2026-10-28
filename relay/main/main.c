@@ -52,6 +52,8 @@
 #include "pb_decode.h"
 #include "flower.pb.h"
 
+#include "device_discovery.h"
+
 /* ── Config ──────────────────────────────────────────────────────────────── */
 #ifndef CONFIG_WIFI_SSID
 #define CONFIG_WIFI_SSID      "your_ssid"
@@ -832,6 +834,9 @@ void app_main(void)
 
     /* HTTP */
     http_server_start();
+
+    /* UDP Device Discovery */
+    device_discovery_start(g_device_id, 80);
 
     /* Idle — all work is event/timer-driven */
     while (1) {
