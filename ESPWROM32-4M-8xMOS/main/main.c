@@ -1,0 +1,1343 @@
+/**
+ * main.c — Flower ESP32 relay controller (ESP-IDF)
+ *
+ * Features:
+ *   1. WiFi STA + NTP time sync
+ *   2. HMAC-SHA256 MQTT credentials (clientId{id}timestamp{ms})
+ *   3. MQTT 5.0 with User Property {"project","flower"} on CONNECT
+ *   4. nanopb: receives relay_control/ota commands; sends status_report + cmd_response
+ *   5. GPIO: relay (pin 4, active-low), button (pin 9), breathing LED (pin 3), DS18B20 temp (pin 1)
+ *   6. HTTP server: GET /change_relay1[?duration=ms]
+ *   7. OTA: HTTPS firmware update triggered via MQTT OtaCommand
+ *
+ * Topics:
+ *   sub  flower/{DEVICE_ID}/down/cmd
+ *   pub  flower/{DEVICE_ID}/up/status
+ *   pub  flower/{DEVICE_ID}/up/cmd_response
+ */
+
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <math.h>
+#include <time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_sntp.h"
+#include "nvs_flash.h"
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/uart.h"
+#include "driver/i2c_master.h"
+
+#include "esp_http_server.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+
+#include "mqtt_client.h"
+#include "mqtt5_client.h"
+
+#include "psa/crypto.h"
+
+#include "pb_encode.h"
+#include "pb_decode.h"
+#include "flower.pb.h"
+#include "ds18b20.h"
+#include "water_logic.h"
+#include "water_store.h"
+
+#include "device_discovery.h"
+
+/* ── Config ──────────────────────────────────────────────────────────────── */
+#ifndef CONFIG_WIFI_SSID
+#define CONFIG_WIFI_SSID      "your_ssid"
+#endif
+#ifndef CONFIG_WIFI_PASSWORD
+#define CONFIG_WIFI_PASSWORD  "your_password"
+#endif
+#ifndef CONFIG_MQTT_BROKER_URI
+#define CONFIG_MQTT_BROKER_URI "mqtts://your-emqx-host:8883"
+#endif
+
+/* Device identity — loaded at runtime from fctry NVS partition */
+static char g_device_id[64];
+static char g_device_secret[128];
+
+/* MQTT topics — built at runtime after device identity is loaded */
+static char s_topic_cmd[96];
+static char s_topic_cmd_resp[96];
+static char s_topic_status[96];
+
+/* ── Hardware (ESP32-WROOM-32E + 8x MOS) ─────────────────────────────────── */
+#define MOS1_PIN              19
+#define MOS2_PIN              18
+#define MOS3_PIN              17
+#define MOS4_PIN              16
+#define MOS5_PIN              33
+#define MOS6_PIN              25
+#define MOS7_PIN              26
+#define MOS8_PIN              27
+
+/* Relay control replaced by MOS1 */
+#define RELAY_PIN             MOS1_PIN
+
+#define BUTTON_PIN            0   /* Board Key (Boot button) */
+#define LED_PIN               23  /* Board User LED */
+#define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_6   /* GPIO34 (ADC1_CH6) */
+#define DS18B20_PIN           GPIO_NUM_4      /* GPIO4 */
+
+/* ── Lux sensor select: define USE_BH1750 for BH1750FVI I2C,
+ *                       undefine for Modbus-RTU sensor ─────────────── */
+#define USE_BH1750
+
+#ifndef USE_BH1750
+#define MODBUS_UART_PORT  UART_NUM_1
+#define MODBUS_UART_TXD   GPIO_NUM_6
+#define MODBUS_UART_RXD   GPIO_NUM_7
+#define MODBUS_BAUD       9600
+#endif /* !USE_BH1750 */
+
+#define STATUS_INTERVAL_MS        30000
+#define SENSOR_MUTEX_TIMEOUT_MS   3000
+#define RELAY_DEFAULT_DURATION_MS 10000
+#define BREATH_PERIOD_MS          3000
+#define APP_TIMER_INTERVAL_MS     50   /* LED + button + relay auto-off tick */
+
+#define TAG "Flower"
+
+/* ── Device identity ─────────────────────────────────────────────────────── */
+static void device_identity_init(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition("fctry", "identity", NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "fctry partition open failed (%s), identity unavailable",
+                 esp_err_to_name(err));
+        goto build_topics;
+    }
+    size_t len = sizeof(g_device_id);
+    nvs_get_str(h, "device_id",     g_device_id,     &len);
+    len = sizeof(g_device_secret);
+    nvs_get_str(h, "device_secret", g_device_secret, &len);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Device identity loaded from fctry: id=%s", g_device_id);
+
+build_topics:
+    snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
+    snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
+    snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
+}
+
+/* ── State ───────────────────────────────────────────────────────────────── */
+static EventGroupHandle_t       s_wifi_event_group;
+#define WIFI_CONNECTED_BIT      BIT0
+
+static SemaphoreHandle_t g_sensor_mutex = NULL;
+
+static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
+static volatile bool            s_mqtt_connected = false;
+
+static volatile bool            s_relay_on       = false;
+static volatile int64_t         s_relay_on_us    = 0;   /* esp_timer_get_time() at relay-on */
+static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
+
+static volatile int64_t         s_last_on_utc_s  = 0;   /* UTC seconds when relay last turned on */
+static volatile uint32_t        s_last_on_dur_ms = 0;   /* duration_ms of that activation */
+
+static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
+
+/* Static to avoid large stack allocation */
+static flower_command_t          s_cmd;
+static flower_command_response_t s_resp;
+
+/* ── ADC ─────────────────────────────────────────────────────────────────── */
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+
+static void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten    = ADC_ATTEN_DB_12,   /* 0 ~ 3.3 V */
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_LOW_HUMIDITY, &chan_cfg));
+}
+
+static int adc_read_raw(adc_channel_t channel)
+{
+    int raw = 0;
+    adc_oneshot_read(s_adc_handle, channel, &raw);
+    return raw;
+}
+
+/* ── Illuminance sensor ──────────────────────────────────────────────────── */
+#ifndef USE_BH1750
+/* -- Modbus-RTU path -- */
+static uint16_t modbus_crc16(const uint8_t *data, int len)
+{
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xA001;
+            else
+                crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+static void modbus_init(void)
+{
+    uart_config_t uart_cfg = {
+        .baud_rate = MODBUS_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(MODBUS_UART_PORT, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(MODBUS_UART_PORT, MODBUS_UART_TXD, MODBUS_UART_RXD,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(MODBUS_UART_PORT, 256, 0, 0, NULL, 0));
+}
+
+static void modbus_reset(void)
+{
+    uint8_t cmd[] = {0xFF, 0x06, 0x00, 0xF0, 0x00, 0x00};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[8];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 8) {
+        ESP_LOGW(TAG, "Modbus reset: expected 8 bytes, got %d", len);
+        return;
+    }
+    ESP_LOGI(TAG, "modbus_reset:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,",
+            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]);
+    return;
+}
+
+static void modbus_read_calc_enable(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x47, 0x00, 0x01};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[7];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 7) {
+        ESP_LOGW(TAG, "modbus_read_calc: expected 7 bytes, got %d", len);
+        return;
+    }
+    ESP_LOGI(TAG, "modbus_read_calc:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
+            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]);
+    return;
+}
+
+static void modbus_read_calc(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x48, 0x00, 0x01};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[7];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 7) {
+        ESP_LOGW(TAG, "modbus_read_calc: expected 7 bytes, got %d", len);
+        return;
+    }
+    ESP_LOGI(TAG, "modbus_read_calc:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
+            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]);
+    return;
+}
+
+static float modbus_read_illuminance(void)
+{
+    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x02, 0x00, 0x02};
+    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
+    uint8_t tx_buf[8];
+    memcpy(tx_buf, cmd, 6);
+    tx_buf[6] = crc & 0xFF;
+    tx_buf[7] = (crc >> 8) & 0xFF;
+
+    uart_flush_input(MODBUS_UART_PORT);
+    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
+
+    uint8_t rx_buf[9];
+    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
+                              100 / portTICK_PERIOD_MS);
+    if (len != 9) {
+        ESP_LOGW(TAG, "Modbus illuminance: expected 9 bytes, got %d", len);
+        return -1.0f;
+    }
+
+    uint32_t raw = ((uint32_t)rx_buf[3] << 24) | ((uint32_t)rx_buf[4] << 16)
+                 | ((uint32_t)rx_buf[5] << 8) | rx_buf[6];
+    return (float)raw / 1000.0f;
+}
+#else /* USE_BH1750 */
+/* -- BH1750FVI I2C path (SCL=IO22, SDA=IO21) -- */
+#define BH1750_SCL_IO   GPIO_NUM_22
+#define BH1750_SDA_IO   GPIO_NUM_21
+#define BH1750_ADDR     0x23
+#define BH1750_CONT_H   0x10   /* Continuous H-Resolution Mode (~120 ms/sample) */
+
+static i2c_master_bus_handle_t s_i2c_bus    = NULL;
+static i2c_master_dev_handle_t s_bh1750_dev = NULL;
+
+static void bh1750_init(void)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port             = I2C_NUM_0,
+        .sda_io_num           = BH1750_SDA_IO,
+        .scl_io_num           = BH1750_SCL_IO,
+        .clk_source           = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt    = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c_bus));
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = BH1750_ADDR,
+        .scl_speed_hz    = 400000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_bh1750_dev));
+
+    uint8_t cmd = BH1750_CONT_H;
+    ESP_ERROR_CHECK(i2c_master_transmit(s_bh1750_dev, &cmd, 1, 100));
+    vTaskDelay(pdMS_TO_TICKS(200)); /* wait for first measurement */
+}
+
+static float bh1750_read_illuminance(void)
+{
+    uint8_t buf[2];
+    esp_err_t err = i2c_master_receive(s_bh1750_dev, buf, 2, 200);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BH1750 read error: %s", esp_err_to_name(err));
+        return -1.0f;
+    }
+    uint16_t raw = ((uint16_t)buf[0] << 8) | buf[1];
+    return (float)raw / 1.2f;
+}
+#endif /* USE_BH1750 */
+
+/* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
+static void calc_signature(int64_t ts_ms, const char *device_id,
+                            const char *secret, char out[65])
+{
+    char plaintext[128];
+    snprintf(plaintext, sizeof(plaintext),
+             "clientId%stimestamp%lld", device_id, (long long)ts_ms);
+
+    /* HMAC-SHA256 via PSA Crypto API (ESP-IDF v6 / mbedTLS 4.x) */
+    uint8_t hmac[32];
+    size_t hmac_len;
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
+    psa_key_id_t key_id = PSA_KEY_ID_NULL;
+    psa_import_key(&attr, (const uint8_t *)secret, strlen(secret), &key_id);
+    psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                    (const uint8_t *)plaintext, strlen(plaintext),
+                    hmac, sizeof(hmac), &hmac_len);
+    psa_destroy_key(key_id);
+
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", hmac[i]);
+    out[64] = '\0';
+}
+
+/* ── nanopb publish helpers ──────────────────────────────────────────────── */
+static void publish_resp(const flower_command_response_t *resp)
+{
+    uint8_t buf[128];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, &flower_command_response_t_msg, resp)) {
+        ESP_LOGE(TAG, "resp encode: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_cmd_resp,
+                            (const char *)buf, (int)stream.bytes_written, 1, 0);
+}
+
+static void send_relay_resp(bool success)
+{
+    memset(&s_resp, 0, sizeof(s_resp));
+    s_resp.which_payload = FLOWER_COMMAND_RESPONSE_RELAY_CONTROL_TAG;
+    s_resp.payload.relay_control.result =
+        success ? FLOWER_CMD_RESULT_OK : FLOWER_CMD_RESULT_BUSY;
+    publish_resp(&s_resp);
+}
+
+/* ── OTA ─────────────────────────────────────────────────────────────────── */
+#define OTA_URL_MAX    256
+#define OTA_TASK_STACK 8192
+
+static QueueHandle_t  s_ota_url_queue   = NULL;
+static volatile bool  s_ota_in_progress = false;
+
+static void publish_ota_status(flower_ota_status_t status, int32_t progress,
+                                const char *msg)
+{
+    flower_command_response_t resp = FLOWER_COMMAND_RESPONSE_INIT_ZERO;
+    resp.which_payload             = FLOWER_COMMAND_RESPONSE_OTA_TAG;
+    resp.payload.ota.status        = status;
+    resp.payload.ota.progress      = progress;
+    if (msg)
+        strncpy(resp.payload.ota.message, msg, sizeof(resp.payload.ota.message) - 1);
+    publish_resp(&resp);
+}
+
+static void ota_task(void *arg)
+{
+    char url[OTA_URL_MAX];
+    for (;;) {
+        xQueueReceive(s_ota_url_queue, url, portMAX_DELAY);
+        s_ota_in_progress = true;
+
+        ESP_LOGI(TAG, "OTA starting: %s", url);
+        publish_ota_status(FLOWER_OTA_STATUS_OTA_STARTED, 0, NULL);
+
+        esp_http_client_config_t http_cfg = {
+            .url                        = url,
+            .timeout_ms                 = 30000,
+            .keep_alive_enable          = true,
+            .skip_cert_common_name_check = true,
+        };
+        esp_https_ota_config_t ota_cfg = { .http_config = &http_cfg };
+
+        esp_https_ota_handle_t handle = NULL;
+        esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA begin: %s", esp_err_to_name(err));
+            publish_ota_status(FLOWER_OTA_STATUS_OTA_FAILED, 0, esp_err_to_name(err));
+            s_ota_in_progress = false;
+            continue;
+        }
+
+        int img_size   = esp_https_ota_get_image_size(handle);
+        int last_pct10 = -1;
+
+        while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            if (img_size > 0) {
+                int read = esp_https_ota_get_image_len_read(handle);
+                int pct  = (int)((int64_t)read * 100 / img_size);
+                int bucket = pct / 10;
+                if (bucket != last_pct10) {
+                    last_pct10 = bucket;
+                    publish_ota_status(FLOWER_OTA_STATUS_OTA_PROGRESS, pct, NULL);
+                }
+            }
+        }
+
+        if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
+            ESP_LOGE(TAG, "OTA download: %s", esp_err_to_name(err));
+            esp_https_ota_abort(handle);
+            publish_ota_status(FLOWER_OTA_STATUS_OTA_FAILED, 0, esp_err_to_name(err));
+            s_ota_in_progress = false;
+            continue;
+        }
+
+        err = esp_https_ota_finish(handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA finish: %s", esp_err_to_name(err));
+            publish_ota_status(FLOWER_OTA_STATUS_OTA_FAILED, 0, esp_err_to_name(err));
+            s_ota_in_progress = false;
+            continue;
+        }
+
+        publish_ota_status(FLOWER_OTA_STATUS_OTA_SUCCESS, 100, NULL);
+        ESP_LOGI(TAG, "OTA done, restarting in 2 s");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    }
+}
+
+/* ── MQTT message handler ────────────────────────────────────────────────── */
+static void handle_mqtt_data(const char *data, int data_len)
+{
+    memset(&s_cmd, 0, sizeof(s_cmd));
+    pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)data, data_len);
+    if (!pb_decode(&stream, &flower_command_t_msg, &s_cmd)) {
+        ESP_LOGE(TAG, "Command decode: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+
+    switch (s_cmd.which_payload) {
+    case FLOWER_COMMAND_RELAY_CONTROL_TAG: {
+        flower_relay_control_t *rc = &s_cmd.payload.relay_control;
+        if (rc->on) {
+            if (s_relay_on) {
+                ESP_LOGW(TAG, "Relay already ON, ignoring command");
+                send_relay_resp(false);
+                break;
+            }
+            gpio_set_level(RELAY_PIN, 1);
+            s_relay_on_us = esp_timer_get_time();
+            time_t _now; time(&_now);
+            s_last_on_utc_s  = (int64_t)_now;
+            s_last_on_dur_ms = rc->duration_ms;
+            if (rc->duration_ms > 0) {
+                s_relay_duration = rc->duration_ms;
+                s_relay_on = true;
+            } else {
+                s_relay_on = false; /* duration_ms=0: no auto-off */
+            }
+        } else {
+            gpio_set_level(RELAY_PIN, 0);
+            s_relay_on = false;
+        }
+        send_relay_resp(true);
+        ESP_LOGI(TAG, "Relay %s via MQTT (duration=%u ms)",
+                 rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
+        break;
+    }
+    case FLOWER_COMMAND_OTA_TAG: {
+        if (s_ota_in_progress) {
+            ESP_LOGW(TAG, "OTA already in progress, ignoring");
+            break;
+        }
+        if (s_cmd.payload.ota.url[0] == '\0') {
+            ESP_LOGE(TAG, "OTA: empty URL");
+            break;
+        }
+        if (xQueueSend(s_ota_url_queue, s_cmd.payload.ota.url, 0) != pdTRUE)
+            ESP_LOGE(TAG, "OTA queue full");
+        break;
+    }
+    default:
+        ESP_LOGW(TAG, "Unknown cmd tag=%d", (int)s_cmd.which_payload);
+        break;
+    }
+
+}
+
+static flower_metric_t s_metrics[5];
+
+static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
+{
+    flower_metric_t *metrics = (flower_metric_t *)(*arg);
+    for (int i = 0; i < 5; i++) {
+        if (!pb_encode_tag_for_field(stream, field))
+            return false;
+        if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
+            return false;
+    }
+    return true;
+}
+
+float get_humidity(void) {
+    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+    float humidity_cap = raw_low * 100.0f / 4096;
+    const float humidity_max = 98;
+    const float humidity_min = 30;
+    float humidity = 100 * (humidity_max - humidity_cap)/(humidity_max-humidity_min);
+    ESP_LOGI(TAG, "ADC humidity(GPIO34)=%d,%.1f%%,%.1f%%", raw_low, humidity_cap, humidity);
+
+    return humidity;
+}
+
+static void publish_status_report(void)
+{
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Status report: sensor busy, skipping this tick");
+        return;
+    }
+    float humidity = get_humidity();
+
+    float temp = ds18b20_read_temperature();
+    if (temp > -273.0f)
+        ESP_LOGI(TAG, "Temperature(GPIO1)=%.2f°C", temp);
+
+#ifdef USE_BH1750
+    float lux = bh1750_read_illuminance();
+#else
+    float lux = modbus_read_illuminance();
+#endif
+    if (lux >= 0)
+        ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
+    xSemaphoreGive(g_sensor_mutex);
+
+    if (!s_mqtt_connected) return;
+
+    strcpy(s_metrics[0].key, "humidity");
+    s_metrics[0].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[0].value.double_value = humidity;
+
+    strcpy(s_metrics[1].key, "temperature");
+    s_metrics[1].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[1].value.double_value = (double)(temp > -273.0f ? temp : 0);
+
+    strcpy(s_metrics[2].key, "lux");
+    s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
+
+    strcpy(s_metrics[3].key, "relayLastOnTs");
+    s_metrics[3].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+    s_metrics[3].value.int64_value = s_last_on_utc_s;
+
+    strcpy(s_metrics[4].key, "relayLastOnDur");
+    s_metrics[4].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+    s_metrics[4].value.int64_value = (int64_t)s_last_on_dur_ms;
+
+    time_t now; time(&now);
+
+    flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
+    sr.timestamp       = (int64_t)now * 1000;
+    sr.has_version     = true;
+    sr.version.major   = 1;
+    sr.version.minor   = 1;
+    sr.version.patch   = 1;
+    strcpy(sr.device_type, "C3V2_humi_temp_lux_relay");
+    sr.metrics.arg = s_metrics;
+    sr.metrics.funcs.encode = encode_metrics;
+
+    uint8_t buf[256];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, &flower_status_report_t_msg, &sr)) {
+        ESP_LOGE(TAG, "Status encode: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+    esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
+                            (const char *)buf, (int)stream.bytes_written, 1, 0);
+
+    ESP_LOGI(TAG, "Status published (humidity=%.1f%%, temp=%.2f°C, lux=%.1f)",
+             humidity, (double)(temp > -273.0f ? temp : 0), (double)(lux >= 0 ? lux : 0));
+}
+
+/* ── Auto watering ───────────────────────────────────────────────────────── */
+/* The strategy, thresholds and durations live in water_logic.c; this function
+ * only reads the sensor, asks for a decision and drives the relay. */
+static void check_auto_water(void)
+{
+    time_t now;
+    time(&now);
+
+    water_strategy_tick(now);
+
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Auto watering: sensor busy, skipping this tick");
+        return;
+    }
+    float humidity = get_humidity();
+    xSemaphoreGive(g_sensor_mutex);
+
+    if (!water_humidity_valid(humidity)) {
+        ESP_LOGW(TAG, "Auto watering: humidity %.1f%% out of range, skipping",
+                 humidity);
+        return;
+    }
+
+    water_decision_t d = water_strategy_eval(now, humidity);
+    if (!d.water)
+        return;
+
+    if (s_relay_on) {
+        ESP_LOGW(TAG, "Auto watering [%s]: relay already on, skipping %u ms",
+                 water_strategy_name(water_config()->strategy),
+                 (unsigned)d.duration_ms);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Auto watering [%s]: humidity=%.1f%%, opening relay for %u ms",
+             water_strategy_name(water_config()->strategy),
+             humidity, (unsigned)d.duration_ms);
+    gpio_set_level(RELAY_PIN, 1);
+    s_relay_on_us    = esp_timer_get_time();
+    s_relay_on       = true;
+    s_relay_duration = d.duration_ms;
+    s_last_on_utc_s  = (int64_t)now;
+    s_last_on_dur_ms = d.duration_ms;
+}
+
+/* ── MQTT ────────────────────────────────────────────────────────────────── */
+static esp_timer_handle_t s_reconnect_timer = NULL;
+static esp_timer_handle_t s_status_timer    = NULL;
+
+static void mqtt_start(void);
+
+/* Runs in ESP timer task — safe to call esp_mqtt_client_destroy here */
+static void reconnect_timer_cb(void *arg)
+{
+    if (s_mqtt_client) {
+        esp_mqtt_client_destroy(s_mqtt_client);
+        s_mqtt_client = NULL;
+    }
+    mqtt_start();
+}
+
+static void status_timer_cb(void *arg)
+{
+    check_auto_water();
+    publish_status_report();
+}
+
+static void mqtt_event_handler(void *arg, esp_event_base_t base,
+                                int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    switch (event->event_id) {
+    case MQTT_EVENT_CONNECTED:
+        s_mqtt_connected = true;
+        esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd, 1);
+        ESP_LOGI(TAG, "MQTT connected, sub: %s", s_topic_cmd);
+        publish_status_report();
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        s_mqtt_connected = false;
+        ESP_LOGW(TAG, "MQTT disconnected, reconnect in 5 s");
+        /* Don't destroy here — we're inside the MQTT task.
+           Timer task will do it safely. */
+        esp_timer_start_once(s_reconnect_timer, 5000000ULL);
+        break;
+    case MQTT_EVENT_DATA:
+        handle_mqtt_data(event->data, event->data_len);
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT error type=%d", event->error_handle->error_type);
+        break;
+    default:
+        break;
+    }
+}
+
+static char s_mqtt_username[80];
+static char s_mqtt_password[65];
+
+static void mqtt_start(void)
+{
+    time_t now; time(&now);
+    int64_t ts_ms = (int64_t)now * 1000;
+    snprintf(s_mqtt_username, sizeof(s_mqtt_username),
+             "%s|%lld", g_device_id, (long long)ts_ms);
+    calc_signature(ts_ms, g_device_id, g_device_secret, s_mqtt_password);
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri                            = CONFIG_MQTT_BROKER_URI;
+    mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
+    mqtt_cfg.credentials.client_id                         = g_device_id;
+    mqtt_cfg.credentials.username                          = s_mqtt_username;
+    mqtt_cfg.credentials.authentication.password           = s_mqtt_password;
+    mqtt_cfg.session.keepalive                             = 60;
+    mqtt_cfg.session.protocol_ver                          = MQTT_PROTOCOL_V_5;
+    mqtt_cfg.network.disable_auto_reconnect                = true;
+
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+
+    /* MQTT 5.0 User Property: self-identify as "flower" project */
+    esp_mqtt5_user_property_item_t prop_items[] = {{"project", "flower"}};
+    mqtt5_user_property_handle_t prop_handle = NULL;
+    esp_mqtt5_client_set_user_property(&prop_handle, prop_items, 1);
+    esp_mqtt5_connection_property_config_t connect_prop = {};
+    connect_prop.user_property = prop_handle;
+    esp_mqtt5_client_set_connect_property(s_mqtt_client, &connect_prop);
+    esp_mqtt5_client_delete_user_property(prop_handle);
+
+    esp_mqtt_client_register_event(s_mqtt_client, MQTT_EVENT_ANY,
+                                   mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
+}
+
+/* ── HTTP server ─────────────────────────────────────────────────────────── */
+static const char STATUS_HTML[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"zh\">\n"
+    "<head>\n"
+    "<meta charset=\"UTF-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    "<title>传感器状态</title>\n"
+    "<script src=\"https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js\"></script>\n"
+    "<style>\n"
+    "body{font-family:sans-serif;margin:0;padding:16px;background:#111;color:#eee}\n"
+    "h2{margin:0 0 8px;font-size:18px}\n"
+    ".relay{margin-bottom:12px;font-size:13px;color:#aaa;padding:8px;background:#1e1e1e;border-radius:6px}\n"
+    ".vals{display:flex;gap:10px;margin-bottom:16px}\n"
+    ".val{flex:1;padding:10px;background:#1e1e1e;border-radius:6px;text-align:center}\n"
+    ".val .num{font-size:22px;font-weight:bold;color:#eee}\n"
+    ".val .lbl{font-size:11px;color:#666;margin-top:2px}\n"
+    ".chart-wrap{margin-bottom:20px}\n"
+    "canvas{background:#1a1a1a;border-radius:8px;width:100%!important}\n"
+    "#status{font-size:11px;color:#555;margin-top:4px}\n"
+    ".btn-relay{margin-bottom:12px;padding:10px 20px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}\n"
+    ".btn-relay:active{background:#1b5e20}\n"
+    ".relay-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}\n"
+    ".relay-row input{width:80px;padding:8px;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:6px;font-size:14px;text-align:center}\n"
+    ".relay-row label{font-size:13px;color:#aaa}\n"
+    ".strat{margin-bottom:16px;padding:10px;background:#1e1e1e;border-radius:6px}\n"
+    ".strat h3{margin:0 0 8px;font-size:14px;color:#ccc}\n"
+    ".strat .cur{font-size:13px;color:#81c784;margin-bottom:8px}\n"
+    ".strat .opts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}\n"
+    ".strat .opts label{padding:6px 10px;background:#2a2a2a;border:1px solid #444;border-radius:6px;cursor:pointer;color:#bbb;font-size:13px}\n"
+    ".strat .opts label.sel{background:#2e7d32;border-color:#2e7d32;color:#fff}\n"
+    ".strat .opts input{display:none}\n"
+    ".strat .row{display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;font-size:13px;color:#aaa}\n"
+    ".strat .row .nm{width:84px}\n"
+    ".strat .row input{width:72px;padding:6px;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:6px;text-align:center;font-size:13px}\n"
+    ".strat button{padding:8px 16px;background:#2e7d32;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px}\n"
+    ".strat .msg{font-size:12px;color:#888}\n"
+    ".strat .hint{font-size:11px;color:#666;margin-top:8px;line-height:1.6}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h2>传感器实时数据</h2>\n"
+    "<div class=\"relay\" id=\"relay-info\">继电器：加载中...</div>\n"
+    "<div class=\"relay-row\">\n"
+    "  <button class=\"btn-relay\" onclick=\"openRelay()\">开继电器</button>\n"
+    "  <input type=\"number\" id=\"relay-dur\" value=\"10\" min=\"1\" max=\"3600\">\n"
+    "  <label>秒</label>\n"
+    "</div>\n"
+    "<div class=\"strat\">\n"
+    "<h3>自动浇水策略</h3>\n"
+    "<div class=\"cur\" id=\"strat-cur\">当前：加载中...</div>\n"
+    "<div class=\"opts\" id=\"strat-opts\">\n"
+    "  <label data-s=\"0\"><input type=\"radio\" name=\"strat\" value=\"0\">中午12点</label>\n"
+    "  <label data-s=\"1\"><input type=\"radio\" name=\"strat\" value=\"1\">浇表面</label>\n"
+    "  <label data-s=\"2\"><input type=\"radio\" name=\"strat\" value=\"2\">干了再浇透</label>\n"
+    "</div>\n"
+    "<div class=\"row\"><span class=\"nm\">浇表面</span>湿度 &lt; <input type=\"number\" id=\"s-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"s-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
+    "<div class=\"row\"><span class=\"nm\">干了再浇透</span>湿度 &lt; <input type=\"number\" id=\"d-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"d-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
+    "<div class=\"row\"><button onclick=\"saveWater()\">保存</button><span class=\"msg\" id=\"strat-msg\"></span></div>\n"
+    "<div class=\"hint\">「中午12点」：每天 12:00 检查一次，阶梯式浇水 &gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min（参数固定）<br>「浇表面」「干了再浇透」：<span id=\"hint-window\">08:00-16:00</span> 之间每 30 秒检查，触发后 <span id=\"hint-cooldown\">30</span> 分钟内不再自动浇水</div>\n"
+    "</div>\n"
+    "<div class=\"vals\">\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
+    "</div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-temp\" height=\"100\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-lux\"  height=\"100\"></canvas></div>\n"
+    "<div id=\"status\">正在连接...</div>\n"
+    "<script>\n"
+    "const p=new URLSearchParams(location.search);\n"
+    "const IV=parseInt(p.get('interval')||'2000',10);\n"
+    "const MX=parseInt(p.get('points')||'120',10);\n"
+    "const t0=Date.now();\n"
+    "function fmt(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;\n"
+    "  return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`}\n"
+    "function mk(id,lbl,unit,clr){\n"
+    "  return new Chart(document.getElementById(id),{\n"
+    "    type:'line',\n"
+    "    data:{labels:[],datasets:[{label:`${lbl} (${unit})`,data:[],\n"
+    "      borderColor:clr,backgroundColor:clr+'22',borderWidth:1.5,\n"
+    "      pointRadius:0,tension:0.3,fill:true}]},\n"
+    "    options:{animation:false,responsive:true,\n"
+    "      scales:{\n"
+    "        x:{ticks:{color:'#888',maxTicksLimit:8},grid:{color:'#333'}},\n"
+    "        y:{ticks:{color:'#888'},grid:{color:'#333'}}},\n"
+    "      plugins:{legend:{labels:{color:'#ccc'}}}}})}\n"
+    "const C={h:mk('c-humi','湿度','%','#4fc3f7'),\n"
+    "         t:mk('c-temp','温度','°C','#ef9a9a'),\n"
+    "         l:mk('c-lux','照度','lx','#fff176')};\n"
+    "function push(c,x,y){c.data.labels.push(x);c.data.datasets[0].data.push(y);\n"
+    "  if(c.data.labels.length>MX){c.data.labels.shift();c.data.datasets[0].data.shift()}\n"
+    "  c.update('none')}\n"
+    "async function poll(){\n"
+    "  const t=fmt(Date.now()-t0);\n"
+    "  try{\n"
+    "    const r=await fetch('/api/sensors');\n"
+    "    if(!r.ok)throw new Error('HTTP '+r.status);\n"
+    "    const d=await r.json();\n"
+    "    const hv=d.humidity.toFixed(1),tv=d.temperature.toFixed(1),lv=d.lux.toFixed(0);\n"
+    "    document.getElementById('v-humi').textContent=hv;\n"
+    "    document.getElementById('v-temp').textContent=tv;\n"
+    "    document.getElementById('v-lux').textContent=lv;\n"
+    "    push(C.h,t,parseFloat(hv));\n"
+    "    push(C.t,t,parseFloat(tv));\n"
+    "    push(C.l,t,parseFloat(lv));\n"
+    "    const el=document.getElementById('relay-info');\n"
+    "    if(d.relay_last_on_ts>0){\n"
+    "      const dt=new Date(d.relay_last_on_ts*1000).toLocaleString();\n"
+    "      const dur=(d.relay_last_on_dur_ms/1000).toFixed(1);\n"
+    "      el.textContent=`继电器最后触发：${dt}（持续 ${dur} 秒）`;\n"
+    "    }else{el.textContent='继电器：从未触发'}\n"
+    "    if(!WC||(Number.isInteger(d.strategy)&&d.strategy!==WC.strategy))loadWater();\n"
+    "    document.getElementById('status').textContent=\n"
+    "      `最后更新：${new Date().toLocaleTimeString()}  轮询间隔：${IV}ms  保留点数：${MX}`;\n"
+    "  }catch(e){\n"
+    "    document.getElementById('status').textContent=`错误：${e.message}，重试中...`;\n"
+    "  }\n"
+    "}\n"
+    "async function openRelay(){\n"
+    "  const sec=parseInt(document.getElementById('relay-dur').value||'10',10);\n"
+    "  const ms=Math.max(1,sec)*1000;\n"
+    "  try{\n"
+    "    await fetch('/change_relay1?duration='+ms);\n"
+    "  }catch(e){\n"
+    "    document.getElementById('status').textContent=`开继电器失败：${e.message}`;\n"
+    "  }\n"
+    "}\n"
+    "let WC=null;\n"
+    "function stratDesc(c){\n"
+    "  if(c.strategy===1)return `湿度 < ${c.surface_thresh_pct}% → 浇 ${c.surface_dur_s} 秒`;\n"
+    "  if(c.strategy===2)return `湿度 < ${c.deep_thresh_pct}% → 浇 ${c.deep_dur_s} 秒`;\n"
+    "  return '每天 12:00 阶梯浇水';\n"
+    "}\n"
+    "function markStrat(id){\n"
+    "  document.querySelectorAll('#strat-opts label').forEach(l=>{\n"
+    "    const s=parseInt(l.dataset.s,10);\n"
+    "    l.classList.toggle('sel',s===id);\n"
+    "    l.querySelector('input').checked=(s===id);\n"
+    "  });\n"
+    "}\n"
+    "function fillWater(c){\n"
+    "  WC=c;\n"
+    "  markStrat(c.strategy);\n"
+    "  document.getElementById('s-thresh').value=c.surface_thresh_pct;\n"
+    "  document.getElementById('s-dur').value=c.surface_dur_s;\n"
+    "  document.getElementById('d-thresh').value=c.deep_thresh_pct;\n"
+    "  document.getElementById('d-dur').value=c.deep_dur_s;\n"
+    "  document.getElementById('hint-window').textContent=c.check_window;\n"
+    "  document.getElementById('hint-cooldown').textContent=Math.round(c.cooldown_s/60);\n"
+    "  document.getElementById('strat-cur').textContent=`当前：${c.strategy_name}（${stratDesc(c)}）`;\n"
+    "}\n"
+    "async function loadWater(){\n"
+    "  try{\n"
+    "    const r=await fetch('/api/water/config');\n"
+    "    if(!r.ok){document.getElementById('strat-msg').textContent='读取配置失败：'+await r.text();return}\n"
+    "    fillWater(await r.json());\n"
+    "  }catch(e){document.getElementById('strat-msg').textContent='读取配置失败：'+e.message}\n"
+    "}\n"
+    "async function saveWater(){\n"
+    "  const sel=document.querySelector('#strat-opts input:checked');\n"
+    "  const q=new URLSearchParams({\n"
+    "    strategy:sel?sel.value:'0',\n"
+    "    surface_thresh_pct:document.getElementById('s-thresh').value,\n"
+    "    surface_dur_s:document.getElementById('s-dur').value,\n"
+    "    deep_thresh_pct:document.getElementById('d-thresh').value,\n"
+    "    deep_dur_s:document.getElementById('d-dur').value});\n"
+    "  const msg=document.getElementById('strat-msg');\n"
+    "  msg.textContent='保存中...';\n"
+    "  try{\n"
+    "    const r=await fetch('/api/water/config?'+q);\n"
+    "    if(!r.ok){msg.textContent='保存失败：'+await r.text();return}\n"
+    "    fillWater(await r.json());\n"
+    "    msg.textContent='已保存';\n"
+    "  }catch(e){msg.textContent='保存失败：'+e.message}\n"
+    "}\n"
+    "function markDirty(){document.getElementById('strat-msg').textContent='';}\n"
+    "document.querySelectorAll('#strat-opts input').forEach(i=>\n"
+    "  i.addEventListener('change',()=>{markStrat(parseInt(i.value,10));markDirty();}));\n"
+    "['s-thresh','s-dur','d-thresh','d-dur'].forEach(id=>\n"
+    "  document.getElementById(id).addEventListener('input',markDirty));\n"
+    "loadWater();\n"
+    "poll();\n"
+    "setInterval(poll,IV);\n"
+    "</script>\n"
+    "</body>\n"
+    "</html>\n";
+
+static esp_err_t handle_api_sensors(httpd_req_t *req)
+{
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"sensor busy\"}");
+        return ESP_OK;
+    }
+
+    float humidity = get_humidity();
+
+    float temp = ds18b20_read_temperature();
+
+#ifdef USE_BH1750
+    float lux = bh1750_read_illuminance();
+#else
+    float lux = modbus_read_illuminance();
+#endif
+
+    xSemaphoreGive(g_sensor_mutex);
+
+    char json[192];
+    snprintf(json, sizeof(json),
+        "{\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,"
+        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%u,\"strategy\":%u}",
+        humidity,
+        (double)(temp > -273.0f ? temp : -273.0f),
+        (double)(lux >= 0.0f ? lux : -1.0f),
+        (long long)s_last_on_utc_s,
+        (unsigned)s_last_on_dur_ms,
+        (unsigned)water_config()->strategy);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
+static esp_err_t handle_root(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, STATUS_HTML, sizeof(STATUS_HTML) - 1);
+    return ESP_OK;
+}
+
+static esp_err_t handle_change_relay1(httpd_req_t *req)
+{
+    char query[64] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16] = {};
+        if (httpd_query_key_value(query, "duration", val, sizeof(val)) == ESP_OK) {
+            uint32_t d = (uint32_t)atoi(val);
+            if (d > 0) s_relay_duration = d;
+        }
+    }
+    gpio_set_level(RELAY_PIN, 1);
+    s_relay_on_us = esp_timer_get_time();
+    s_relay_on    = true;
+    time_t _now; time(&_now);
+    s_last_on_utc_s  = (int64_t)_now;
+    s_last_on_dur_ms = s_relay_duration;
+    httpd_resp_send(req, "0", 1);
+    return ESP_OK;
+}
+
+/* GET /api/water/config            → current configuration as JSON
+ * GET /api/water/config?strategy=1 → apply the given fields, persist, return
+ *                                    the saved configuration as JSON */
+static esp_err_t handle_api_water_config(httpd_req_t *req)
+{
+    char query[192] = {};
+    esp_err_t qerr = httpd_req_get_url_query_str(req, query, sizeof(query));
+
+    if (qerr == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "query too long");
+        return ESP_OK;
+    }
+
+    if (qerr == ESP_OK && query[0] != '\0') {
+        char err[64] = {};
+        if (!water_config_apply_query(query, err, sizeof(err))) {
+            ESP_LOGW(TAG, "Water config rejected: %s", err);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "text/plain; charset=utf-8");
+            httpd_resp_sendstr(req, err);
+            return ESP_OK;
+        }
+        if (!water_store_save()) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "text/plain; charset=utf-8");
+            httpd_resp_sendstr(req, "save failed");
+            return ESP_OK;
+        }
+        ESP_LOGI(TAG, "Water config updated: %s", query);
+    }
+
+    char json[256];
+    water_config_to_json(json, sizeof(json));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
+static void http_server_start(void)
+{
+    httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server  = NULL;
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP server start failed");
+        return;
+    }
+    static const httpd_uri_t uri_root = {
+        .uri     = "/",
+        .method  = HTTP_GET,
+        .handler = handle_root,
+    };
+    static const httpd_uri_t uri_relay = {
+        .uri     = "/change_relay1",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay1,
+    };
+    static const httpd_uri_t uri_api_sensors = {
+        .uri     = "/api/sensors",
+        .method  = HTTP_GET,
+        .handler = handle_api_sensors,
+    };
+    static const httpd_uri_t uri_api_water = {
+        .uri     = "/api/water/config",
+        .method  = HTTP_GET,
+        .handler = handle_api_water_config,
+    };
+    httpd_register_uri_handler(server, &uri_root);
+    httpd_register_uri_handler(server, &uri_relay);
+    httpd_register_uri_handler(server, &uri_api_sensors);
+    httpd_register_uri_handler(server, &uri_api_water);
+    ESP_LOGI(TAG, "HTTP server started on port 80");
+}
+
+/* ── App timer: LED breath, button poll, relay auto-off ──────────────────── */
+static esp_timer_handle_t s_app_timer = NULL;
+static int64_t            s_app_tick  = 0;
+
+#define BREATH_STEPS (BREATH_PERIOD_MS / APP_TIMER_INTERVAL_MS)  /* 60 steps */
+
+static void app_timer_cb(void *arg)
+{
+    s_app_tick++;
+
+    /* Breathing LED */
+    float phase = (float)(s_app_tick % BREATH_STEPS) / (float)BREATH_STEPS
+                  * 2.0f * (float)M_PI;
+    uint32_t duty = (uint32_t)(((sinf(phase - (float)M_PI / 2.0f) + 1.0f) / 2.0f) * 255.0f);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+
+    /* Button: active-low, toggle relay on falling edge */
+    bool btn = (bool)gpio_get_level(BUTTON_PIN);
+    if (!btn && s_last_btn)
+        gpio_set_level(RELAY_PIN, !gpio_get_level(RELAY_PIN));
+    s_last_btn = btn;
+
+    /* Relay auto-off */
+    if (s_relay_on) {
+        int64_t elapsed_ms = (esp_timer_get_time() - s_relay_on_us) / 1000LL;
+        if (elapsed_ms >= (int64_t)s_relay_duration) {
+            gpio_set_level(RELAY_PIN, 0);
+            s_relay_on = false;
+        }
+    }
+}
+
+/* ── WiFi ────────────────────────────────────────────────────────────────── */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                                int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected, retrying...");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(netif, g_device_id);
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t h1, h2;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &h1));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &h2));
+
+    wifi_config_t wifi_cfg = {};
+    strncpy((char *)wifi_cfg.sta.ssid,     CONFIG_WIFI_SSID,    sizeof(wifi_cfg.sta.ssid));
+    strncpy((char *)wifi_cfg.sta.password, CONFIG_WIFI_PASSWORD, sizeof(wifi_cfg.sta.password));
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Waiting for WiFi...");
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+}
+
+/* ── Entry point ─────────────────────────────────────────────────────────── */
+void app_main(void)
+{
+    /* NVS */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    /* Watering strategy + thresholds, restored from NVS (defaults if absent) */
+    water_store_load();
+
+    /* PSA Crypto — must be called before any psa_* API */
+    ESP_ERROR_CHECK(psa_crypto_init());
+
+    /* Factory partition — device identity (id + secret) */
+    nvs_flash_init_partition("fctry");
+    device_identity_init();
+
+    /* ADC: humidity (IO0) */
+    adc_init();
+
+    /* DS18B20: temperature sensor (IO1) */
+    ds18b20_init(DS18B20_PIN);
+
+#ifdef USE_BH1750
+    /* BH1750FVI: illuminance sensor (IO6=SCL, IO7=SDA) */
+    bh1750_init();
+#else
+    /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
+    modbus_init();
+    modbus_read_calc_enable();
+    modbus_read_calc(); /* modbus_reset(); */
+#endif
+
+    /* Sensor mutex — serializes HTTP handler vs status_timer reads */
+    g_sensor_mutex = xSemaphoreCreateMutex();
+    assert(g_sensor_mutex != NULL);
+
+    /* GPIO: 8x MOS outputs (default off, pull-down enabled) */
+    static const gpio_num_t s_mos_pins[8] = {
+        MOS1_PIN, MOS2_PIN, MOS3_PIN, MOS4_PIN,
+        MOS5_PIN, MOS6_PIN, MOS7_PIN, MOS8_PIN
+    };
+    uint64_t mos_mask = 0;
+    for (int i = 0; i < 8; i++) {
+        mos_mask |= (1ULL << s_mos_pins[i]);
+        gpio_set_level(s_mos_pins[i], 0);  /* preset low before config so pins stay low atomically */
+    }
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = mos_mask;
+    io_conf.mode         = GPIO_MODE_INPUT_OUTPUT;
+    io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    /* GPIO: button (input pull-up) */
+    io_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
+    io_conf.mode         = GPIO_MODE_INPUT;
+    io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    /* LEDC: breathing LED */
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_TIMER_8_BIT,
+        .freq_hz          = 1000,
+        .clk_cfg          = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_ch = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .timer_sel  = LEDC_TIMER_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = LED_PIN,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_ch));
+
+    /* App timer: 50 ms — LED breath, button, relay auto-off */
+    esp_timer_create_args_t app_args = {
+        .callback              = app_timer_cb,
+        .dispatch_method       = ESP_TIMER_TASK,
+        .name                  = "app",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&app_args, &s_app_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_app_timer,
+                        (uint64_t)APP_TIMER_INTERVAL_MS * 1000ULL));
+
+    /* Status timer: 30 s — ADC read + status report */
+    esp_timer_create_args_t st_args = {
+        .callback              = status_timer_cb,
+        .dispatch_method       = ESP_TIMER_TASK,
+        .name                  = "status",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&st_args, &s_status_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_status_timer,
+                        (uint64_t)STATUS_INTERVAL_MS * 1000ULL));
+
+    /* Reconnect timer: one-shot, started on MQTT_EVENT_DISCONNECTED */
+    esp_timer_create_args_t rc_args = {
+        .callback        = reconnect_timer_cb,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "reconnect",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&rc_args, &s_reconnect_timer));
+
+    /* OTA task */
+    s_ota_url_queue = xQueueCreate(1, OTA_URL_MAX);
+    xTaskCreate(ota_task, "ota", OTA_TASK_STACK, NULL, 5, NULL);
+
+    /* WiFi */
+    wifi_init_sta();
+
+    /* NTP (UTC+8) — needed for HMAC timestamp */
+    /* Set timezone first so localtime_r is correct as soon as NTP syncs */
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.nist.gov");
+    esp_sntp_init();
+
+    ESP_LOGI(TAG, "Waiting for NTP sync...");
+    time_t now = 0;
+    for (int i = 0; i < 40 && now < 1700000000LL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        time(&now);
+    }
+    ESP_LOGI(TAG, "NTP %s (ts=%lld)", now > 1700000000LL ? "OK" : "FAILED",
+             (long long)now);
+
+    /* MQTT */
+    mqtt_start();
+
+    /* HTTP */
+    http_server_start();
+
+    /* UDP Device Discovery */
+    device_discovery_start(g_device_id, 80);
+
+    /* Idle — all work is event/timer-driven */
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        ESP_LOGI(TAG, "Uptime: %lld s", esp_timer_get_time() / 1000000LL);
+    }
+}

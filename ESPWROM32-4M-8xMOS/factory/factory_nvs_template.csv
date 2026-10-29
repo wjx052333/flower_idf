@@ -1,0 +1,4 @@
+key,type,encoding,value
+identity,namespace,,
+device_id,data,string,DEVICE_ID_PLACEHOLDER
+device_secret,data,string,DEVICE_SECRET_PLACEHOLDER
