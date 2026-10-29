@@ -80,6 +80,7 @@ static char s_topic_cmd_resp[96];
 static char s_topic_status[96];
 
 /* ── Hardware (ESP32-WROOM-32E + 8x MOS) ─────────────────────────────────── */
+#define NUM_RELAYS            8
 #define MOS1_PIN              19
 #define MOS2_PIN              18
 #define MOS3_PIN              17
@@ -89,11 +90,12 @@ static char s_topic_status[96];
 #define MOS7_PIN              26
 #define MOS8_PIN              27
 
-/* Relay control replaced by MOS1 */
+/* Relay 1 is MOS1 (also default for auto watering / board button) */
 #define RELAY_PIN             MOS1_PIN
 
 #define BUTTON_PIN            0   /* Board Key (Boot button) */
 #define LED_PIN               23  /* Board User LED */
+#define REED_PIN              GPIO_NUM_14 /* Reed switch input (internal pull-up) */
 #define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_6   /* GPIO34 (ADC1_CH6) */
 #define DS18B20_PIN           GPIO_NUM_4      /* GPIO4 */
 
@@ -148,12 +150,65 @@ static SemaphoreHandle_t g_sensor_mutex = NULL;
 static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
 static volatile bool            s_mqtt_connected = false;
 
-static volatile bool            s_relay_on       = false;
-static volatile int64_t         s_relay_on_us    = 0;   /* esp_timer_get_time() at relay-on */
-static volatile uint32_t        s_relay_duration = RELAY_DEFAULT_DURATION_MS;
+typedef struct {
+    gpio_num_t       relay_gpio;
+    bool             on;
+    int64_t          on_us;
+    uint32_t         duration_ms;
+    int64_t          last_on_utc_s;
+    uint32_t         last_on_dur_ms;
+} relay_channel_t;
 
-static volatile int64_t         s_last_on_utc_s  = 0;   /* UTC seconds when relay last turned on */
-static volatile uint32_t        s_last_on_dur_ms = 0;   /* duration_ms of that activation */
+static SemaphoreHandle_t s_relay_mutex = NULL;
+
+static relay_channel_t s_relays[NUM_RELAYS] = {
+    { .relay_gpio = MOS1_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS2_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS3_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS4_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS5_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS6_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS7_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+    { .relay_gpio = MOS8_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
+};
+
+static void relay_set_unlocked(int ch, bool on, uint32_t duration_ms)
+{
+    if (ch < 0 || ch >= NUM_RELAYS) return;
+    if (on) {
+        s_relays[ch].on_us = esp_timer_get_time();
+        s_relays[ch].duration_ms = duration_ms;
+        time_t _now; time(&_now);
+        s_relays[ch].last_on_utc_s = (int64_t)_now;
+        s_relays[ch].last_on_dur_ms = duration_ms;
+    }
+    s_relays[ch].on = on;
+    gpio_set_level(s_relays[ch].relay_gpio, on ? 1 : 0);
+}
+
+void relay_set(int ch, bool on, uint32_t duration_ms)
+{
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    relay_set_unlocked(ch, on, duration_ms);
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+}
+
+static void relay_toggle_unlocked(int ch)
+{
+    if (ch < 0 || ch >= NUM_RELAYS) return;
+    if (s_relays[ch].on) {
+        relay_set_unlocked(ch, false, 0);
+    } else {
+        relay_set_unlocked(ch, true, s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS);
+    }
+}
+
+void relay_toggle(int ch)
+{
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    relay_toggle_unlocked(ch);
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+}
 
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
 
@@ -508,28 +563,12 @@ static void handle_mqtt_data(const char *data, int data_len)
     case FLOWER_COMMAND_RELAY_CONTROL_TAG: {
         flower_relay_control_t *rc = &s_cmd.payload.relay_control;
         if (rc->on) {
-            if (s_relay_on) {
-                ESP_LOGW(TAG, "Relay already ON, ignoring command");
-                send_relay_resp(false);
-                break;
-            }
-            gpio_set_level(RELAY_PIN, 1);
-            s_relay_on_us = esp_timer_get_time();
-            time_t _now; time(&_now);
-            s_last_on_utc_s  = (int64_t)_now;
-            s_last_on_dur_ms = rc->duration_ms;
-            if (rc->duration_ms > 0) {
-                s_relay_duration = rc->duration_ms;
-                s_relay_on = true;
-            } else {
-                s_relay_on = false; /* duration_ms=0: no auto-off */
-            }
+            relay_set(0, true, rc->duration_ms > 0 ? rc->duration_ms : RELAY_DEFAULT_DURATION_MS);
         } else {
-            gpio_set_level(RELAY_PIN, 0);
-            s_relay_on = false;
+            relay_set(0, false, 0);
         }
         send_relay_resp(true);
-        ESP_LOGI(TAG, "Relay %s via MQTT (duration=%u ms)",
+        ESP_LOGI(TAG, "Relay 1 %s via MQTT (duration=%u ms)",
                  rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
         break;
     }
@@ -615,11 +654,11 @@ static void publish_status_report(void)
 
     strcpy(s_metrics[3].key, "relayLastOnTs");
     s_metrics[3].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
-    s_metrics[3].value.int64_value = s_last_on_utc_s;
+    s_metrics[3].value.int64_value = s_relays[0].last_on_utc_s;
 
     strcpy(s_metrics[4].key, "relayLastOnDur");
     s_metrics[4].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
-    s_metrics[4].value.int64_value = (int64_t)s_last_on_dur_ms;
+    s_metrics[4].value.int64_value = (int64_t)s_relays[0].last_on_dur_ms;
 
     time_t now; time(&now);
 
@@ -673,22 +712,17 @@ static void check_auto_water(void)
     if (!d.water)
         return;
 
-    if (s_relay_on) {
-        ESP_LOGW(TAG, "Auto watering [%s]: relay already on, skipping %u ms",
+    if (s_relays[0].on) {
+        ESP_LOGW(TAG, "Auto watering [%s]: relay 1 already on, skipping %u ms",
                  water_strategy_name(water_config()->strategy),
                  (unsigned)d.duration_ms);
         return;
     }
 
-    ESP_LOGI(TAG, "Auto watering [%s]: humidity=%.1f%%, opening relay for %u ms",
+    ESP_LOGI(TAG, "Auto watering [%s]: humidity=%.1f%%, opening relay 1 for %u ms",
              water_strategy_name(water_config()->strategy),
              humidity, (unsigned)d.duration_ms);
-    gpio_set_level(RELAY_PIN, 1);
-    s_relay_on_us    = esp_timer_get_time();
-    s_relay_on       = true;
-    s_relay_duration = d.duration_ms;
-    s_last_on_utc_s  = (int64_t)now;
-    s_last_on_dur_ms = d.duration_ms;
+    relay_set(0, true, d.duration_ms);
 }
 
 /* ── MQTT ────────────────────────────────────────────────────────────────── */
@@ -786,25 +820,32 @@ static const char STATUS_HTML[] =
     "<head>\n"
     "<meta charset=\"UTF-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-    "<title>传感器状态</title>\n"
+    "<title>8路MOS控制与传感器状态</title>\n"
     "<script src=\"https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js\"></script>\n"
     "<style>\n"
     "body{font-family:sans-serif;margin:0;padding:16px;background:#111;color:#eee}\n"
-    "h2{margin:0 0 8px;font-size:18px}\n"
-    ".relay{margin-bottom:12px;font-size:13px;color:#aaa;padding:8px;background:#1e1e1e;border-radius:6px}\n"
-    ".vals{display:flex;gap:10px;margin-bottom:16px}\n"
+    "h2{margin:0 0 10px;font-size:18px}\n"
+    ".vals{display:flex;gap:10px;margin-bottom:14px}\n"
     ".val{flex:1;padding:10px;background:#1e1e1e;border-radius:6px;text-align:center}\n"
     ".val .num{font-size:22px;font-weight:bold;color:#eee}\n"
     ".val .lbl{font-size:11px;color:#666;margin-top:2px}\n"
-    ".chart-wrap{margin-bottom:20px}\n"
+    ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px;margin-bottom:14px}\n"
+    ".card{padding:8px 10px;background:#1e1e1e;border-radius:6px}\n"
+    ".ch-hd{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:bold;margin-bottom:4px}\n"
+    ".badge{padding:2px 6px;border-radius:4px;font-size:11px}\n"
+    ".badge.on{background:#2e7d32;color:#fff}\n"
+    ".badge.off{background:#424242;color:#bbb}\n"
+    ".inf{font-size:11px;color:#888;margin-bottom:6px}\n"
+    ".crow{display:flex;align-items:center;gap:4px}\n"
+    ".crow input{width:48px;padding:4px;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;text-align:center;font-size:12px}\n"
+    ".crow span{font-size:11px;color:#888}\n"
+    ".btn{padding:4px 10px;border:none;border-radius:4px;font-size:12px;cursor:pointer;font-weight:bold}\n"
+    ".btn.on{background:#2e7d32;color:#fff;margin-left:auto}\n"
+    ".btn.off{background:#c62828;color:#fff}\n"
+    ".chart-wrap{margin-bottom:16px}\n"
     "canvas{background:#1a1a1a;border-radius:8px;width:100%!important}\n"
     "#status{font-size:11px;color:#555;margin-top:4px}\n"
-    ".btn-relay{margin-bottom:12px;padding:10px 20px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}\n"
-    ".btn-relay:active{background:#1b5e20}\n"
-    ".relay-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}\n"
-    ".relay-row input{width:80px;padding:8px;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:6px;font-size:14px;text-align:center}\n"
-    ".relay-row label{font-size:13px;color:#aaa}\n"
-    ".strat{margin-bottom:16px;padding:10px;background:#1e1e1e;border-radius:6px}\n"
+    ".strat{margin-bottom:14px;padding:10px;background:#1e1e1e;border-radius:6px}\n"
     ".strat h3{margin:0 0 8px;font-size:14px;color:#ccc}\n"
     ".strat .cur{font-size:13px;color:#81c784;margin-bottom:8px}\n"
     ".strat .opts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}\n"
@@ -820,13 +861,18 @@ static const char STATUS_HTML[] =
     "</style>\n"
     "</head>\n"
     "<body>\n"
-    "<h2>传感器实时数据</h2>\n"
-    "<div class=\"relay\" id=\"relay-info\">继电器：加载中...</div>\n"
-    "<div class=\"relay-row\">\n"
-    "  <button class=\"btn-relay\" onclick=\"openRelay()\">开继电器</button>\n"
-    "  <input type=\"number\" id=\"relay-dur\" value=\"10\" min=\"1\" max=\"3600\">\n"
-    "  <label>秒</label>\n"
+    "<h2>8路MOS输出控制面板</h2>\n"
+    "<div class=\"grid\">\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 1 [GPIO 19]</span><span class=\"badge off\" id=\"b-1\">关</span></div><div class=\"inf\" id=\"i-1\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-1\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(1,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(1,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 2 [GPIO 18]</span><span class=\"badge off\" id=\"b-2\">关</span></div><div class=\"inf\" id=\"i-2\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-2\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(2,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(2,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 3 [GPIO 17]</span><span class=\"badge off\" id=\"b-3\">关</span></div><div class=\"inf\" id=\"i-3\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-3\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(3,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(3,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 4 [GPIO 16]</span><span class=\"badge off\" id=\"b-4\">关</span></div><div class=\"inf\" id=\"i-4\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-4\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(4,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(4,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 5 [GPIO 33]</span><span class=\"badge off\" id=\"b-5\">关</span></div><div class=\"inf\" id=\"i-5\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-5\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(5,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(5,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 6 [GPIO 25]</span><span class=\"badge off\" id=\"b-6\">关</span></div><div class=\"inf\" id=\"i-6\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-6\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(6,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(6,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 7 [GPIO 26]</span><span class=\"badge off\" id=\"b-7\">关</span></div><div class=\"inf\" id=\"i-7\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-7\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(7,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(7,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 8 [GPIO 27]</span><span class=\"badge off\" id=\"b-8\">关</span></div><div class=\"inf\" id=\"i-8\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-8\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(8,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(8,'off')\">关</button></div></div>\n"
     "</div>\n"
+    "<h2>传感器实时数据</h2>\n"
     "<div class=\"strat\">\n"
     "<h3>自动浇水策略</h3>\n"
     "<div class=\"cur\" id=\"strat-cur\">当前：加载中...</div>\n"
@@ -844,6 +890,7 @@ static const char STATUS_HTML[] =
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14]</div></div>\n"
     "</div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-temp\" height=\"100\"></canvas></div>\n"
@@ -854,6 +901,7 @@ static const char STATUS_HTML[] =
     "const IV=parseInt(p.get('interval')||'2000',10);\n"
     "const MX=parseInt(p.get('points')||'120',10);\n"
     "const t0=Date.now();\n"
+    "const urls=['/change_relay1','/change_relay2','/change_relay3','/change_relay4','/change_relay5','/change_relay6','/change_relay7','/change_relay8'];\n"
     "function fmt(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;\n"
     "  return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`}\n"
     "function mk(id,lbl,unit,clr){\n"
@@ -873,6 +921,19 @@ static const char STATUS_HTML[] =
     "function push(c,x,y){c.data.labels.push(x);c.data.datasets[0].data.push(y);\n"
     "  if(c.data.labels.length>MX){c.data.labels.shift();c.data.datasets[0].data.shift()}\n"
     "  c.update('none')}\n"
+    "async function ctrl(ch,act){\n"
+    "  const inp=document.getElementById('d-'+ch);\n"
+    "  const sec=Math.max(1,Math.min(3600,parseInt(inp?inp.value:'10',10)||10));\n"
+    "  const url=urls[ch-1]+(act==='off'?'?action=off':('?duration='+(sec*1000)));\n"
+    "  try{\n"
+    "    const r=await fetch(url);\n"
+    "    if(!r.ok)throw new Error('HTTP '+r.status);\n"
+    "    poll();\n"
+    "  }catch(e){\n"
+    "    document.getElementById('status').textContent='控制失败: '+e.message;\n"
+    "  }\n"
+    "}\n"
+    "function openRelay(){ctrl(1,'on');}\n"
     "async function poll(){\n"
     "  const t=fmt(Date.now()-t0);\n"
     "  try{\n"
@@ -883,31 +944,30 @@ static const char STATUS_HTML[] =
     "    document.getElementById('v-humi').textContent=hv;\n"
     "    document.getElementById('v-temp').textContent=tv;\n"
     "    document.getElementById('v-lux').textContent=lv;\n"
+    "    const rEl=document.getElementById('v-reed');\n"
+    "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
     "    push(C.h,t,parseFloat(hv));\n"
     "    push(C.t,t,parseFloat(tv));\n"
     "    push(C.l,t,parseFloat(lv));\n"
-    "    const el=document.getElementById('relay-info');\n"
-    "    if(d.relay_last_on_ts>0){\n"
-    "      const dt=new Date(d.relay_last_on_ts*1000).toLocaleString();\n"
-    "      const dur=(d.relay_last_on_dur_ms/1000).toFixed(1);\n"
-    "      el.textContent=`继电器最后触发：${dt}（持续 ${dur} 秒）`;\n"
-    "    }else{el.textContent='继电器：从未触发'}\n"
-    "    if(!WC||(Number.isInteger(d.strategy)&&d.strategy!==WC.strategy))loadWater();\n"
-    "    document.getElementById('status').textContent=\n"
-    "      `最后更新：${new Date().toLocaleTimeString()}  轮询间隔：${IV}ms  保留点数：${MX}`;\n"
-    "  }catch(e){\n"
-    "    document.getElementById('status').textContent=`错误：${e.message}，重试中...`;\n"
-    "  }\n"
-    "}\n"
-    "async function openRelay(){\n"
-    "  const sec=parseInt(document.getElementById('relay-dur').value||'10',10);\n"
-    "  const ms=Math.max(1,sec)*1000;\n"
-    "  try{\n"
-    "    await fetch('/change_relay1?duration='+ms);\n"
-    "  }catch(e){\n"
-    "    document.getElementById('status').textContent=`开继电器失败：${e.message}`;\n"
-    "  }\n"
-    "}\n"
+    "    if(d.relays&&Array.isArray(d.relays)){\n"
+    "      for(let i=0;i<d.relays.length;i++){\n"
+    "        const item=d.relays[i];\n"
+    "        const ch=item.ch||(i+1);\n"
+    "        const bd=document.getElementById('b-'+ch);\n"
+    "        const inf=document.getElementById('i-'+ch);\n"
+    "        if(bd){\n"
+    "          bd.textContent=item.state?'开':'关';\n"
+    "          bd.className='badge '+(item.state?'on':'off');\n"
+    "        }\n"
+    "        if(inf){\n"
+    "          if(item.last_on_ts>0){\n"
+    "            const dt=new Date(item.last_on_ts*1000).toLocaleTimeString();\n"
+    "            const dur=(item.last_on_dur_ms/1000).toFixed(0);\n"
+    "            inf.textContent=`最近: ${dt} (${dur}s)`;\n"
+    "          }else{inf.textContent='从未触发'}\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
     "let WC=null;\n"
     "function stratDesc(c){\n"
     "  if(c.strategy===1)return `湿度 < ${c.surface_thresh_pct}% → 浇 ${c.surface_dur_s} 秒`;\n"
@@ -989,16 +1049,40 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     xSemaphoreGive(g_sensor_mutex);
 
-    char json[192];
+    int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
+
+    char json[768];
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
-        "{\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,"
-        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%u,\"strategy\":%u}",
+        "{"
+        "\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
+        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
+        "\"relays\":["
+        "{\"ch\":1,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":2,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":3,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":4,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":5,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":6,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":7,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
+        "{\"ch\":8,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu}"
+        "]}",
         humidity,
         (double)(temp > -273.0f ? temp : -273.0f),
         (double)(lux >= 0.0f ? lux : -1.0f),
-        (long long)s_last_on_utc_s,
-        (unsigned)s_last_on_dur_ms,
-        (unsigned)water_config()->strategy);
+        reed_closed,
+        (long long)s_relays[0].last_on_utc_s,
+        (unsigned long)s_relays[0].last_on_dur_ms,
+        (unsigned)water_config()->strategy,
+        s_relays[0].relay_gpio, s_relays[0].on ? 1 : 0, (long long)s_relays[0].last_on_utc_s, (unsigned long)s_relays[0].last_on_dur_ms,
+        s_relays[1].relay_gpio, s_relays[1].on ? 1 : 0, (long long)s_relays[1].last_on_utc_s, (unsigned long)s_relays[1].last_on_dur_ms,
+        s_relays[2].relay_gpio, s_relays[2].on ? 1 : 0, (long long)s_relays[2].last_on_utc_s, (unsigned long)s_relays[2].last_on_dur_ms,
+        s_relays[3].relay_gpio, s_relays[3].on ? 1 : 0, (long long)s_relays[3].last_on_utc_s, (unsigned long)s_relays[3].last_on_dur_ms,
+        s_relays[4].relay_gpio, s_relays[4].on ? 1 : 0, (long long)s_relays[4].last_on_utc_s, (unsigned long)s_relays[4].last_on_dur_ms,
+        s_relays[5].relay_gpio, s_relays[5].on ? 1 : 0, (long long)s_relays[5].last_on_utc_s, (unsigned long)s_relays[5].last_on_dur_ms,
+        s_relays[6].relay_gpio, s_relays[6].on ? 1 : 0, (long long)s_relays[6].last_on_utc_s, (unsigned long)s_relays[6].last_on_dur_ms,
+        s_relays[7].relay_gpio, s_relays[7].on ? 1 : 0, (long long)s_relays[7].last_on_utc_s, (unsigned long)s_relays[7].last_on_dur_ms);
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
@@ -1012,25 +1096,53 @@ static esp_err_t handle_root(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t handle_change_relay1(httpd_req_t *req)
+static esp_err_t handle_change_relay_ch(httpd_req_t *req, int ch)
 {
+    if (ch < 0 || ch >= NUM_RELAYS) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
     char query[64] = {};
+    uint32_t dur = RELAY_DEFAULT_DURATION_MS;
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    if (s_relays[ch].duration_ms > 0) {
+        dur = s_relays[ch].duration_ms;
+    }
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+    bool is_off = false;
+
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         char val[16] = {};
-        if (httpd_query_key_value(query, "duration", val, sizeof(val)) == ESP_OK) {
+        if (httpd_query_key_value(query, "action", val, sizeof(val)) == ESP_OK) {
+            if (strcmp(val, "off") == 0) {
+                is_off = true;
+            }
+        }
+        if (!is_off && httpd_query_key_value(query, "duration", val, sizeof(val)) == ESP_OK) {
             uint32_t d = (uint32_t)atoi(val);
-            if (d > 0) s_relay_duration = d;
+            if (d > 0) dur = d;
         }
     }
-    gpio_set_level(RELAY_PIN, 1);
-    s_relay_on_us = esp_timer_get_time();
-    s_relay_on    = true;
-    time_t _now; time(&_now);
-    s_last_on_utc_s  = (int64_t)_now;
-    s_last_on_dur_ms = s_relay_duration;
+
+    if (is_off) {
+        relay_set(ch, false, 0);
+    } else {
+        relay_set(ch, true, dur);
+    }
+
     httpd_resp_send(req, "0", 1);
     return ESP_OK;
 }
+
+static esp_err_t handle_change_relay1(httpd_req_t *req) { return handle_change_relay_ch(req, 0); }
+static esp_err_t handle_change_relay2(httpd_req_t *req) { return handle_change_relay_ch(req, 1); }
+static esp_err_t handle_change_relay3(httpd_req_t *req) { return handle_change_relay_ch(req, 2); }
+static esp_err_t handle_change_relay4(httpd_req_t *req) { return handle_change_relay_ch(req, 3); }
+static esp_err_t handle_change_relay5(httpd_req_t *req) { return handle_change_relay_ch(req, 4); }
+static esp_err_t handle_change_relay6(httpd_req_t *req) { return handle_change_relay_ch(req, 5); }
+static esp_err_t handle_change_relay7(httpd_req_t *req) { return handle_change_relay_ch(req, 6); }
+static esp_err_t handle_change_relay8(httpd_req_t *req) { return handle_change_relay_ch(req, 7); }
 
 /* GET /api/water/config            → current configuration as JSON
  * GET /api/water/config?strategy=1 → apply the given fields, persist, return
@@ -1075,6 +1187,7 @@ static esp_err_t handle_api_water_config(httpd_req_t *req)
 static void http_server_start(void)
 {
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
     httpd_handle_t server  = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server start failed");
@@ -1085,10 +1198,45 @@ static void http_server_start(void)
         .method  = HTTP_GET,
         .handler = handle_root,
     };
-    static const httpd_uri_t uri_relay = {
+    static const httpd_uri_t uri_relay1 = {
         .uri     = "/change_relay1",
         .method  = HTTP_GET,
         .handler = handle_change_relay1,
+    };
+    static const httpd_uri_t uri_relay2 = {
+        .uri     = "/change_relay2",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay2,
+    };
+    static const httpd_uri_t uri_relay3 = {
+        .uri     = "/change_relay3",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay3,
+    };
+    static const httpd_uri_t uri_relay4 = {
+        .uri     = "/change_relay4",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay4,
+    };
+    static const httpd_uri_t uri_relay5 = {
+        .uri     = "/change_relay5",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay5,
+    };
+    static const httpd_uri_t uri_relay6 = {
+        .uri     = "/change_relay6",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay6,
+    };
+    static const httpd_uri_t uri_relay7 = {
+        .uri     = "/change_relay7",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay7,
+    };
+    static const httpd_uri_t uri_relay8 = {
+        .uri     = "/change_relay8",
+        .method  = HTTP_GET,
+        .handler = handle_change_relay8,
     };
     static const httpd_uri_t uri_api_sensors = {
         .uri     = "/api/sensors",
@@ -1101,10 +1249,17 @@ static void http_server_start(void)
         .handler = handle_api_water_config,
     };
     httpd_register_uri_handler(server, &uri_root);
-    httpd_register_uri_handler(server, &uri_relay);
+    httpd_register_uri_handler(server, &uri_relay1);
+    httpd_register_uri_handler(server, &uri_relay2);
+    httpd_register_uri_handler(server, &uri_relay3);
+    httpd_register_uri_handler(server, &uri_relay4);
+    httpd_register_uri_handler(server, &uri_relay5);
+    httpd_register_uri_handler(server, &uri_relay6);
+    httpd_register_uri_handler(server, &uri_relay7);
+    httpd_register_uri_handler(server, &uri_relay8);
     httpd_register_uri_handler(server, &uri_api_sensors);
     httpd_register_uri_handler(server, &uri_api_water);
-    ESP_LOGI(TAG, "HTTP server started on port 80");
+    ESP_LOGI(TAG, "HTTP server started on port 80 (8 relay endpoints registered)");
 }
 
 /* ── App timer: LED breath, button poll, relay auto-off ──────────────────── */
@@ -1124,20 +1279,24 @@ static void app_timer_cb(void *arg)
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 
-    /* Button: active-low, toggle relay on falling edge */
+    /* Button: active-low, toggle relay 1 on falling edge */
     bool btn = (bool)gpio_get_level(BUTTON_PIN);
     if (!btn && s_last_btn)
-        gpio_set_level(RELAY_PIN, !gpio_get_level(RELAY_PIN));
+        relay_toggle(0);
     s_last_btn = btn;
 
-    /* Relay auto-off */
-    if (s_relay_on) {
-        int64_t elapsed_ms = (esp_timer_get_time() - s_relay_on_us) / 1000LL;
-        if (elapsed_ms >= (int64_t)s_relay_duration) {
-            gpio_set_level(RELAY_PIN, 0);
-            s_relay_on = false;
+    /* Relays auto-off */
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    int64_t now_us = esp_timer_get_time();
+    for (int ch = 0; ch < NUM_RELAYS; ch++) {
+        if (s_relays[ch].on && s_relays[ch].duration_ms > 0) {
+            int64_t elapsed_ms = (now_us - s_relays[ch].on_us) / 1000LL;
+            if (elapsed_ms >= (int64_t)s_relays[ch].duration_ms) {
+                relay_set_unlocked(ch, false, 0);
+            }
         }
     }
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 }
 
 /* ── WiFi ────────────────────────────────────────────────────────────────── */
@@ -1227,6 +1386,10 @@ void app_main(void)
     g_sensor_mutex = xSemaphoreCreateMutex();
     assert(g_sensor_mutex != NULL);
 
+    /* Relay mutex — serializes HTTP handlers vs timer auto-off vs auto-water */
+    s_relay_mutex = xSemaphoreCreateMutex();
+    assert(s_relay_mutex != NULL);
+
     /* GPIO: 8x MOS outputs (default off, pull-down enabled) */
     static const gpio_num_t s_mos_pins[8] = {
         MOS1_PIN, MOS2_PIN, MOS3_PIN, MOS4_PIN,
@@ -1248,6 +1411,14 @@ void app_main(void)
     io_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
     io_conf.mode         = GPIO_MODE_INPUT;
     io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    /* GPIO: reed switch (input pull-up) */
+    io_conf.pin_bit_mask = (1ULL << REED_PIN);
+    io_conf.mode         = GPIO_MODE_INPUT;
+    io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
     /* LEDC: breathing LED */
