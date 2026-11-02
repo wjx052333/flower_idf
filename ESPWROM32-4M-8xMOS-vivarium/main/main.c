@@ -56,8 +56,6 @@
 #include "ds18b20.h"
 #include "aht25.h"
 #include "vivarium_config.h"
-#include "water_logic.h"
-#include "water_store.h"
 
 #include "device_discovery.h"
 
@@ -154,7 +152,8 @@ static float g_air_temp   = 0.0f;  /* From AHT25 */
 static float g_air_rh     = 0.0f;  /* From AHT25 */
 static float g_slab_temp  = 0.0f;  /* From DS18B20 */
 static float g_lux        = -1.0f; /* From BH1750 */
-static float g_soil_hum   = 0.0f;  /* From ADC1_CH6 (spare) */
+static float g_soil_hum   = 0.0f;  /* From ADC1_CH6 (calibrated %) */
+static int   g_soil_raw   = 0;     /* Raw ADC1_CH6 counts (0~4095) */
 
 /* ── Vivarium dynamic config (NVS persisted) ────────────────────────────── */
 static vivarium_config_t s_vivarium_cfg;
@@ -634,7 +633,7 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
     return true;
 }
 
-static void sample_all_sensors_locked(void)
+static void vivarium_sample_sensors_to_cache(void)
 {
     /* 1. Soil humidity from ADC1_CH6 (GPIO 34, optional/spare) */
     int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
@@ -644,41 +643,49 @@ static void sample_all_sensors_locked(void)
     float soil_h = 100.0f * (humidity_max - humidity_cap) / (humidity_max - humidity_min);
     if (soil_h < 0.0f) soil_h = 0.0f;
     if (soil_h > 100.0f) soil_h = 100.0f;
-    g_soil_hum = soil_h;
 
     /* 2. Hotspot belly heat slab temperature from DS18B20 (GPIO 4) */
     float slab_t = ds18b20_read_temperature();
-    if (slab_t > -273.0f) {
-        g_slab_temp = slab_t;
-    }
 
     /* 3. Rainforest air temp & humidity from AHT25 (I2C 0x38) */
     float aht_temp = 0.0f, aht_rh = 0.0f;
-    if (aht25_read(&aht_temp, &aht_rh) == ESP_OK) {
-        g_air_temp = aht_temp;
-        g_air_rh   = aht_rh;
-    }
+    bool aht_ok = (aht25_read(&aht_temp, &aht_rh) == ESP_OK);
 
     /* 4. Ambient illuminance from BH1750 (I2C 0x23) */
 #ifdef USE_BH1750
     float lux = bh1750_read_illuminance();
-    if (lux >= 0.0f) {
-        g_lux = lux;
-    }
+#else
+    float lux = -1.0f;
 #endif
+
+    /* Quick cache update with minimal mutex lock time (< 1us) */
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_soil_raw = raw_low;
+        g_soil_hum = soil_h;
+        if (slab_t > -273.0f) {
+            g_slab_temp = slab_t;
+        }
+        if (aht_ok) {
+            g_air_temp = aht_temp;
+            g_air_rh   = aht_rh;
+        }
+        if (lux >= 0.0f) {
+            g_lux = lux;
+        }
+        xSemaphoreGive(g_sensor_mutex);
+    }
 }
 
 static void publish_status_report(void)
 {
     float air_rh = 0.0f, slab_t = 0.0f, lux_val = -1.0f;
-    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) == pdTRUE) {
-        sample_all_sensors_locked();
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         air_rh  = g_air_rh;
         slab_t  = g_slab_temp;
         lux_val = g_lux;
         xSemaphoreGive(g_sensor_mutex);
     } else {
-        ESP_LOGW(TAG, "Status report: sensor busy, skipping this tick");
+        ESP_LOGW(TAG, "Status report: sensor cache busy, skipping this tick");
     }
 
     if (!s_mqtt_connected) return;
@@ -823,238 +830,313 @@ static const char STATUS_HTML[] =
     "<head>\n"
     "<meta charset=\"UTF-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-    "<title>8路MOS控制与传感器状态</title>\n"
+    "<title>玩嘉天际S1 微型赛博生态箱控制面板</title>\n"
     "<script src=\"https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js\"></script>\n"
     "<style>\n"
     "body{font-family:sans-serif;margin:0;padding:16px;background:#111;color:#eee}\n"
-    "h2{margin:0 0 10px;font-size:18px}\n"
-    ".vals{display:flex;gap:10px;margin-bottom:14px}\n"
-    ".val{flex:1;padding:10px;background:#1e1e1e;border-radius:6px;text-align:center}\n"
+    "h2{margin:0 0 10px;font-size:18px;color:#81c784}\n"
+    ".header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid #333;padding-bottom:8px}\n"
+    ".header h1{margin:0;font-size:18px;color:#81c784}\n"
+    ".header .tag{font-size:12px;color:#888}\n"
+    ".zone-box{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:14px;border:1px solid #2a2a2a}\n"
+    ".zone-box.upper{border-left:4px solid #4fc3f7}\n"
+    ".zone-box.lower{border-left:4px solid #ffb74d}\n"
+    ".zone-title{font-size:14px;font-weight:bold;margin-bottom:10px;display:flex;align-items:center;gap:6px}\n"
+    ".zone-title.upper{color:#4fc3f7}\n"
+    ".zone-title.lower{color:#ffb74d}\n"
+    ".vals{display:flex;gap:10px;flex-wrap:wrap}\n"
+    ".val{flex:1;min-width:110px;padding:10px;background:#242424;border-radius:6px;text-align:center}\n"
     ".val .num{font-size:22px;font-weight:bold;color:#eee}\n"
-    ".val .lbl{font-size:11px;color:#666;margin-top:2px}\n"
+    ".val .lbl{font-size:11px;color:#aaa;margin-top:2px}\n"
+    ".val .sub{font-size:10px;color:#666;margin-top:2px}\n"
     ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px;margin-bottom:14px}\n"
-    ".card{padding:8px 10px;background:#1e1e1e;border-radius:6px}\n"
-    ".ch-hd{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:bold;margin-bottom:4px}\n"
+    ".card{padding:8px 10px;background:#1e1e1e;border-radius:6px;border:1px solid #2a2a2a}\n"
+    ".ch-hd{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:bold;margin-bottom:4px}\n"
     ".badge{padding:2px 6px;border-radius:4px;font-size:11px}\n"
     ".badge.on{background:#2e7d32;color:#fff}\n"
     ".badge.off{background:#424242;color:#bbb}\n"
     ".inf{font-size:11px;color:#888;margin-bottom:6px}\n"
     ".crow{display:flex;align-items:center;gap:4px}\n"
-    ".crow input{width:48px;padding:4px;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;text-align:center;font-size:12px}\n"
+    ".crow input{width:46px;padding:4px;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;text-align:center;font-size:12px}\n"
     ".crow span{font-size:11px;color:#888}\n"
     ".btn{padding:4px 10px;border:none;border-radius:4px;font-size:12px;cursor:pointer;font-weight:bold}\n"
     ".btn.on{background:#2e7d32;color:#fff;margin-left:auto}\n"
     ".btn.off{background:#c62828;color:#fff}\n"
-    ".chart-wrap{margin-bottom:16px}\n"
+    ".chart-wrap{margin-bottom:14px}\n"
     "canvas{background:#1a1a1a;border-radius:8px;width:100%!important}\n"
+    ".auto-card{background:#181818;border-radius:6px;padding:10px 12px;font-size:12px;color:#888;margin-bottom:14px;line-height:1.6;border:1px solid #282828}\n"
+    ".auto-card span{color:#bbb}\n"
     "#status{font-size:11px;color:#555;margin-top:4px}\n"
-    ".strat{margin-bottom:14px;padding:10px;background:#1e1e1e;border-radius:6px}\n"
-    ".strat h3{margin:0 0 8px;font-size:14px;color:#ccc}\n"
-    ".strat .cur{font-size:13px;color:#81c784;margin-bottom:8px}\n"
-    ".strat .opts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}\n"
-    ".strat .opts label{padding:6px 10px;background:#2a2a2a;border:1px solid #444;border-radius:6px;cursor:pointer;color:#bbb;font-size:13px}\n"
-    ".strat .opts label.sel{background:#2e7d32;border-color:#2e7d32;color:#fff}\n"
-    ".strat .opts input{display:none}\n"
-    ".strat .row{display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;font-size:13px;color:#aaa}\n"
-    ".strat .row .nm{width:84px}\n"
-    ".strat .row input{width:72px;padding:6px;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:6px;text-align:center;font-size:13px}\n"
-    ".strat button{padding:8px 16px;background:#2e7d32;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px}\n"
-    ".strat .msg{font-size:12px;color:#888}\n"
-    ".strat .hint{font-size:11px;color:#666;margin-top:8px;line-height:1.6}\n"
     "</style>\n"
     "</head>\n"
     "<body>\n"
-    "<h2>8路MOS输出控制面板</h2>\n"
+    "<div class=\"header\">\n"
+    "  <h1>微型赛博生态箱控制面板</h1>\n"
+    "  <div class=\"tag\">ESP32-WROOM-32E · 8-MOS · 群落交错区</div>\n"
+    "</div>\n"
+    "\n"
+    "<div class=\"zone-box upper\">\n"
+    "  <div class=\"zone-title upper\">🌸 上层雨林生境 (亚热带附生 · 斑眼螳螂与积水凤梨)</div>\n"
+    "  <div class=\"vals\">\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-air-temp\">--</div><div class=\"lbl\">雨林空气温度</div><div class=\"sub\">舒适 25.0~28.0°C</div></div>\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-air-rh\">--</div><div class=\"lbl\">雨林空气湿度</div><div class=\"sub\">舒适 70.0~85.0%</div></div>\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">环境光照强度</div><div class=\"sub\">顶置日照灯</div></div>\n"
+    "  </div>\n"
+    "</div>\n"
+    "\n"
+    "<div class=\"zone-box lower\">\n"
+    "  <div class=\"zone-title lower\">🦎 下层荒漠生境 (干旱地栖 · 豹纹守宫亚成体)</div>\n"
+    "  <div class=\"vals\">\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-slab-temp\">--</div><div class=\"lbl\">热区石板腹热</div><div class=\"sub\">目标 31.0~32.2°C</div></div>\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">前挡玻璃门禁 [IO14]</div><div class=\"sub\" id=\"v-reed-sub\">磁敏防逃逸</div></div>\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-soil-hum\">--</div><div class=\"lbl\">土壤湿度 [IO34, 调试]</div><div class=\"sub\" id=\"v-soil-sub\">AD: -- / 4095</div></div>\n"
+    "    <div class=\"val\"><div class=\"num\" id=\"v-fuse\">正常</div><div class=\"lbl\">生命维持硬熔断</div><div class=\"sub\">≥35.0°C 紧急切断</div></div>\n"
+    "  </div>\n"
+    "</div>\n"
+    "\n"
+    "<h2>8路 MOS 动力执行回路</h2>\n"
     "<div class=\"grid\">\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 1 [GPIO 19]</span><span class=\"badge off\" id=\"b-1\">关</span></div><div class=\"inf\" id=\"i-1\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-1\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(1,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(1,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 2 [GPIO 18]</span><span class=\"badge off\" id=\"b-2\">关</span></div><div class=\"inf\" id=\"i-2\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-2\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(2,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(2,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 3 [GPIO 17]</span><span class=\"badge off\" id=\"b-3\">关</span></div><div class=\"inf\" id=\"i-3\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-3\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(3,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(3,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 4 [GPIO 16]</span><span class=\"badge off\" id=\"b-4\">关</span></div><div class=\"inf\" id=\"i-4\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-4\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(4,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(4,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 5 [GPIO 33]</span><span class=\"badge off\" id=\"b-5\">关</span></div><div class=\"inf\" id=\"i-5\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-5\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(5,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(5,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 6 [GPIO 25]</span><span class=\"badge off\" id=\"b-6\">关</span></div><div class=\"inf\" id=\"i-6\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-6\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(6,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(6,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 7 [GPIO 26]</span><span class=\"badge off\" id=\"b-7\">关</span></div><div class=\"inf\" id=\"i-7\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-7\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(7,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(7,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 8 [GPIO 27]</span><span class=\"badge off\" id=\"b-8\">关</span></div><div class=\"inf\" id=\"i-8\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-8\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(8,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(8,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 1: 凤梨叶心补水泵</span><span class=\"badge off\" id=\"b-1\">关</span></div><div class=\"inf\" id=\"i-1\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-1\" value=\"10\" min=\"1\" max=\"20\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(1,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(1,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 2: 守宫饮水给水泵</span><span class=\"badge off\" id=\"b-2\">关</span></div><div class=\"inf\" id=\"i-2\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-2\" value=\"6\" min=\"1\" max=\"12\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(2,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(2,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 3: 守宫PTC 40℃加热</span><span class=\"badge off\" id=\"b-3\">关</span></div><div class=\"inf\" id=\"i-3\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-3\" value=\"0\" min=\"0\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(3,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(3,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 4: 隔层大面积加热板</span><span class=\"badge off\" id=\"b-4\">关</span></div><div class=\"inf\" id=\"i-4\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-4\" value=\"600\" min=\"1\" max=\"1800\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(4,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(4,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 5: 外挂超声波冷雾</span><span class=\"badge off\" id=\"b-5\">关</span></div><div class=\"inf\" id=\"i-5\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-5\" value=\"5\" min=\"1\" max=\"10\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(5,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(5,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 6: 雨林利民排风扇</span><span class=\"badge off\" id=\"b-6\">关</span></div><div class=\"inf\" id=\"i-6\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-6\" value=\"30\" min=\"1\" max=\"90\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(6,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(6,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 7: 箱顶全光谱日照灯</span><span class=\"badge off\" id=\"b-7\">关</span></div><div class=\"inf\" id=\"i-7\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-7\" value=\"3600\" min=\"0\" max=\"86400\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(7,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(7,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 8: 备用通用功率通道</span><span class=\"badge off\" id=\"b-8\">关</span></div><div class=\"inf\" id=\"i-8\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-8\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(8,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(8,'off')\">关</button></div></div>\n"
     "</div>\n"
-    "<h2>传感器实时数据</h2>\n"
-    "<div class=\"strat\">\n"
-    "<h3>自动浇水策略</h3>\n"
-    "<div class=\"cur\" id=\"strat-cur\">当前：加载中...</div>\n"
-    "<div class=\"opts\" id=\"strat-opts\">\n"
-    "  <label data-s=\"0\"><input type=\"radio\" name=\"strat\" value=\"0\">中午12点</label>\n"
-    "  <label data-s=\"1\"><input type=\"radio\" name=\"strat\" value=\"1\">浇表面</label>\n"
-    "  <label data-s=\"2\"><input type=\"radio\" name=\"strat\" value=\"2\">干了再浇透</label>\n"
+    "\n"
+    "<div class=\"auto-card\">\n"
+    "  <strong>🌿 本地自治生命维持策略状态</strong><br>\n"
+    "  • <span>守宫热区腹热闭环</span>：目标 31.0~32.2°C (DS18B20反馈，≥35.0°C 强制硬切断)<br>\n"
+    "  • <span>隔层环境底温补偿</span>：目标 24.0~26.5°C (AHT25空气温度反馈，驱动 MOS 4)<br>\n"
+    "  • <span>雨林高湿主动排风</span>：湿度 &gt; 88.0% 自动强排 45s (利民风扇 MOS 6)<br>\n"
+    "  • <span>定时防闷微气流置换</span>：连续 3 小时无通风则强制微风换气 30s\n"
     "</div>\n"
-    "<div class=\"row\"><span class=\"nm\">浇表面</span>湿度 &lt; <input type=\"number\" id=\"s-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"s-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
-    "<div class=\"row\"><span class=\"nm\">干了再浇透</span>湿度 &lt; <input type=\"number\" id=\"d-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"d-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
-    "<div class=\"row\"><button onclick=\"saveWater()\">保存</button><span class=\"msg\" id=\"strat-msg\"></span></div>\n"
-    "<div class=\"hint\">「中午12点」：每天 12:00 检查一次，阶梯式浇水 &gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min（参数固定）<br>「浇表面」「干了再浇透」：<span id=\"hint-window\">08:00-16:00</span> 之间每 30 秒检查，触发后 <span id=\"hint-cooldown\">30</span> 分钟内不再自动浇水</div>\n"
+    "\n"
+    "<h2>环境趋势曲线</h2>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-rainforest\" height=\"100\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-slab\" height=\"85\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-lux\" height=\"80\"></canvas></div>\n"
+    "<div class=\"chart-wrap\">\n"
+    "  <div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:6px\">\n"
+    "    <span style=\"font-size:12px;color:#81c784\">🌱 土壤湿度传感器调试分析</span>\n"
+    "    <button id=\"btn-soil-mode\" class=\"btn\" style=\"background:#263238;color:#80cbc4;font-size:11px;padding:3px 10px;border:1px solid #37474f\" onclick=\"toggleSoilMode()\">切换: 原始 AD 读数</button>\n"
+    "  </div>\n"
+    "  <canvas id=\"c-soil\" height=\"80\"></canvas>\n"
     "</div>\n"
-    "<div class=\"vals\">\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14]</div></div>\n"
-    "</div>\n"
-    "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
-    "<div class=\"chart-wrap\"><canvas id=\"c-temp\" height=\"100\"></canvas></div>\n"
-    "<div class=\"chart-wrap\"><canvas id=\"c-lux\"  height=\"100\"></canvas></div>\n"
     "<div id=\"status\">正在连接...</div>\n"
+    "\n"
     "<script>\n"
-    "const p=new URLSearchParams(location.search);\n"
-    "const IV=parseInt(p.get('interval')||'2000',10);\n"
-    "const MX=parseInt(p.get('points')||'120',10);\n"
-    "const t0=Date.now();\n"
-    "const urls=['/change_relay1','/change_relay2','/change_relay3','/change_relay4','/change_relay5','/change_relay6','/change_relay7','/change_relay8'];\n"
-    "function fmt(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;\n"
-    "  return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`}\n"
-    "function mk(id,lbl,unit,clr){\n"
-    "  return new Chart(document.getElementById(id),{\n"
-    "    type:'line',\n"
-    "    data:{labels:[],datasets:[{label:`${lbl} (${unit})`,data:[],\n"
-    "      borderColor:clr,backgroundColor:clr+'22',borderWidth:1.5,\n"
-    "      pointRadius:0,tension:0.3,fill:true}]},\n"
-    "    options:{animation:false,responsive:true,\n"
-    "      scales:{\n"
-    "        x:{ticks:{color:'#888',maxTicksLimit:8},grid:{color:'#333'}},\n"
-    "        y:{ticks:{color:'#888'},grid:{color:'#333'}}},\n"
-    "      plugins:{legend:{labels:{color:'#ccc'}}}}})}\n"
-    "const C={h:mk('c-humi','湿度','%','#4fc3f7'),\n"
-    "         t:mk('c-temp','温度','°C','#ef9a9a'),\n"
-    "         l:mk('c-lux','照度','lx','#fff176')};\n"
-    "function push(c,x,y){c.data.labels.push(x);c.data.datasets[0].data.push(y);\n"
-    "  if(c.data.labels.length>MX){c.data.labels.shift();c.data.datasets[0].data.shift()}\n"
-    "  c.update('none')}\n"
-    "async function ctrl(ch,act){\n"
-    "  const inp=document.getElementById('d-'+ch);\n"
-    "  const sec=Math.max(1,Math.min(3600,parseInt(inp?inp.value:'10',10)||10));\n"
-    "  const url=urls[ch-1]+(act==='off'?'?action=off':('?duration='+(sec*1000)));\n"
-    "  try{\n"
-    "    const r=await fetch(url);\n"
-    "    if(!r.ok)throw new Error('HTTP '+r.status);\n"
+    "const p = new URLSearchParams(location.search);\n"
+    "const IV = parseInt(p.get('interval') || '2000', 10);\n"
+    "const MX = parseInt(p.get('points') || '120', 10);\n"
+    "const t0 = Date.now();\n"
+    "const urls = ['/change_relay1','/change_relay2','/change_relay3','/change_relay4','/change_relay5','/change_relay6','/change_relay7','/change_relay8'];\n"
+    "\n"
+    "function fmt(ms) {\n"
+    "  const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;\n"
+    "  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;\n"
+    "}\n"
+    "\n"
+    "function mk(id, ds) {\n"
+    "  return new Chart(document.getElementById(id), {\n"
+    "    type: 'line',\n"
+    "    data: { labels: [], datasets: ds },\n"
+    "    options: {\n"
+    "      animation: false,\n"
+    "      responsive: true,\n"
+    "      scales: {\n"
+    "        x: { ticks: { color: '#888', maxTicksLimit: 8 }, grid: { color: '#333' } },\n"
+    "        y: { ticks: { color: '#888' }, grid: { color: '#333' } }\n"
+    "      },\n"
+    "      plugins: { legend: { labels: { color: '#ccc' } } }\n"
+    "    }\n"
+    "  });\n"
+    "}\n"
+    "\n"
+    "const C_rf = mk('c-rainforest', [\n"
+    "  { label: '雨林空气温度 (°C)', data: [], borderColor: '#ff8a80', backgroundColor: '#ff8a8022', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true },\n"
+    "  { label: '雨林相对湿度 (%)', data: [], borderColor: '#4fc3f7', backgroundColor: '#4fc3f722', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true }\n"
+    "]);\n"
+    "\n"
+    "const C_slab = mk('c-slab', [\n"
+    "  { label: '守宫石板腹热 (°C)', data: [], borderColor: '#ffb74d', backgroundColor: '#ffb74d22', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true }\n"
+    "]);\n"
+    "\n"
+    "const C_lux = mk('c-lux', [\n"
+    "  { label: '箱顶环境照度 (lx)', data: [], borderColor: '#fff176', backgroundColor: '#fff17622', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true }\n"
+    "]);\n"
+    "\n"
+    "const C_soil = mk('c-soil', [\n"
+    "  { label: '土壤相对湿度 (%)', data: [], borderColor: '#a5d6a7', backgroundColor: '#a5d6a722', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true }\n"
+    "]);\n"
+    "\n"
+    "let soilMode = 'hum';\n"
+    "\n"
+    "function toggleSoilMode() {\n"
+    "  soilMode = (soilMode === 'hum') ? 'raw' : 'hum';\n"
+    "  const btn = document.getElementById('btn-soil-mode');\n"
+    "  if (soilMode === 'raw') {\n"
+    "    btn.textContent = '当前: 原始 AD (点此切为 %)';\n"
+    "    btn.style.color = '#ffb74d';\n"
+    "    C_soil.data.datasets[0].label = '土壤传感器原始 AD 采样读数 [0~4095]';\n"
+    "    C_soil.data.datasets[0].borderColor = '#ffb74d';\n"
+    "    C_soil.data.datasets[0].backgroundColor = '#ffb74d22';\n"
+    "  } else {\n"
+    "    btn.textContent = '当前: 相对湿度 % (点此切为 AD)';\n"
+    "    btn.style.color = '#80cbc4';\n"
+    "    C_soil.data.datasets[0].label = '土壤相对湿度 (%)';\n"
+    "    C_soil.data.datasets[0].borderColor = '#a5d6a7';\n"
+    "    C_soil.data.datasets[0].backgroundColor = '#a5d6a722';\n"
+    "  }\n"
+    "  C_soil.data.labels = [];\n"
+    "  C_soil.data.datasets[0].data = [];\n"
+    "  C_soil.update('none');\n"
+    "}\n"
+    "\n"
+    "function pushMulti(chart, x, vals) {\n"
+    "  chart.data.labels.push(x);\n"
+    "  for (let i = 0; i < vals.length; i++) {\n"
+    "    chart.data.datasets[i].data.push(vals[i]);\n"
+    "  }\n"
+    "  if (chart.data.labels.length > MX) {\n"
+    "    chart.data.labels.shift();\n"
+    "    for (let i = 0; i < vals.length; i++) {\n"
+    "      chart.data.datasets[i].data.shift();\n"
+    "    }\n"
+    "  }\n"
+    "  chart.update('none');\n"
+    "}\n"
+    "\n"
+    "async function ctrl(ch, act) {\n"
+    "  const inp = document.getElementById('d-' + ch);\n"
+    "  const sec = parseInt(inp ? inp.value : '10', 10) || 0;\n"
+    "  const url = urls[ch - 1] + (act === 'off' ? '?action=off' : ('?duration=' + (sec * 1000)));\n"
+    "  try {\n"
+    "    const r = await fetch(url);\n"
+    "    if (!r.ok) throw new Error('HTTP ' + r.status);\n"
     "    poll();\n"
-    "  }catch(e){\n"
-    "    document.getElementById('status').textContent='控制失败: '+e.message;\n"
+    "  } catch (e) {\n"
+    "    document.getElementById('status').textContent = '控制失败: ' + e.message;\n"
     "  }\n"
     "}\n"
-    "function openRelay(){ctrl(1,'on');}\n"
-    "async function poll(){\n"
-    "  const t=fmt(Date.now()-t0);\n"
-    "  try{\n"
-    "    const r=await fetch('/api/sensors');\n"
-    "    if(!r.ok)throw new Error('HTTP '+r.status);\n"
-    "    const d=await r.json();\n"
-    "    const hv=d.humidity.toFixed(1),tv=d.temperature.toFixed(1),lv=d.lux.toFixed(0);\n"
-    "    document.getElementById('v-humi').textContent=hv;\n"
-    "    document.getElementById('v-temp').textContent=tv;\n"
-    "    document.getElementById('v-lux').textContent=lv;\n"
-    "    const rEl=document.getElementById('v-reed');\n"
-    "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
-    "    push(C.h,t,parseFloat(hv));\n"
-    "    push(C.t,t,parseFloat(tv));\n"
-    "    push(C.l,t,parseFloat(lv));\n"
-    "    if(d.relays&&Array.isArray(d.relays)){\n"
-    "      for(let i=0;i<d.relays.length;i++){\n"
-    "        const item=d.relays[i];\n"
-    "        const ch=item.ch||(i+1);\n"
-    "        const bd=document.getElementById('b-'+ch);\n"
-    "        const inf=document.getElementById('i-'+ch);\n"
-    "        if(bd){\n"
-    "          bd.textContent=item.state?'开':'关';\n"
-    "          bd.className='badge '+(item.state?'on':'off');\n"
+    "\n"
+    "async function poll() {\n"
+    "  const t = fmt(Date.now() - t0);\n"
+    "  try {\n"
+    "    const r = await fetch('/api/sensors');\n"
+    "    if (!r.ok) throw new Error('HTTP ' + r.status);\n"
+    "    const d = await r.json();\n"
+    "\n"
+    "    const at = (d.air_temp !== undefined ? d.air_temp : (d.temperature || 0)).toFixed(1);\n"
+    "    const ar = (d.air_rh !== undefined ? d.air_rh : (d.humidity || 0)).toFixed(1);\n"
+    "    const st = (d.slab_temp !== undefined ? d.slab_temp : (d.temperature || 0)).toFixed(1);\n"
+    "    const lx = (d.lux !== undefined ? d.lux : 0).toFixed(0);\n"
+    "    const sh = (d.soil_hum !== undefined ? d.soil_hum : 0).toFixed(1);\n"
+    "    const sr = (d.soil_raw !== undefined ? d.soil_raw : '--');\n"
+    "\n"
+    "    document.getElementById('v-air-temp').textContent = at + ' °C';\n"
+    "    document.getElementById('v-air-rh').textContent = ar + ' %';\n"
+    "    document.getElementById('v-slab-temp').textContent = st + ' °C';\n"
+    "    document.getElementById('v-lux').textContent = lx + ' lx';\n"
+    "    document.getElementById('v-soil-hum').textContent = sh + ' %';\n"
+    "    const soilSub = document.getElementById('v-soil-sub');\n"
+    "    if (soilSub) soilSub.textContent = 'AD: ' + sr + ' / 4095';\n"
+    "\n"
+    "    const rEl = document.getElementById('v-reed');\n"
+    "    const rSub = document.getElementById('v-reed-sub');\n"
+    "    if (rEl) {\n"
+    "      if (d.reed === 1) {\n"
+    "        rEl.textContent = '闭合';\n"
+    "        rEl.style.color = '#81c784';\n"
+    "        if (rSub) rSub.textContent = '前挡门紧闭 (安全)';\n"
+    "      } else {\n"
+    "        rEl.textContent = '断开';\n"
+    "        rEl.style.color = '#e57373';\n"
+    "        if (rSub) rSub.textContent = '注意防逃逸！';\n"
+    "      }\n"
+    "    }\n"
+    "\n"
+    "    const fuseEl = document.getElementById('v-fuse');\n"
+    "    if (fuseEl) {\n"
+    "      if (parseFloat(st) >= 35.0) {\n"
+    "        fuseEl.textContent = '熔断告警';\n"
+    "        fuseEl.style.color = '#e57373';\n"
+    "      } else {\n"
+    "        fuseEl.textContent = '正常';\n"
+    "        fuseEl.style.color = '#81c784';\n"
+    "      }\n"
+    "    }\n"
+    "\n"
+    "    pushMulti(C_rf, t, [parseFloat(at), parseFloat(ar)]);\n"
+    "    pushMulti(C_slab, t, [parseFloat(st)]);\n"
+    "    pushMulti(C_lux, t, [parseFloat(lx)]);\n"
+    "    const sPlotVal = (soilMode === 'raw') ? parseInt(sr, 10) || 0 : parseFloat(sh);\n"
+    "    pushMulti(C_soil, t, [sPlotVal]);\n"
+    "\n"
+    "    if (d.relays && Array.isArray(d.relays)) {\n"
+    "      for (let i = 0; i < d.relays.length; i++) {\n"
+    "        const item = d.relays[i];\n"
+    "        const ch = item.ch || (i + 1);\n"
+    "        const bd = document.getElementById('b-' + ch);\n"
+    "        const inf = document.getElementById('i-' + ch);\n"
+    "        if (bd) {\n"
+    "          bd.textContent = item.state ? '开' : '关';\n"
+    "          bd.className = 'badge ' + (item.state ? 'on' : 'off');\n"
     "        }\n"
-    "        if(inf){\n"
-    "          if(item.last_on_ts>0){\n"
-    "            const dt=new Date(item.last_on_ts*1000).toLocaleTimeString();\n"
-    "            const dur=(item.last_on_dur_ms/1000).toFixed(0);\n"
-    "            inf.textContent=`最近: ${dt} (${dur}s)`;\n"
-    "          }else{inf.textContent='从未触发'}\n"
+    "        if (inf) {\n"
+    "          if (item.last_on_ts > 0) {\n"
+    "            const dt = new Date(item.last_on_ts * 1000).toLocaleTimeString();\n"
+    "            const dur = (item.last_on_dur_ms / 1000).toFixed(0);\n"
+    "            inf.textContent = `最近: ${dt} (${dur}s)`;\n"
+    "          } else {\n"
+    "            inf.textContent = '从未触发';\n"
+    "          }\n"
     "        }\n"
     "      }\n"
     "    }\n"
-    "let WC=null;\n"
-    "function stratDesc(c){\n"
-    "  if(c.strategy===1)return `湿度 < ${c.surface_thresh_pct}% → 浇 ${c.surface_dur_s} 秒`;\n"
-    "  if(c.strategy===2)return `湿度 < ${c.deep_thresh_pct}% → 浇 ${c.deep_dur_s} 秒`;\n"
-    "  return '每天 12:00 阶梯浇水';\n"
+    "    document.getElementById('status').textContent = '已连接 · 运行中 (' + t + ')';\n"
+    "  } catch (e) {\n"
+    "    document.getElementById('status').textContent = '连接中断: ' + e.message;\n"
+    "  }\n"
     "}\n"
-    "function markStrat(id){\n"
-    "  document.querySelectorAll('#strat-opts label').forEach(l=>{\n"
-    "    const s=parseInt(l.dataset.s,10);\n"
-    "    l.classList.toggle('sel',s===id);\n"
-    "    l.querySelector('input').checked=(s===id);\n"
-    "  });\n"
-    "}\n"
-    "function fillWater(c){\n"
-    "  WC=c;\n"
-    "  markStrat(c.strategy);\n"
-    "  document.getElementById('s-thresh').value=c.surface_thresh_pct;\n"
-    "  document.getElementById('s-dur').value=c.surface_dur_s;\n"
-    "  document.getElementById('d-thresh').value=c.deep_thresh_pct;\n"
-    "  document.getElementById('d-dur').value=c.deep_dur_s;\n"
-    "  document.getElementById('hint-window').textContent=c.check_window;\n"
-    "  document.getElementById('hint-cooldown').textContent=Math.round(c.cooldown_s/60);\n"
-    "  document.getElementById('strat-cur').textContent=`当前：${c.strategy_name}（${stratDesc(c)}）`;\n"
-    "}\n"
-    "async function loadWater(){\n"
-    "  try{\n"
-    "    const r=await fetch('/api/water/config');\n"
-    "    if(!r.ok){document.getElementById('strat-msg').textContent='读取配置失败：'+await r.text();return}\n"
-    "    fillWater(await r.json());\n"
-    "  }catch(e){document.getElementById('strat-msg').textContent='读取配置失败：'+e.message}\n"
-    "}\n"
-    "async function saveWater(){\n"
-    "  const sel=document.querySelector('#strat-opts input:checked');\n"
-    "  const q=new URLSearchParams({\n"
-    "    strategy:sel?sel.value:'0',\n"
-    "    surface_thresh_pct:document.getElementById('s-thresh').value,\n"
-    "    surface_dur_s:document.getElementById('s-dur').value,\n"
-    "    deep_thresh_pct:document.getElementById('d-thresh').value,\n"
-    "    deep_dur_s:document.getElementById('d-dur').value});\n"
-    "  const msg=document.getElementById('strat-msg');\n"
-    "  msg.textContent='保存中...';\n"
-    "  try{\n"
-    "    const r=await fetch('/api/water/config?'+q);\n"
-    "    if(!r.ok){msg.textContent='保存失败：'+await r.text();return}\n"
-    "    fillWater(await r.json());\n"
-    "    msg.textContent='已保存';\n"
-    "  }catch(e){msg.textContent='保存失败：'+e.message}\n"
-    "}\n"
-    "function markDirty(){document.getElementById('strat-msg').textContent='';}\n"
-    "document.querySelectorAll('#strat-opts input').forEach(i=>\n"
-    "  i.addEventListener('change',()=>{markStrat(parseInt(i.value,10));markDirty();}));\n"
-    "['s-thresh','s-dur','d-thresh','d-dur'].forEach(id=>\n"
-    "  document.getElementById(id).addEventListener('input',markDirty));\n"
-    "loadWater();\n"
+    "\n"
     "poll();\n"
-    "setInterval(poll,IV);\n"
+    "setInterval(poll, IV);\n"
     "</script>\n"
     "</body>\n"
-    "</html>\n";
+    "</html>\n"
+    "\n";
 
 static esp_err_t handle_api_sensors(httpd_req_t *req)
 {
-    float humidity = 0.0f, temp = 0.0f, lux = -1.0f;
-    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+    float air_temp = 0.0f, air_rh = 0.0f, slab_temp = 0.0f, lux = -1.0f, soil_hum = 0.0f;
+    int soil_raw = 0;
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"sensor busy\"}");
+        httpd_resp_sendstr(req, "{\"error\":\"sensor cache busy\"}");
         return ESP_OK;
     }
 
-    sample_all_sensors_locked();
-    humidity = g_air_rh;
-    temp     = g_slab_temp;
-    lux      = g_lux;
+    air_temp  = g_air_temp;
+    air_rh    = g_air_rh;
+    slab_temp = g_slab_temp;
+    lux       = g_lux;
+    soil_hum  = g_soil_hum;
+    soil_raw  = g_soil_raw;
     xSemaphoreGive(g_sensor_mutex);
 
     int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
 
-    char json[768];
+    char json[896];
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
-        "\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
-        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
+        "\"air_temp\":%.2f,\"air_rh\":%.1f,\"slab_temp\":%.2f,\"lux\":%.1f,\"soil_hum\":%.1f,\"soil_raw\":%d,\"reed\":%d,"
+        "\"humidity\":%.1f,\"temperature\":%.2f,"
+        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,"
         "\"relays\":["
         "{\"ch\":1,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
         "{\"ch\":2,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
@@ -1065,13 +1147,11 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         "{\"ch\":7,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
         "{\"ch\":8,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu}"
         "]}",
-        humidity,
-        (double)(temp > -273.0f ? temp : -273.0f),
-        (double)(lux >= 0.0f ? lux : -1.0f),
+        air_temp, air_rh, slab_temp, (double)(lux >= 0.0f ? lux : -1.0f), soil_hum, soil_raw,
         reed_closed,
+        air_rh, slab_temp,
         (long long)s_relays[0].last_on_utc_s,
         (unsigned long)s_relays[0].last_on_dur_ms,
-        (unsigned)water_config()->strategy,
         s_relays[0].relay_gpio, s_relays[0].on ? 1 : 0, (long long)s_relays[0].last_on_utc_s, (unsigned long)s_relays[0].last_on_dur_ms,
         s_relays[1].relay_gpio, s_relays[1].on ? 1 : 0, (long long)s_relays[1].last_on_utc_s, (unsigned long)s_relays[1].last_on_dur_ms,
         s_relays[2].relay_gpio, s_relays[2].on ? 1 : 0, (long long)s_relays[2].last_on_utc_s, (unsigned long)s_relays[2].last_on_dur_ms,
@@ -1142,46 +1222,6 @@ static esp_err_t handle_change_relay6(httpd_req_t *req) { return handle_change_r
 static esp_err_t handle_change_relay7(httpd_req_t *req) { return handle_change_relay_ch(req, 6); }
 static esp_err_t handle_change_relay8(httpd_req_t *req) { return handle_change_relay_ch(req, 7); }
 
-/* GET /api/water/config            → current configuration as JSON
- * GET /api/water/config?strategy=1 → apply the given fields, persist, return
- *                                    the saved configuration as JSON */
-static esp_err_t handle_api_water_config(httpd_req_t *req)
-{
-    char query[192] = {};
-    esp_err_t qerr = httpd_req_get_url_query_str(req, query, sizeof(query));
-
-    if (qerr == ESP_ERR_HTTPD_RESULT_TRUNC) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "text/plain; charset=utf-8");
-        httpd_resp_sendstr(req, "query too long");
-        return ESP_OK;
-    }
-
-    if (qerr == ESP_OK && query[0] != '\0') {
-        char err[64] = {};
-        if (!water_config_apply_query(query, err, sizeof(err))) {
-            ESP_LOGW(TAG, "Water config rejected: %s", err);
-            httpd_resp_set_status(req, "400 Bad Request");
-            httpd_resp_set_type(req, "text/plain; charset=utf-8");
-            httpd_resp_sendstr(req, err);
-            return ESP_OK;
-        }
-        if (!water_store_save()) {
-            httpd_resp_set_status(req, "500 Internal Server Error");
-            httpd_resp_set_type(req, "text/plain; charset=utf-8");
-            httpd_resp_sendstr(req, "save failed");
-            return ESP_OK;
-        }
-        ESP_LOGI(TAG, "Water config updated: %s", query);
-    }
-
-    char json[256];
-    water_config_to_json(json, sizeof(json));
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
 /* ── Vivarium Agent Endpoints ────────────────────────────────────────────── */
 
 /* GET /api/v1/telemetry */
@@ -1190,8 +1230,7 @@ static esp_err_t handle_agent_telemetry(httpd_req_t *req)
     float air_temp = 0.0f, air_humi = 0.0f, lux = -1.0f;
     float slab_temp = 0.0f;
 
-    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) == pdTRUE) {
-        sample_all_sensors_locked();
+    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         air_humi  = g_air_rh;
         air_temp  = g_air_temp;
         lux       = g_lux;
@@ -1435,17 +1474,47 @@ static void vivarium_closed_loop_task(void *pvParameters)
     ESP_LOGI(TAG, "Vivarium autonomous climate control loop started.");
     TickType_t last_routine_vent = xTaskGetTickCount();
 
+    /* Fault tolerance filter: keep heating on across transient DS18B20 glitches */
+    static float s_last_valid_slab_t = 0.0f;
+    static int   s_slab_err_cnt = 0;
+    static float s_last_valid_air_t = 0.0f;
+    static float s_last_valid_air_rh = 0.0f;
+    static int   s_aht_err_cnt = 0;
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000)); /* Sample & evaluate once per second */
 
-        float slab_t = 0.0f, air_t = 0.0f, air_rh = 0.0f;
+        /* 1. Perform hardware sampling without holding mutex */
+        vivarium_sample_sensors_to_cache();
+
+        /* 2. Read latest snapshot with quick mutex lock (< 1us) */
+        float cur_slab = 0.0f, cur_air_t = 0.0f, cur_air_rh = 0.0f;
         if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            sample_all_sensors_locked();
-            slab_t = g_slab_temp;
-            air_t  = g_air_temp;
-            air_rh = g_air_rh;
+            cur_slab   = g_slab_temp;
+            cur_air_t  = g_air_temp;
+            cur_air_rh = g_air_rh;
             xSemaphoreGive(g_sensor_mutex);
         }
+
+        /* 3. Smooth & filter sensor readings */
+        if (cur_slab > -273.0f && cur_slab < 85.0f) {
+            s_last_valid_slab_t = cur_slab;
+            s_slab_err_cnt = 0;
+        } else {
+            s_slab_err_cnt++;
+        }
+
+        if (cur_air_t > -40.0f && cur_air_t < 85.0f) {
+            s_last_valid_air_t  = cur_air_t;
+            s_last_valid_air_rh = cur_air_rh;
+            s_aht_err_cnt = 0;
+        } else {
+            s_aht_err_cnt++;
+        }
+
+        float slab_t = (s_slab_err_cnt < 10) ? s_last_valid_slab_t : 0.0f;
+        float air_t  = (s_aht_err_cnt < 10)  ? s_last_valid_air_t  : 0.0f;
+        float air_rh = (s_aht_err_cnt < 10)  ? s_last_valid_air_rh : 0.0f;
 
         vivarium_config_t cfg;
         if (s_vivarium_cfg_mutex) xSemaphoreTake(s_vivarium_cfg_mutex, portMAX_DELAY);
@@ -1469,7 +1538,7 @@ static void vivarium_closed_loop_task(void *pvParameters)
                 relay_set(MOS_CH_PTC_HEATPAD, false, 0);
             }
         } else {
-            /* Sensor disconnected or invalid -> fail-safe off */
+            /* Sensor disconnected > 10s or invalid -> fail-safe off */
             relay_set(MOS_CH_PTC_HEATPAD, false, 0);
         }
 
@@ -1558,11 +1627,6 @@ static void http_server_start(void)
         .method  = HTTP_GET,
         .handler = handle_api_sensors,
     };
-    static const httpd_uri_t uri_api_water = {
-        .uri     = "/api/water/config",
-        .method  = HTTP_GET,
-        .handler = handle_api_water_config,
-    };
 
     /* Vivarium Agent REST API (4 endpoints) */
     static const httpd_uri_t uri_agent_telemetry = {
@@ -1596,14 +1660,13 @@ static void http_server_start(void)
     httpd_register_uri_handler(server, &uri_relay7);
     httpd_register_uri_handler(server, &uri_relay8);
     httpd_register_uri_handler(server, &uri_api_sensors);
-    httpd_register_uri_handler(server, &uri_api_water);
 
     httpd_register_uri_handler(server, &uri_agent_telemetry);
     httpd_register_uri_handler(server, &uri_agent_config_get);
     httpd_register_uri_handler(server, &uri_agent_config_post);
     httpd_register_uri_handler(server, &uri_agent_actuator);
 
-    ESP_LOGI(TAG, "HTTP server started (15/16 handlers registered, wildcard enabled)");
+    ESP_LOGI(TAG, "HTTP server started (14/16 handlers registered, wildcard enabled)");
 }
 
 /* ── App timer: LED breath, button poll, relay auto-off ──────────────────── */
@@ -1699,9 +1762,6 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
-
-    /* Watering strategy + thresholds, restored from NVS (defaults if absent) */
-    water_store_load();
 
     /* Vivarium dynamic configuration */
     s_vivarium_cfg_mutex = xSemaphoreCreateMutex();
