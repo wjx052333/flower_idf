@@ -78,6 +78,7 @@ static char g_device_secret[128];
 static char s_topic_cmd[96];
 static char s_topic_cmd_resp[96];
 static char s_topic_status[96];
+static char s_host_name[96];
 
 /* ── Hardware (ESP32-WROOM-32E + 8x MOS) ─────────────────────────────────── */
 #define NUM_RELAYS            8
@@ -139,6 +140,8 @@ build_topics:
     snprintf(s_topic_cmd,      sizeof(s_topic_cmd),      "flower/%s/down/cmd",        g_device_id);
     snprintf(s_topic_cmd_resp, sizeof(s_topic_cmd_resp), "flower/%s/up/cmd_response", g_device_id);
     snprintf(s_topic_status,   sizeof(s_topic_status),   "flower/%s/up/status",       g_device_id);
+
+    snprintf(s_host_name,      sizeof(s_host_name),      "mos_%s",                    g_device_id);
 }
 
 /* ── State ───────────────────────────────────────────────────────────────── */
@@ -1321,7 +1324,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_t *netif = esp_netif_create_default_wifi_sta();
-    esp_netif_set_hostname(netif, g_device_id);
+    esp_netif_set_hostname(netif, s_host_name);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1504,7 +1507,7 @@ void app_main(void)
     http_server_start();
 
     /* UDP Device Discovery */
-    device_discovery_start(g_device_id, 80);
+    device_discovery_start(s_host_name, 80);
 
     /* Idle — all work is event/timer-driven */
     while (1) {
