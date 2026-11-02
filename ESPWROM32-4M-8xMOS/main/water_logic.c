@@ -28,6 +28,8 @@ static water_config_t s_cfg = {
     .surface_dur_s      = DEF_SURFACE_DUR_S,
     .deep_thresh_pct    = DEF_DEEP_THRESH_PCT,
     .deep_dur_s         = DEF_DEEP_DUR_S,
+    .raw_dry            = DEF_RAW_DRY,
+    .raw_wet            = DEF_RAW_WET,
 };
 
 static bool   s_noon_done_today = false;
@@ -40,11 +42,13 @@ water_config_t *water_config(void)
 
 void water_config_reset(void)
 {
-    s_cfg.strategy           = WATER_STRATEGY_NOON;
+    s_cfg.strategy           = WATER_STRATEGY_NOON,
     s_cfg.surface_thresh_pct = DEF_SURFACE_THRESH_PCT;
     s_cfg.surface_dur_s      = DEF_SURFACE_DUR_S;
     s_cfg.deep_thresh_pct    = DEF_DEEP_THRESH_PCT;
     s_cfg.deep_dur_s         = DEF_DEEP_DUR_S;
+    s_cfg.raw_dry            = DEF_RAW_DRY;
+    s_cfg.raw_wet            = DEF_RAW_WET;
 }
 
 const char *water_strategy_name(uint8_t strategy)
@@ -74,6 +78,17 @@ static bool set_dur(const char *key, long v, uint16_t *dst, char *err, size_t er
     if (v < WATER_DUR_MIN || v > WATER_DUR_MAX) {
         snprintf(err, errlen, "%s: %d-%d required", key,
                  WATER_DUR_MIN, WATER_DUR_MAX);
+        return false;
+    }
+    *dst = (uint16_t)v;
+    return true;
+}
+
+static bool set_raw(const char *key, long v, uint16_t *dst, char *err, size_t errlen)
+{
+    if (v < WATER_RAW_ADC_MIN || v > WATER_RAW_ADC_MAX) {
+        snprintf(err, errlen, "%s: %d-%d required", key,
+                 WATER_RAW_ADC_MIN, WATER_RAW_ADC_MAX);
         return false;
     }
     *dst = (uint16_t)v;
@@ -114,6 +129,10 @@ static bool apply_pair(water_config_t *cfg, char *pair, char *err, size_t errlen
         return set_pct(key, v, &cfg->deep_thresh_pct, err, errlen);
     if (strcmp(key, "deep_dur_s") == 0)
         return set_dur(key, v, &cfg->deep_dur_s, err, errlen);
+    if (strcmp(key, "raw_dry") == 0)
+        return set_raw(key, v, &cfg->raw_dry, err, errlen);
+    if (strcmp(key, "raw_wet") == 0)
+        return set_raw(key, v, &cfg->raw_wet, err, errlen);
 
     snprintf(err, errlen, "%s: unknown field", key);
     return false;
@@ -153,6 +172,11 @@ bool water_config_apply_query(const char *query, char *err, size_t errlen)
     if (!ok)
         return false;
 
+    if (next.raw_dry <= next.raw_wet) {
+        snprintf(err, errlen, "raw_dry must be greater than raw_wet");
+        return false;
+    }
+
     s_cfg = next;
     return true;
 }
@@ -163,6 +187,7 @@ int water_config_to_json(char *buf, size_t n)
         "{\"strategy\":%u,\"strategy_name\":\"%s\","
         "\"surface_thresh_pct\":%u,\"surface_dur_s\":%u,"
         "\"deep_thresh_pct\":%u,\"deep_dur_s\":%u,"
+        "\"raw_dry\":%u,\"raw_wet\":%u,"
         "\"check_window\":\"%02d:00-%02d:00\",\"cooldown_s\":%d}",
         (unsigned)s_cfg.strategy,
         water_strategy_name(s_cfg.strategy),
@@ -170,7 +195,21 @@ int water_config_to_json(char *buf, size_t n)
         (unsigned)s_cfg.surface_dur_s,
         (unsigned)s_cfg.deep_thresh_pct,
         (unsigned)s_cfg.deep_dur_s,
+        (unsigned)s_cfg.raw_dry,
+        (unsigned)s_cfg.raw_wet,
         WATER_CHECK_START_HOUR, WATER_CHECK_END_HOUR, WATER_COOLDOWN_S);
+}
+
+float water_calc_humidity(int raw_val, uint16_t raw_dry, uint16_t raw_wet)
+{
+    if (raw_dry <= raw_wet) {
+        raw_dry = DEF_RAW_DRY;
+        raw_wet = DEF_RAW_WET;
+    }
+    float hum = (float)(raw_dry - raw_val) * 100.0f / (float)(raw_dry - raw_wet);
+    if (hum < 0.0f) hum = 0.0f;
+    if (hum > 100.0f) hum = 100.0f;
+    return hum;
 }
 
 /* ── Decision ────────────────────────────────────────────────────────────── */

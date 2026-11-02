@@ -112,5 +112,13 @@ scripts.forEach((s, idx) => {
   });
 });
 
-console.log('PASS: All referenced element IDs exist in HTML.');
+// 4. Check JSON keys in handle_api_sensors
+const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity"];
+for (const key of requiredJsonKeys) {
+  if (!mainContent.includes(`"${key}"`) && !mainContent.includes(`\\"${key}\\"`)) {
+    throw new Error(`FAIL: JSON response missing required key: ${key}`);
+  }
+}
+console.log('PASS: All required JSON keys present in main.c.');
+
 console.log('ALL CHECKS PASSED!');

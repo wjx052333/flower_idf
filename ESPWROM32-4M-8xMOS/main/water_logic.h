@@ -29,6 +29,11 @@
 #define WATER_DUR_MIN  1
 #define WATER_DUR_MAX  65535
 
+#define WATER_RAW_ADC_MIN 0
+#define WATER_RAW_ADC_MAX 4095
+#define DEF_RAW_DRY       3110
+#define DEF_RAW_WET       958
+
 typedef enum {
     WATER_STRATEGY_NOON    = 0,  /* 12:00 ladder watering, fixed parameters */
     WATER_STRATEGY_SURFACE = 1,  /* humidity < thresh → short fixed duration */
@@ -42,6 +47,8 @@ typedef struct {
     uint16_t surface_dur_s;       /* WATER_STRATEGY_SURFACE duration, 1-65535 */
     uint16_t deep_thresh_pct;     /* WATER_STRATEGY_DEEP threshold, 0-100 */
     uint16_t deep_dur_s;          /* WATER_STRATEGY_DEEP duration, 1-65535 */
+    uint16_t raw_dry;             /* ADC counts in dry air (0%), 0-4095 */
+    uint16_t raw_wet;             /* ADC counts in water (100%), 0-4095 */
 } water_config_t;
 
 typedef struct {
@@ -86,3 +93,6 @@ void water_strategy_tick(time_t now);
  * a watering decision: a floating sensor reads permanently "dry" and would
  * otherwise water on every cooldown, indefinitely. */
 bool water_humidity_valid(float humidity);
+
+/* Calculate calibrated humidity (0.0% - 100.0%) from raw ADC count. */
+float water_calc_humidity(int raw_val, uint16_t raw_dry, uint16_t raw_wet);

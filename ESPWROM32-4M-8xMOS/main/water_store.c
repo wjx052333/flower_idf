@@ -61,13 +61,32 @@ void water_store_load(void)
         else
             ESP_LOGW(TAG, "d_dur out of range (%u), using default", (unsigned)u16);
     }
+    if (nvs_get_u16(h, "raw_dry", &u16) == ESP_OK) {
+        if (u16 <= WATER_RAW_ADC_MAX)
+            cfg->raw_dry = u16;
+        else
+            ESP_LOGW(TAG, "raw_dry out of range (%u), using default", (unsigned)u16);
+    }
+    if (nvs_get_u16(h, "raw_wet", &u16) == ESP_OK) {
+        if (u16 <= WATER_RAW_ADC_MAX)
+            cfg->raw_wet = u16;
+        else
+            ESP_LOGW(TAG, "raw_wet out of range (%u), using default", (unsigned)u16);
+    }
+    if (cfg->raw_dry <= cfg->raw_wet) {
+        ESP_LOGW(TAG, "raw_dry (%u) <= raw_wet (%u), resetting to defaults",
+                 (unsigned)cfg->raw_dry, (unsigned)cfg->raw_wet);
+        cfg->raw_dry = DEF_RAW_DRY;
+        cfg->raw_wet = DEF_RAW_WET;
+    }
 
     nvs_close(h);
 
-    ESP_LOGI(TAG, "Water config loaded: strategy=%u surface=%u%%/%us deep=%u%%/%us",
+    ESP_LOGI(TAG, "Water config loaded: strategy=%u surface=%u%%/%us deep=%u%%/%us dry=%u wet=%u",
              (unsigned)cfg->strategy,
              (unsigned)cfg->surface_thresh_pct, (unsigned)cfg->surface_dur_s,
-             (unsigned)cfg->deep_thresh_pct, (unsigned)cfg->deep_dur_s);
+             (unsigned)cfg->deep_thresh_pct, (unsigned)cfg->deep_dur_s,
+             (unsigned)cfg->raw_dry, (unsigned)cfg->raw_wet);
 }
 
 bool water_store_save(void)
@@ -85,6 +104,8 @@ bool water_store_save(void)
     if (err == ESP_OK) err = nvs_set_u16(h, "s_dur",    cfg->surface_dur_s);
     if (err == ESP_OK) err = nvs_set_u16(h, "d_thresh", cfg->deep_thresh_pct);
     if (err == ESP_OK) err = nvs_set_u16(h, "d_dur",    cfg->deep_dur_s);
+    if (err == ESP_OK) err = nvs_set_u16(h, "raw_dry",  cfg->raw_dry);
+    if (err == ESP_OK) err = nvs_set_u16(h, "raw_wet",  cfg->raw_wet);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
 

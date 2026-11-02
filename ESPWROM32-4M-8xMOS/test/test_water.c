@@ -54,8 +54,10 @@ static void test_defaults_and_json(void)
     CHECK(c->surface_dur_s == 60, "default surface dur %u", c->surface_dur_s);
     CHECK(c->deep_thresh_pct == 10, "default deep thresh %u", c->deep_thresh_pct);
     CHECK(c->deep_dur_s == 1200, "default deep dur %u", c->deep_dur_s);
+    CHECK(c->raw_dry == DEF_RAW_DRY, "default raw_dry %u", c->raw_dry);
+    CHECK(c->raw_wet == DEF_RAW_WET, "default raw_wet %u", c->raw_wet);
 
-    char json[256];
+    char json[320];
     int n = water_config_to_json(json, sizeof(json));
     CHECK(n > 0 && n < (int)sizeof(json), "json length %d", n);
     CHECK(strstr(json, "\"strategy\":0") != NULL, "json strategy: %s", json);
@@ -64,6 +66,8 @@ static void test_defaults_and_json(void)
     CHECK(strstr(json, "\"surface_dur_s\":60") != NULL, "json s_dur: %s", json);
     CHECK(strstr(json, "\"deep_thresh_pct\":10") != NULL, "json d_thresh: %s", json);
     CHECK(strstr(json, "\"deep_dur_s\":1200") != NULL, "json d_dur: %s", json);
+    CHECK(strstr(json, "\"raw_dry\":3110") != NULL, "json raw_dry: %s", json);
+    CHECK(strstr(json, "\"raw_wet\":958") != NULL, "json raw_wet: %s", json);
     CHECK(strstr(json, "\"check_window\":\"08:00-16:00\"") != NULL, "json window: %s", json);
     CHECK(strstr(json, "\"cooldown_s\":1800") != NULL, "json cooldown: %s", json);
 }
@@ -303,6 +307,32 @@ static void test_humidity_validity(void)
     CHECK(!water_humidity_valid(144.1f), "stuck-low sensor value accepted");
 }
 
+static void test_calibration(void)
+{
+    char err[64];
+    water_config_reset();
+
+    /* Test apply query */
+    CHECK(water_config_apply_query("raw_dry=3200&raw_wet=1000", err, sizeof(err)),
+          "valid calibration query rejected: %s", err);
+    water_config_t *c = water_config();
+    CHECK(c->raw_dry == 3200, "raw_dry %u", c->raw_dry);
+    CHECK(c->raw_wet == 1000, "raw_wet %u", c->raw_wet);
+
+    /* Test dry <= wet rejection */
+    CHECK(!water_config_apply_query("raw_dry=1000&raw_wet=2000", err, sizeof(err)),
+          "dry < wet accepted");
+    CHECK(!water_config_apply_query("raw_dry=1000&raw_wet=1000", err, sizeof(err)),
+          "dry == wet accepted");
+
+    /* Test water_calc_humidity */
+    CHECK(water_calc_humidity(3200, 3200, 1000) == 0.0f, "dry reading not 0%%");
+    CHECK(water_calc_humidity(1000, 3200, 1000) == 100.0f, "wet reading not 100%%");
+    CHECK(water_calc_humidity(2100, 3200, 1000) == 50.0f, "mid reading not 50%%");
+    CHECK(water_calc_humidity(3500, 3200, 1000) == 0.0f, "drier than dry reading not clamped to 0%%");
+    CHECK(water_calc_humidity(500, 3200, 1000) == 100.0f, "wetter than wet reading not clamped to 100%%");
+}
+
 int main(void)
 {
     setenv("TZ", "CST-8", 1);
@@ -310,6 +340,7 @@ int main(void)
 
     test_defaults_and_json();
     test_query_apply();
+    test_calibration();
     test_noon_strategy();
     test_midnight_rollover();
     test_clock_guard();

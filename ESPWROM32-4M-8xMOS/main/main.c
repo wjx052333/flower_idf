@@ -609,15 +609,19 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
     return true;
 }
 
-float get_humidity(void) {
-    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    float humidity_cap = raw_low * 100.0f / 4096;
-    const float humidity_max = 98;
-    const float humidity_min = 30;
-    float humidity = 100 * (humidity_max - humidity_cap)/(humidity_max-humidity_min);
-    ESP_LOGI(TAG, "ADC humidity(GPIO34)=%d,%.1f%%,%.1f%%", raw_low, humidity_cap, humidity);
+static float calculate_humidity_from_raw(int raw_low)
+{
+    const water_config_t *cfg = water_config();
+    float humidity = water_calc_humidity(raw_low, cfg->raw_dry, cfg->raw_wet);
+    ESP_LOGI(TAG, "ADC humidity(GPIO34)=%d, calibrated=%.1f%% (dry=%u, wet=%u)",
+             raw_low, humidity, (unsigned)cfg->raw_dry, (unsigned)cfg->raw_wet);
 
     return humidity;
+}
+
+float get_humidity(void) {
+    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+    return calculate_humidity_from_raw(raw_low);
 }
 
 static void publish_status_report(void)
@@ -886,11 +890,12 @@ static const char STATUS_HTML[] =
     "</div>\n"
     "<div class=\"row\"><span class=\"nm\">浇表面</span>湿度 &lt; <input type=\"number\" id=\"s-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"s-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
     "<div class=\"row\"><span class=\"nm\">干了再浇透</span>湿度 &lt; <input type=\"number\" id=\"d-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"d-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
-    "<div class=\"row\"><button onclick=\"saveWater()\">保存</button><span class=\"msg\" id=\"strat-msg\"></span></div>\n"
-    "<div class=\"hint\">「中午12点」：每天 12:00 检查一次，阶梯式浇水 &gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min（参数固定）<br>「浇表面」「干了再浇透」：<span id=\"hint-window\">08:00-16:00</span> 之间每 30 秒检查，触发后 <span id=\"hint-cooldown\">30</span> 分钟内不再自动浇水</div>\n"
+    "<div class=\"row\" style=\"border-top:1px solid #333;padding-top:8px;margin-top:6px\"><span class=\"nm\">湿度标定</span>空气干燥(0%): <input type=\"number\" id=\"cal-dry\" min=\"0\" max=\"4095\"><button class=\"btn on\" style=\"margin-left:0;padding:4px 8px;font-size:11px\" onclick=\"setCal('dry')\">取当前AD</button>&nbsp;水中湿润(100%): <input type=\"number\" id=\"cal-wet\" min=\"0\" max=\"4095\"><button class=\"btn on\" style=\"margin-left:0;padding:4px 8px;font-size:11px\" onclick=\"setCal('wet')\">取当前AD</button></div>\n"
+    "<div class=\"row\"><button onclick=\"saveWater()\">保存配置</button><span class=\"msg\" id=\"strat-msg\"></span></div>\n"
+    "<div class=\"hint\">「中午12点」：每天 12:00 检查一次，阶梯式浇水 &gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min（参数固定）<br>「浇表面」「干了再浇透」：<span id=\"hint-window\">08:00-16:00</span> 之间每 30 秒检查，触发后 <span id=\"hint-cooldown\">30</span> 分钟内不再自动浇水<br>「土壤湿度标定」：空气干燥值对应 0% 湿度（默认 3110），完全浸水值对应 100% 湿度（默认 958）。置于对应介质后点“取当前AD”再点击保存配置写入 Flash。</div>\n"
     "</div>\n"
     "<div class=\"vals\">\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%) <span id=\"v-raw\">(AD: --)</span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14]</div></div>\n"
@@ -945,6 +950,11 @@ static const char STATUS_HTML[] =
     "    const d=await r.json();\n"
     "    const hv=d.humidity.toFixed(1),tv=d.temperature.toFixed(1),lv=d.lux.toFixed(0);\n"
     "    document.getElementById('v-humi').textContent=hv;\n"
+    "    const rawEl=document.getElementById('v-raw');\n"
+    "    if(rawEl&&d.raw_low!==undefined){\n"
+    "      latestRaw=d.raw_low;\n"
+    "      rawEl.textContent=`(AD: ${d.raw_low})`;\n"
+    "    }\n"
     "    document.getElementById('v-temp').textContent=tv;\n"
     "    document.getElementById('v-lux').textContent=lv;\n"
     "    const rEl=document.getElementById('v-reed');\n"
@@ -978,7 +988,13 @@ static const char STATUS_HTML[] =
     "    document.getElementById('status').textContent=`错误：${e.message}，重试中...`;\n"
     "  }\n"
     "}\n"
-    "let WC=null;\n"
+    "let WC=null,latestRaw=null;\n"
+    "function setCal(which){\n"
+    "  if(latestRaw===null){alert('尚未获取到传感器读数');return;}\n"
+    "  if(which==='dry')document.getElementById('cal-dry').value=latestRaw;\n"
+    "  if(which==='wet')document.getElementById('cal-wet').value=latestRaw;\n"
+    "  markDirty();\n"
+    "}\n"
     "function stratDesc(c){\n"
     "  if(c.strategy===1)return `湿度 < ${c.surface_thresh_pct}% → 浇 ${c.surface_dur_s} 秒`;\n"
     "  if(c.strategy===2)return `湿度 < ${c.deep_thresh_pct}% → 浇 ${c.deep_dur_s} 秒`;\n"
@@ -998,6 +1014,8 @@ static const char STATUS_HTML[] =
     "  document.getElementById('s-dur').value=c.surface_dur_s;\n"
     "  document.getElementById('d-thresh').value=c.deep_thresh_pct;\n"
     "  document.getElementById('d-dur').value=c.deep_dur_s;\n"
+    "  if(c.raw_dry!==undefined)document.getElementById('cal-dry').value=c.raw_dry;\n"
+    "  if(c.raw_wet!==undefined)document.getElementById('cal-wet').value=c.raw_wet;\n"
     "  document.getElementById('hint-window').textContent=c.check_window;\n"
     "  document.getElementById('hint-cooldown').textContent=Math.round(c.cooldown_s/60);\n"
     "  document.getElementById('strat-cur').textContent=`当前：${c.strategy_name}（${stratDesc(c)}）`;\n"
@@ -1016,7 +1034,9 @@ static const char STATUS_HTML[] =
     "    surface_thresh_pct:document.getElementById('s-thresh').value,\n"
     "    surface_dur_s:document.getElementById('s-dur').value,\n"
     "    deep_thresh_pct:document.getElementById('d-thresh').value,\n"
-    "    deep_dur_s:document.getElementById('d-dur').value});\n"
+    "    deep_dur_s:document.getElementById('d-dur').value,\n"
+    "    raw_dry:document.getElementById('cal-dry').value,\n"
+    "    raw_wet:document.getElementById('cal-wet').value});\n"
     "  const msg=document.getElementById('strat-msg');\n"
     "  msg.textContent='保存中...';\n"
     "  try{\n"
@@ -1029,7 +1049,7 @@ static const char STATUS_HTML[] =
     "function markDirty(){document.getElementById('strat-msg').textContent='';}\n"
     "document.querySelectorAll('#strat-opts input').forEach(i=>\n"
     "  i.addEventListener('change',()=>{markStrat(parseInt(i.value,10));markDirty();}));\n"
-    "['s-thresh','s-dur','d-thresh','d-dur'].forEach(id=>\n"
+    "['s-thresh','s-dur','d-thresh','d-dur','cal-dry','cal-wet'].forEach(id=>\n"
     "  document.getElementById(id).addEventListener('input',markDirty));\n"
     "loadWater();\n"
     "poll();\n"
@@ -1047,7 +1067,8 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         return ESP_OK;
     }
 
-    float humidity = get_humidity();
+    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+    float humidity = calculate_humidity_from_raw(raw_low);
 
     float temp = ds18b20_read_temperature();
 
@@ -1061,11 +1082,11 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
 
-    char json[768];
+    char json[896];
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
-        "\"humidity\":%.1f,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
+        "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
         "\"relays\":["
         "{\"ch\":1,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
@@ -1078,6 +1099,7 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         "{\"ch\":8,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu}"
         "]}",
         humidity,
+        raw_low,
         (double)(temp > -273.0f ? temp : -273.0f),
         (double)(lux >= 0.0f ? lux : -1.0f),
         reed_closed,
@@ -1159,7 +1181,7 @@ static esp_err_t handle_change_relay8(httpd_req_t *req) { return handle_change_r
  *                                    the saved configuration as JSON */
 static esp_err_t handle_api_water_config(httpd_req_t *req)
 {
-    char query[192] = {};
+    char query[256] = {};
     esp_err_t qerr = httpd_req_get_url_query_str(req, query, sizeof(query));
 
     if (qerr == ESP_ERR_HTTPD_RESULT_TRUNC) {
@@ -1187,7 +1209,7 @@ static esp_err_t handle_api_water_config(httpd_req_t *req)
         ESP_LOGI(TAG, "Water config updated: %s", query);
     }
 
-    char json[256];
+    char json[320];
     water_config_to_json(json, sizeof(json));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
