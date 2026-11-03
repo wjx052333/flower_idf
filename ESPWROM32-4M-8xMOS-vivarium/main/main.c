@@ -638,14 +638,16 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
 
 static void vivarium_sample_sensors_to_cache(void)
 {
-    /* 1. Soil humidity from ADC1_CH6 (GPIO 34, optional/spare) */
+    /* 1. Soil humidity from ADC1_CH6 (GPIO 34) */
     int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    float humidity_cap = raw_low * 100.0f / 4096.0f;
-    const float humidity_max = 98.0f;
-    const float humidity_min = 30.0f;
-    float soil_h = 100.0f * (humidity_max - humidity_cap) / (humidity_max - humidity_min);
-    if (soil_h < 0.0f) soil_h = 0.0f;
-    if (soil_h > 100.0f) soil_h = 100.0f;
+    uint16_t dry = DEF_SOIL_RAW_DRY;
+    uint16_t wet = DEF_SOIL_RAW_WET;
+    if (s_vivarium_cfg_mutex && xSemaphoreTake(s_vivarium_cfg_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        dry = s_vivarium_cfg.soil_raw_dry;
+        wet = s_vivarium_cfg.soil_raw_wet;
+        xSemaphoreGive(s_vivarium_cfg_mutex);
+    }
+    float soil_h = vivarium_calc_soil_humidity(raw_low, dry, wet);
 
     /* 2. Hotspot belly heat slab temperature from DS18B20 (GPIO 4) */
     float slab_t = ds18b20_read_temperature();
@@ -1308,7 +1310,9 @@ static esp_err_t handle_agent_config_get(httpd_req_t *req)
         "  \"target_bulk_temp_max\": %.1f,\n"
         "  \"vent_humidity_thresh\": %.1f,\n"
         "  \"routine_vent_interval_s\": %lu,\n"
-        "  \"auto_control_enabled\": %s\n"
+        "  \"auto_control_enabled\": %s,\n"
+        "  \"soil_raw_dry\": %u,\n"
+        "  \"soil_raw_wet\": %u\n"
         "}",
         s_vivarium_cfg.target_slab_temp_min,
         s_vivarium_cfg.target_slab_temp_max,
@@ -1316,7 +1320,9 @@ static esp_err_t handle_agent_config_get(httpd_req_t *req)
         s_vivarium_cfg.target_bulk_temp_max,
         s_vivarium_cfg.vent_humidity_thresh,
         (unsigned long)s_vivarium_cfg.routine_vent_interval_s,
-        s_vivarium_cfg.auto_control_enabled ? "true" : "false"
+        s_vivarium_cfg.auto_control_enabled ? "true" : "false",
+        (unsigned)s_vivarium_cfg.soil_raw_dry,
+        (unsigned)s_vivarium_cfg.soil_raw_wet
     );
     if (s_vivarium_cfg_mutex) xSemaphoreGive(s_vivarium_cfg_mutex);
 
@@ -1367,6 +1373,38 @@ static esp_err_t handle_agent_config_post(httpd_req_t *req)
     }
     if (httpd_query_key_value(query, "auto_ctrl", val, sizeof(val)) == ESP_OK) {
         s_vivarium_cfg.auto_control_enabled = (strcmp(val, "1") == 0 || strcmp(val, "true") == 0);
+    }
+    if (httpd_query_key_value(query, "soil_dry", val, sizeof(val)) == ESP_OK ||
+        httpd_query_key_value(query, "raw_dry", val, sizeof(val)) == ESP_OK) {
+        int d = atoi(val);
+        if (d >= 0 && d <= 4095) s_vivarium_cfg.soil_raw_dry = (uint16_t)d;
+    }
+    if (httpd_query_key_value(query, "soil_wet", val, sizeof(val)) == ESP_OK ||
+        httpd_query_key_value(query, "raw_wet", val, sizeof(val)) == ESP_OK) {
+        int w = atoi(val);
+        if (w >= 0 && w <= 4095) s_vivarium_cfg.soil_raw_wet = (uint16_t)w;
+    }
+
+    /* JSON body fallback parsing */
+    if (buf[0] != '\0') {
+        char *p_dry = strstr(buf, "\"soil_dry\":");
+        if (!p_dry) p_dry = strstr(buf, "\"soil_raw_dry\":");
+        if (p_dry) {
+            int d = atoi(p_dry + strcspn(p_dry, "0123456789"));
+            if (d >= 0 && d <= 4095) s_vivarium_cfg.soil_raw_dry = (uint16_t)d;
+        }
+        char *p_wet = strstr(buf, "\"soil_wet\":");
+        if (!p_wet) p_wet = strstr(buf, "\"soil_raw_wet\":");
+        if (p_wet) {
+            int w = atoi(p_wet + strcspn(p_wet, "0123456789"));
+            if (w >= 0 && w <= 4095) s_vivarium_cfg.soil_raw_wet = (uint16_t)w;
+        }
+    }
+
+    if (s_vivarium_cfg.soil_raw_dry <= s_vivarium_cfg.soil_raw_wet) {
+        ESP_LOGW(TAG, "Invalid soil calibration dry <= wet, resetting to defaults");
+        s_vivarium_cfg.soil_raw_dry = DEF_SOIL_RAW_DRY;
+        s_vivarium_cfg.soil_raw_wet = DEF_SOIL_RAW_WET;
     }
 
     vivarium_config_save(&s_vivarium_cfg);
