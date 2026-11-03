@@ -41,6 +41,9 @@
 /* ==============================================================================
  * Dynamic Configuration Stored in NVS
  * ============================================================================== */
+#define DEF_SOIL_RAW_DRY  3110
+#define DEF_SOIL_RAW_WET  958
+
 typedef struct {
     /* Hotspot belly heat hysteresis */
     float    target_slab_temp_min;  /* Default: 31.0 C */
@@ -58,8 +61,15 @@ typedef struct {
 
     /* Auto control enabled */
     bool     auto_control_enabled;  /* Default: true */
+
+    /* Soil moisture 2-point ADC calibration (counts 0~4095) */
+    uint16_t soil_raw_dry;          /* Default: 3110 (air / 0%) */
+    uint16_t soil_raw_wet;          /* Default: 958  (water / 100%) */
 } vivarium_config_t;
 
 void vivarium_config_init_default(vivarium_config_t *cfg);
 esp_err_t vivarium_config_load(vivarium_config_t *cfg);
 esp_err_t vivarium_config_save(const vivarium_config_t *cfg);
+
+/* Calculate calibrated soil humidity (0.0% - 100.0%) from raw ADC reading */
+float vivarium_calc_soil_humidity(int raw_val, uint16_t raw_dry, uint16_t raw_wet);

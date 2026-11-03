@@ -17,6 +17,8 @@ void vivarium_config_init_default(vivarium_config_t *cfg)
     cfg->vent_humidity_thresh     = 88.0f;
     cfg->routine_vent_interval_s  = 10800; /* 3 hours */
     cfg->auto_control_enabled     = true;
+    cfg->soil_raw_dry             = DEF_SOIL_RAW_DRY;
+    cfg->soil_raw_wet             = DEF_SOIL_RAW_WET;
 }
 
 esp_err_t vivarium_config_load(vivarium_config_t *cfg)
@@ -36,7 +38,14 @@ esp_err_t vivarium_config_load(vivarium_config_t *cfg)
     nvs_close(h);
 
     if (err == ESP_OK && size == sizeof(vivarium_config_t)) {
-        ESP_LOGI(TAG, "Vivarium config loaded from NVS");
+        if (cfg->soil_raw_dry <= cfg->soil_raw_wet || cfg->soil_raw_dry > 4095 || cfg->soil_raw_wet > 4095) {
+            ESP_LOGW(TAG, "Invalid soil calibration (dry=%u, wet=%u), resetting to defaults",
+                     (unsigned)cfg->soil_raw_dry, (unsigned)cfg->soil_raw_wet);
+            cfg->soil_raw_dry = DEF_SOIL_RAW_DRY;
+            cfg->soil_raw_wet = DEF_SOIL_RAW_WET;
+        }
+        ESP_LOGI(TAG, "Vivarium config loaded from NVS (soil dry=%u wet=%u)",
+                 (unsigned)cfg->soil_raw_dry, (unsigned)cfg->soil_raw_wet);
         return ESP_OK;
     }
 
@@ -68,4 +77,16 @@ esp_err_t vivarium_config_save(const vivarium_config_t *cfg)
         ESP_LOGE(TAG, "Failed to save vivarium config: %s", esp_err_to_name(err));
     }
     return err;
+}
+
+float vivarium_calc_soil_humidity(int raw_val, uint16_t raw_dry, uint16_t raw_wet)
+{
+    if (raw_dry <= raw_wet) {
+        raw_dry = DEF_SOIL_RAW_DRY;
+        raw_wet = DEF_SOIL_RAW_WET;
+    }
+    float hum = (float)(raw_dry - raw_val) * 100.0f / (float)(raw_dry - raw_wet);
+    if (hum < 0.0f) hum = 0.0f;
+    if (hum > 100.0f) hum = 100.0f;
+    return hum;
 }
