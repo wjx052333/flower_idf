@@ -178,6 +178,16 @@ static relay_channel_t s_relays[NUM_RELAYS] = {
 static void relay_set_unlocked(int ch, bool on, uint32_t duration_ms)
 {
     if (ch < 0 || ch >= NUM_RELAYS) return;
+
+    /* Interlock: if reed switch is open (level != 0), forbid turning on MOS 2 and trigger MOS 3 for 1s */
+    if (ch == 1 && on) {
+        if (gpio_get_level(REED_PIN) != 0) {
+            ESP_LOGW(TAG, "Reed switch open: rejected turning on MOS 2, triggering MOS 3 for 1s");
+            relay_set_unlocked(2, true, 1000);
+            return;
+        }
+    }
+
     if (on) {
         s_relays[ch].on_us = esp_timer_get_time();
         s_relays[ch].duration_ms = duration_ms;
@@ -1163,6 +1173,14 @@ static esp_err_t handle_change_relay_ch(httpd_req_t *req, int ch)
     if (is_off) {
         relay_set(ch, false, 0);
     } else {
+        if (ch == 1 && gpio_get_level(REED_PIN) != 0) {
+            ESP_LOGW(TAG, "HTTP request to open MOS 2 rejected: reed switch is open");
+            relay_set(2, true, 1000);
+            httpd_resp_set_status(req, "403 Forbidden");
+            httpd_resp_set_type(req, "text/plain; charset=utf-8");
+            httpd_resp_sendstr(req, "干簧管处于断开状态，拒绝开启MOS 2（已触发MOS 3闭合1秒）");
+            return ESP_OK;
+        }
         relay_set(ch, true, dur);
     }
 
