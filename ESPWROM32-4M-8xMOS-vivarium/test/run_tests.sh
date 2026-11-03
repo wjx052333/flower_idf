@@ -4,6 +4,12 @@
 set -e
 cd "$(dirname "$0")"
 
+echo "running soil calibration tests"
+node test_calibration.js
+
+echo "verifying HTML and JS syntax"
+node test_html.js
+
 OUT=test_water
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) OUT=test_water.exe ;;
