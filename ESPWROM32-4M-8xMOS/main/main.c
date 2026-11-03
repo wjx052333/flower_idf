@@ -223,6 +223,54 @@ void relay_toggle(int ch)
     if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 }
 
+/* ── Reed switch interrupt & event task ─────────────────────────────────── */
+static TaskHandle_t s_reed_task_handle = NULL;
+
+static void IRAM_ATTR reed_isr_handler(void *arg)
+{
+    (void)arg;
+    BaseType_t high_task_wakeup = pdFALSE;
+    if (s_reed_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(s_reed_task_handle, &high_task_wakeup);
+        portYIELD_FROM_ISR(high_task_wakeup);
+    }
+}
+
+static void reed_task(void *arg)
+{
+    (void)arg;
+    int64_t last_trigger_us = 0;
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* Debounce delay: 30 ms */
+        vTaskDelay(pdMS_TO_TICKS(30));
+
+        /* Verify that REED_PIN is still open (level == 1) */
+        if (gpio_get_level(REED_PIN) == 0) {
+            continue; /* False trigger / bounce */
+        }
+
+        /* Cooldown: ignore triggers within 200 ms */
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_trigger_us) < 200000LL) {
+            continue;
+        }
+        last_trigger_us = now_us;
+
+        ESP_LOGI(TAG, "Reed switch opened (closed->open transition detected)");
+
+        if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+        /* If MOS 2 is currently ON, turn it OFF immediately */
+        if (s_relays[1].on) {
+            ESP_LOGW(TAG, "Reed opened while MOS 2 was ON: forcing MOS 2 OFF immediately");
+            relay_set_unlocked(1, false, 0);
+        }
+        /* Trigger MOS 3 for 1 second */
+        relay_set_unlocked(2, true, 1000);
+        if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+    }
+}
+
 static volatile bool            s_last_btn       = true; /* HIGH = not pressed */
 
 /* Static to avoid large stack allocation */
@@ -1467,12 +1515,23 @@ void app_main(void)
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
-    /* GPIO: reed switch (input pull-up) */
+    /* GPIO: reed switch (input pull-up with rising edge interrupt for closed->open transition) */
     io_conf.pin_bit_mask = (1ULL << REED_PIN);
     io_conf.mode         = GPIO_MODE_INPUT;
     io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type    = GPIO_INTR_POSEDGE;
     ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    /* Create reed switch background task */
+    xTaskCreate(reed_task, "reed_task", 2048, NULL, 5, &s_reed_task_handle);
+
+    /* Install GPIO ISR service and attach handler for REED_PIN */
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(isr_err);
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(REED_PIN, reed_isr_handler, NULL));
 
     /* LEDC: breathing LED */
     ledc_timer_config_t ledc_timer = {
