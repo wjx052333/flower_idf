@@ -54,6 +54,7 @@
 #include "pb_decode.h"
 #include "flower.pb.h"
 #include "ds18b20.h"
+#include "aht25.h"
 #include "water_logic.h"
 #include "water_store.h"
 
@@ -99,17 +100,6 @@ static char s_host_name[96];
 #define REED_PIN              GPIO_NUM_14 /* Reed switch input (internal pull-up) */
 #define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_6   /* GPIO34 (ADC1_CH6) */
 #define DS18B20_PIN           GPIO_NUM_4      /* GPIO4 */
-
-/* ── Lux sensor select: define USE_BH1750 for BH1750FVI I2C,
- *                       undefine for Modbus-RTU sensor ─────────────── */
-#define USE_BH1750
-
-#ifndef USE_BH1750
-#define MODBUS_UART_PORT  UART_NUM_1
-#define MODBUS_UART_TXD   GPIO_NUM_6
-#define MODBUS_UART_RXD   GPIO_NUM_7
-#define MODBUS_BAUD       9600
-#endif /* !USE_BH1750 */
 
 #define STATUS_INTERVAL_MS        30000
 #define SENSOR_MUTEX_TIMEOUT_MS   3000
@@ -310,137 +300,7 @@ static int adc_read_raw(adc_channel_t channel)
     return raw;
 }
 
-/* ── Illuminance sensor ──────────────────────────────────────────────────── */
-#ifndef USE_BH1750
-/* -- Modbus-RTU path -- */
-static uint16_t modbus_crc16(const uint8_t *data, int len)
-{
-    uint16_t crc = 0xFFFF;
-    for (int i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 1)
-                crc = (crc >> 1) ^ 0xA001;
-            else
-                crc >>= 1;
-        }
-    }
-    return crc;
-}
-
-static void modbus_init(void)
-{
-    uart_config_t uart_cfg = {
-        .baud_rate = MODBUS_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    };
-    ESP_ERROR_CHECK(uart_param_config(MODBUS_UART_PORT, &uart_cfg));
-    ESP_ERROR_CHECK(uart_set_pin(MODBUS_UART_PORT, MODBUS_UART_TXD, MODBUS_UART_RXD,
-                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(MODBUS_UART_PORT, 256, 0, 0, NULL, 0));
-}
-
-static void modbus_reset(void)
-{
-    uint8_t cmd[] = {0xFF, 0x06, 0x00, 0xF0, 0x00, 0x00};
-    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
-    uint8_t tx_buf[8];
-    memcpy(tx_buf, cmd, 6);
-    tx_buf[6] = crc & 0xFF;
-    tx_buf[7] = (crc >> 8) & 0xFF;
-
-    uart_flush_input(MODBUS_UART_PORT);
-    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
-
-    uint8_t rx_buf[8];
-    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
-                              100 / portTICK_PERIOD_MS);
-    if (len != 8) {
-        ESP_LOGW(TAG, "Modbus reset: expected 8 bytes, got %d", len);
-        return;
-    }
-    ESP_LOGI(TAG, "modbus_reset:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,",
-            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]);
-    return;
-}
-
-static void modbus_read_calc_enable(void)
-{
-    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x47, 0x00, 0x01};
-    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
-    uint8_t tx_buf[8];
-    memcpy(tx_buf, cmd, 6);
-    tx_buf[6] = crc & 0xFF;
-    tx_buf[7] = (crc >> 8) & 0xFF;
-
-    uart_flush_input(MODBUS_UART_PORT);
-    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
-
-    uint8_t rx_buf[7];
-    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
-                              100 / portTICK_PERIOD_MS);
-    if (len != 7) {
-        ESP_LOGW(TAG, "modbus_read_calc: expected 7 bytes, got %d", len);
-        return;
-    }
-    ESP_LOGI(TAG, "modbus_read_calc:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
-            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]);
-    return;
-}
-
-static void modbus_read_calc(void)
-{
-    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x48, 0x00, 0x01};
-    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
-    uint8_t tx_buf[8];
-    memcpy(tx_buf, cmd, 6);
-    tx_buf[6] = crc & 0xFF;
-    tx_buf[7] = (crc >> 8) & 0xFF;
-
-    uart_flush_input(MODBUS_UART_PORT);
-    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
-
-    uint8_t rx_buf[7];
-    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
-                              100 / portTICK_PERIOD_MS);
-    if (len != 7) {
-        ESP_LOGW(TAG, "modbus_read_calc: expected 7 bytes, got %d", len);
-        return;
-    }
-    ESP_LOGI(TAG, "modbus_read_calc:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
-            rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]);
-    return;
-}
-
-static float modbus_read_illuminance(void)
-{
-    uint8_t cmd[] = {0x01, 0x03, 0x00, 0x02, 0x00, 0x02};
-    uint16_t crc = modbus_crc16(cmd, sizeof(cmd));
-    uint8_t tx_buf[8];
-    memcpy(tx_buf, cmd, 6);
-    tx_buf[6] = crc & 0xFF;
-    tx_buf[7] = (crc >> 8) & 0xFF;
-
-    uart_flush_input(MODBUS_UART_PORT);
-    uart_write_bytes(MODBUS_UART_PORT, tx_buf, 8);
-
-    uint8_t rx_buf[9];
-    int len = uart_read_bytes(MODBUS_UART_PORT, rx_buf, sizeof(rx_buf),
-                              100 / portTICK_PERIOD_MS);
-    if (len != 9) {
-        ESP_LOGW(TAG, "Modbus illuminance: expected 9 bytes, got %d", len);
-        return -1.0f;
-    }
-
-    uint32_t raw = ((uint32_t)rx_buf[3] << 24) | ((uint32_t)rx_buf[4] << 16)
-                 | ((uint32_t)rx_buf[5] << 8) | rx_buf[6];
-    return (float)raw / 1000.0f;
-}
-#else /* USE_BH1750 */
-/* -- BH1750FVI I2C path (SCL=IO22, SDA=IO21) -- */
+/* ── I2C sensors (BH1750 illuminance + AHT25 temperature/humidity) ───────── */
 #define BH1750_SCL_IO   GPIO_NUM_22
 #define BH1750_SDA_IO   GPIO_NUM_21
 #define BH1750_ADDR     0x23
@@ -449,7 +309,7 @@ static float modbus_read_illuminance(void)
 static i2c_master_bus_handle_t s_i2c_bus    = NULL;
 static i2c_master_dev_handle_t s_bh1750_dev = NULL;
 
-static void bh1750_init(void)
+static void i2c_sensors_init(void)
 {
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port             = I2C_NUM_0,
@@ -464,17 +324,32 @@ static void bh1750_init(void)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = BH1750_ADDR,
-        .scl_speed_hz    = 400000,
+        .scl_speed_hz    = 100000,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_bh1750_dev));
-
-    uint8_t cmd = BH1750_CONT_H;
-    ESP_ERROR_CHECK(i2c_master_transmit(s_bh1750_dev, &cmd, 1, 100));
+    esp_err_t err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_bh1750_dev);
+    if (err == ESP_OK) {
+        uint8_t cmd = BH1750_CONT_H;
+        err = i2c_master_transmit(s_bh1750_dev, &cmd, 1, 100);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "BH1750 initialized on I2C (0x23)");
+        } else {
+            ESP_LOGW(TAG, "BH1750 start continuous mode failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to add BH1750 to I2C: %s", esp_err_to_name(err));
+    }
     vTaskDelay(pdMS_TO_TICKS(200)); /* wait for first measurement */
+
+    /* Initialize AHT25 on shared I2C bus */
+    err = aht25_init(s_i2c_bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AHT25 init returned: %s", esp_err_to_name(err));
+    }
 }
 
 static float bh1750_read_illuminance(void)
 {
+    if (!s_bh1750_dev) return -1.0f;
     uint8_t buf[2];
     esp_err_t err = i2c_master_receive(s_bh1750_dev, buf, 2, 200);
     if (err != ESP_OK) {
@@ -484,7 +359,6 @@ static float bh1750_read_illuminance(void)
     uint16_t raw = ((uint16_t)buf[0] << 8) | buf[1];
     return (float)raw / 1.2f;
 }
-#endif /* USE_BH1750 */
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
 static void calc_signature(int64_t ts_ms, const char *device_id,
@@ -706,11 +580,7 @@ static void publish_status_report(void)
     if (temp > -273.0f)
         ESP_LOGI(TAG, "Temperature(GPIO1)=%.2f°C", temp);
 
-#ifdef USE_BH1750
     float lux = bh1750_read_illuminance();
-#else
-    float lux = modbus_read_illuminance();
-#endif
     if (lux >= 0)
         ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
     xSemaphoreGive(g_sensor_mutex);
@@ -1170,11 +1040,7 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     float temp = ds18b20_read_temperature();
 
-#ifdef USE_BH1750
     float lux = bh1750_read_illuminance();
-#else
-    float lux = modbus_read_illuminance();
-#endif
 
     xSemaphoreGive(g_sensor_mutex);
 
@@ -1511,15 +1377,8 @@ void app_main(void)
     /* DS18B20: temperature sensor (IO1) */
     ds18b20_init(DS18B20_PIN);
 
-#ifdef USE_BH1750
-    /* BH1750FVI: illuminance sensor (IO6=SCL, IO7=SDA) */
-    bh1750_init();
-#else
-    /* Modbus-RTU: illuminance sensor (IO6=TXD→绿线/设备RXD, IO7=RXD→黄线/设备TXD) */
-    modbus_init();
-    modbus_read_calc_enable();
-    modbus_read_calc(); /* modbus_reset(); */
-#endif
+    /* I2C sensors: BH1750 (0x23) + AHT25 (0x38) on SCL=IO22, SDA=IO21 */
+    i2c_sensors_init();
 
     /* Sensor mutex — serializes HTTP handler vs status_timer reads */
     g_sensor_mutex = xSemaphoreCreateMutex();
