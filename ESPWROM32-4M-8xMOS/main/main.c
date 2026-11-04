@@ -877,6 +877,8 @@ static const char STATUS_HTML[] =
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14]</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-aht-humi\">--</div><div class=\"lbl\">AHT25湿度 (%)</div></div>\n"
     "</div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-temp\" height=\"100\"></canvas></div>\n"
@@ -944,6 +946,10 @@ static const char STATUS_HTML[] =
     "    document.getElementById('v-lux').textContent=lv;\n"
     "    const rEl=document.getElementById('v-reed');\n"
     "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
+    "    const atEl=document.getElementById('v-aht-temp');\n"
+    "    if(atEl&&d.aht_temp!==undefined){atEl.textContent=d.aht_temp>-40?d.aht_temp.toFixed(1):'ERR';}\n"
+    "    const ahEl=document.getElementById('v-aht-humi');\n"
+    "    if(ahEl&&d.aht_humi!==undefined){ahEl.textContent=d.aht_humi>=0?d.aht_humi.toFixed(1):'ERR';}\n"
     "    push(C.h,t,parseFloat(hv));\n"
     "    push(C.t,t,parseFloat(tv));\n"
     "    push(C.l,t,parseFloat(lv));\n"
@@ -1059,16 +1065,20 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     float lux = bh1750_read_illuminance();
 
+    float aht_temp = 0.0f, aht_humi = 0.0f;
+    esp_err_t aht_err = aht25_read(&aht_temp, &aht_humi);
+
     xSemaphoreGive(g_sensor_mutex);
 
     int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
 
-    char json[960];
+    char json[1024];
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
         "\"version\":\"" FW_VERSION_STR "\","
         "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
+        "\"aht_temp\":%.2f,\"aht_humi\":%.1f,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
         "\"relays\":["
         "{\"ch\":1,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
@@ -1085,6 +1095,8 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         (double)(temp > -273.0f ? temp : -273.0f),
         (double)(lux >= 0.0f ? lux : -1.0f),
         reed_closed,
+        (double)(aht_err == ESP_OK ? aht_temp : -99.0f),
+        (double)(aht_err == ESP_OK ? aht_humi : -99.0f),
         (long long)s_relays[0].last_on_utc_s,
         (unsigned long)s_relays[0].last_on_dur_ms,
         (unsigned)water_config()->strategy,
