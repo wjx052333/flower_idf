@@ -113,7 +113,7 @@ scripts.forEach((s, idx) => {
 });
 
 // 4. Check JSON keys in handle_api_sensors
-const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity"];
+const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity", "aht_temp", "aht_humi"];
 for (const key of requiredJsonKeys) {
   if (!mainContent.includes(`"${key}"`) && !mainContent.includes(`\\"${key}\\"`)) {
     throw new Error(`FAIL: JSON response missing required key: ${key}`);
@@ -121,7 +121,7 @@ for (const key of requiredJsonKeys) {
 }
 console.log('PASS: All required JSON keys present in main.c.');
 
-// 5. Check reed interrupt, MOS protection, device_type and metrics macro patterns
+// 5. Check reed interrupt, MOS protection, device_type, metrics and aht25 patterns
 const requiredCodePatterns = [
   "reed_isr_handler",
   "reed_task",
@@ -129,9 +129,15 @@ const requiredCodePatterns = [
   "gpio_isr_handler_add",
   "403 Forbidden",
   "METRICS_COUNT",
-  "HT_reed_8Xmos",
+  "HT_reed_AHT25_8Xmos",
   "FW_VERSION_MAJOR",
-  "fw-ver"
+  "fw-ver",
+  "aht25_init",
+  "aht25_read",
+  "aht_temp",
+  "aht_humi",
+  "v-aht-temp",
+  "v-aht-humi"
 ];
 for (const pattern of requiredCodePatterns) {
   if (!mainContent.includes(pattern)) {
