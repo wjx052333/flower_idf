@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "aht25.c"
         "ds18b20.c"
         "water_logic.c"
         "water_store.c"
