@@ -111,8 +111,8 @@ static char s_host_name[96];
 
 /* ── Firmware version ─────────────────────────────────────────────────────── */
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 1
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_MINOR 2
+#define FW_VERSION_PATCH 0
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
@@ -537,7 +537,7 @@ static void handle_mqtt_data(const char *data, int data_len)
 }
 
 /* ── Status metrics ──────────────────────────────────────────────────────── */
-#define METRICS_COUNT 6
+#define METRICS_COUNT 8
 
 static flower_metric_t s_metrics[METRICS_COUNT];
 
@@ -583,6 +583,14 @@ static void publish_status_report(void)
     float lux = bh1750_read_illuminance();
     if (lux >= 0)
         ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
+
+    float aht_temp = 0.0f, aht_humi = 0.0f;
+    esp_err_t aht_err = aht25_read(&aht_temp, &aht_humi);
+    if (aht_err == ESP_OK)
+        ESP_LOGI(TAG, "AHT25 temp=%.2f°C, humi=%.1f%%", aht_temp, aht_humi);
+    else
+        ESP_LOGW(TAG, "AHT25 read failed: %s", esp_err_to_name(aht_err));
+
     xSemaphoreGive(g_sensor_mutex);
 
     if (!s_mqtt_connected) return;
@@ -625,6 +633,14 @@ static void publish_status_report(void)
     s_metrics[5].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
     s_metrics[5].value.int64_value = (int64_t)mos_prev;
 
+    strcpy(s_metrics[6].key, "aht_temp");
+    s_metrics[6].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[6].value.double_value = (aht_err == ESP_OK) ? (double)aht_temp : 0.0;
+
+    strcpy(s_metrics[7].key, "aht_humi");
+    s_metrics[7].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
+    s_metrics[7].value.double_value = (aht_err == ESP_OK) ? (double)aht_humi : 0.0;
+
     s_prev_mos_state = mos_current;
 
     time_t now; time(&now);
@@ -635,7 +651,7 @@ static void publish_status_report(void)
     sr.version.major   = FW_VERSION_MAJOR;
     sr.version.minor   = FW_VERSION_MINOR;
     sr.version.patch   = FW_VERSION_PATCH;
-    strcpy(sr.device_type, "HT_reed_8Xmos");
+    strcpy(sr.device_type, "HT_reed_AHT25_8Xmos");
     sr.metrics.arg = s_metrics;
     sr.metrics.funcs.encode = encode_metrics;
 
@@ -648,9 +664,10 @@ static void publish_status_report(void)
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
 
-    ESP_LOGI(TAG, "Status published (humidity=%.1f%%, temp=%.2f°C, lux=%.1f, reed=%d, mos=0x%02lx, prev_mos=0x%02lx)",
+    ESP_LOGI(TAG, "Status published (humidity=%.1f%%, temp=%.2f°C, lux=%.1f, reed=%d, aht_temp=%.2f°C, aht_humi=%.1f%%, mos=0x%02lx, prev_mos=0x%02lx)",
              humidity, (double)(temp > -273.0f ? temp : 0), (double)(lux >= 0 ? lux : 0),
-             reed_closed, (unsigned long)mos_current, (unsigned long)mos_prev);
+             reed_closed, (double)(aht_err == ESP_OK ? aht_temp : 0), (double)(aht_err == ESP_OK ? aht_humi : 0),
+             (unsigned long)mos_current, (unsigned long)mos_prev);
 }
 
 /* ── Auto watering ───────────────────────────────────────────────────────── */
