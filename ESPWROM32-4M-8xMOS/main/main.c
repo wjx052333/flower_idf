@@ -119,6 +119,15 @@ static char s_host_name[96];
 
 #define TAG "Flower"
 
+/* ── Firmware version ─────────────────────────────────────────────────────── */
+#define FW_VERSION_MAJOR 1
+#define FW_VERSION_MINOR 1
+#define FW_VERSION_PATCH 1
+
+#define _STR(x) #x
+#define STR(x) _STR(x)
+#define FW_VERSION_STR STR(FW_VERSION_MAJOR) "." STR(FW_VERSION_MINOR) "." STR(FW_VERSION_PATCH)
+
 /* ── Device identity ─────────────────────────────────────────────────────── */
 static void device_identity_init(void)
 {
@@ -653,12 +662,15 @@ static void handle_mqtt_data(const char *data, int data_len)
 
 }
 
-static flower_metric_t s_metrics[5];
+/* ── Status metrics ──────────────────────────────────────────────────────── */
+#define METRICS_COUNT 6
+
+static flower_metric_t s_metrics[METRICS_COUNT];
 
 static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
 {
     flower_metric_t *metrics = (flower_metric_t *)(*arg);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < METRICS_COUNT; i++) {
         if (!pb_encode_tag_for_field(stream, field))
             return false;
         if (!pb_encode_submessage(stream, FLOWER_METRIC_FIELDS, &metrics[i]))
@@ -705,6 +717,19 @@ static void publish_status_report(void)
 
     if (!s_mqtt_connected) return;
 
+    /* Current and previous 8x MOS status bitmap */
+    uint32_t mos_current = 0;
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    for (int i = 0; i < NUM_RELAYS; i++) {
+        if (s_relays[i].on) {
+            mos_current |= (1U << i);
+        }
+    }
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+
+    static uint32_t s_prev_mos_state = 0;
+    uint32_t mos_prev = s_prev_mos_state;
+
     strcpy(s_metrics[0].key, "humidity");
     s_metrics[0].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
     s_metrics[0].value.double_value = humidity;
@@ -717,23 +742,30 @@ static void publish_status_report(void)
     s_metrics[2].which_value = FLOWER_METRIC_DOUBLE_VALUE_TAG;
     s_metrics[2].value.double_value = (double)(lux >= 0 ? lux : 0);
 
-    strcpy(s_metrics[3].key, "relayLastOnTs");
+    int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
+    strcpy(s_metrics[3].key, "reed");
     s_metrics[3].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
-    s_metrics[3].value.int64_value = s_relays[0].last_on_utc_s;
+    s_metrics[3].value.int64_value = reed_closed;
 
-    strcpy(s_metrics[4].key, "relayLastOnDur");
+    strcpy(s_metrics[4].key, "mosState");
     s_metrics[4].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
-    s_metrics[4].value.int64_value = (int64_t)s_relays[0].last_on_dur_ms;
+    s_metrics[4].value.int64_value = (int64_t)mos_current;
+
+    strcpy(s_metrics[5].key, "mosPrevState");
+    s_metrics[5].which_value = FLOWER_METRIC_INT64_VALUE_TAG;
+    s_metrics[5].value.int64_value = (int64_t)mos_prev;
+
+    s_prev_mos_state = mos_current;
 
     time_t now; time(&now);
 
     flower_status_report_t sr = FLOWER_STATUS_REPORT_INIT_ZERO;
     sr.timestamp       = (int64_t)now * 1000;
     sr.has_version     = true;
-    sr.version.major   = 1;
-    sr.version.minor   = 1;
-    sr.version.patch   = 1;
-    strcpy(sr.device_type, "C3V2_humi_temp_lux_relay");
+    sr.version.major   = FW_VERSION_MAJOR;
+    sr.version.minor   = FW_VERSION_MINOR;
+    sr.version.patch   = FW_VERSION_PATCH;
+    strcpy(sr.device_type, "HT_reed_8Xmos");
     sr.metrics.arg = s_metrics;
     sr.metrics.funcs.encode = encode_metrics;
 
@@ -746,8 +778,9 @@ static void publish_status_report(void)
     esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                             (const char *)buf, (int)stream.bytes_written, 1, 0);
 
-    ESP_LOGI(TAG, "Status published (humidity=%.1f%%, temp=%.2f°C, lux=%.1f)",
-             humidity, (double)(temp > -273.0f ? temp : 0), (double)(lux >= 0 ? lux : 0));
+    ESP_LOGI(TAG, "Status published (humidity=%.1f%%, temp=%.2f°C, lux=%.1f, reed=%d, mos=0x%02lx, prev_mos=0x%02lx)",
+             humidity, (double)(temp > -273.0f ? temp : 0), (double)(lux >= 0 ? lux : 0),
+             reed_closed, (unsigned long)mos_current, (unsigned long)mos_prev);
 }
 
 /* ── Auto watering ───────────────────────────────────────────────────────── */
@@ -926,7 +959,7 @@ static const char STATUS_HTML[] =
     "</style>\n"
     "</head>\n"
     "<body>\n"
-    "<h2>8路MOS输出控制面板</h2>\n"
+    "<h2>8路MOS输出控制面板<span id=\"fw-ver\" style=\"font-size:13px;color:#888;font-weight:normal;margin-left:8px\"></span></h2>\n"
     "<div class=\"grid\">\n"
     "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 1 [GPIO 19]</span><span class=\"badge off\" id=\"b-1\">关</span></div><div class=\"inf\" id=\"i-1\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-1\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(1,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(1,'off')\">关</button></div></div>\n"
     "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 2 [GPIO 18]</span><span class=\"badge off\" id=\"b-2\">关</span></div><div class=\"inf\" id=\"i-2\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-2\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(2,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(2,'off')\">关</button></div></div>\n"
@@ -1009,6 +1042,10 @@ static const char STATUS_HTML[] =
     "    const r=await fetch('/api/sensors');\n"
     "    if(!r.ok)throw new Error('HTTP '+r.status);\n"
     "    const d=await r.json();\n"
+    "    if(d.version){\n"
+    "      const vEl=document.getElementById('fw-ver');\n"
+    "      if(vEl)vEl.textContent='v'+d.version;\n"
+    "    }\n"
     "    const hv=d.humidity.toFixed(1),tv=d.temperature.toFixed(1),lv=d.lux.toFixed(0);\n"
     "    document.getElementById('v-humi').textContent=hv;\n"
     "    const rawEl=document.getElementById('v-raw');\n"
@@ -1143,10 +1180,11 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
 
-    char json[896];
+    char json[960];
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
+        "\"version\":\"" FW_VERSION_STR "\","
         "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
         "\"relays\":["

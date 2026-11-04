@@ -121,19 +121,23 @@ for (const key of requiredJsonKeys) {
 }
 console.log('PASS: All required JSON keys present in main.c.');
 
-// 5. Check reed interrupt and MOS protection patterns
+// 5. Check reed interrupt, MOS protection, device_type and metrics macro patterns
 const requiredCodePatterns = [
   "reed_isr_handler",
   "reed_task",
   "gpio_install_isr_service",
   "gpio_isr_handler_add",
-  "403 Forbidden"
+  "403 Forbidden",
+  "METRICS_COUNT",
+  "HT_reed_8Xmos",
+  "FW_VERSION_MAJOR",
+  "fw-ver"
 ];
 for (const pattern of requiredCodePatterns) {
   if (!mainContent.includes(pattern)) {
     throw new Error(`FAIL: main.c missing required pattern: ${pattern}`);
   }
 }
-console.log('PASS: All reed interrupt and MOS protection patterns present in main.c.');
+console.log('PASS: All required code and version patterns present in main.c.');
 
 console.log('ALL CHECKS PASSED!');
