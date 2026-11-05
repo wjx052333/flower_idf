@@ -111,7 +111,7 @@ static char s_host_name[96];
 
 /* ── Firmware version ─────────────────────────────────────────────────────── */
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 2
+#define FW_VERSION_MINOR 3
 #define FW_VERSION_PATCH 0
 
 #define _STR(x) #x
