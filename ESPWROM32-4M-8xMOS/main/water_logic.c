@@ -23,7 +23,7 @@
  * which is harmless here. No lock is used because this file must stay free of
  * RTOS dependencies so it can also be built for the host test binary. */
 static water_config_t s_cfg = {
-    .strategy           = WATER_STRATEGY_NOON,
+    .strategy           = WATER_STRATEGY_OFF,
     .surface_thresh_pct = DEF_SURFACE_THRESH_PCT,
     .surface_dur_s      = DEF_SURFACE_DUR_S,
     .deep_thresh_pct    = DEF_DEEP_THRESH_PCT,
@@ -42,7 +42,7 @@ water_config_t *water_config(void)
 
 void water_config_reset(void)
 {
-    s_cfg.strategy           = WATER_STRATEGY_NOON,
+    s_cfg.strategy           = WATER_STRATEGY_OFF;
     s_cfg.surface_thresh_pct = DEF_SURFACE_THRESH_PCT;
     s_cfg.surface_dur_s      = DEF_SURFACE_DUR_S;
     s_cfg.deep_thresh_pct    = DEF_DEEP_THRESH_PCT;

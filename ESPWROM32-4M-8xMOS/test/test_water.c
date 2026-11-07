@@ -49,7 +49,7 @@ static void test_defaults_and_json(void)
 {
     water_config_reset();
     water_config_t *c = water_config();
-    CHECK(c->strategy == WATER_STRATEGY_NOON, "default strategy %u", c->strategy);
+    CHECK(c->strategy == WATER_STRATEGY_OFF, "default strategy %u", c->strategy);
     CHECK(c->surface_thresh_pct == 50, "default surface thresh %u", c->surface_thresh_pct);
     CHECK(c->surface_dur_s == 60, "default surface dur %u", c->surface_dur_s);
     CHECK(c->deep_thresh_pct == 10, "default deep thresh %u", c->deep_thresh_pct);
@@ -60,7 +60,7 @@ static void test_defaults_and_json(void)
     char json[320];
     int n = water_config_to_json(json, sizeof(json));
     CHECK(n > 0 && n < (int)sizeof(json), "json length %d", n);
-    CHECK(strstr(json, "\"strategy\":0") != NULL, "json strategy: %s", json);
+    CHECK(strstr(json, "\"strategy\":3") != NULL, "json strategy: %s", json);
     CHECK(strstr(json, "\"strategy_name\":\"") != NULL, "json name: %s", json);
     CHECK(strstr(json, "\"surface_thresh_pct\":50") != NULL, "json s_thresh: %s", json);
     CHECK(strstr(json, "\"surface_dur_s\":60") != NULL, "json s_dur: %s", json);

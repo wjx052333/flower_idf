@@ -44,3 +44,6 @@ python mock_device.py [--port 8080] [--device-id mock001] [--no-discovery]
 - 箱门状态由调试页直接设置，没有 50 ms 去抖；只对"闭合→断开"计数（对应固件的上升沿中断）。
 - 板载 LED、ADC、I2C、NVS、OTA、MQTT 均未模拟。
 - 浇水时间判断用本机时间换算到 UTC+8。
+
+## 关闭自动浇花策略
+/api/water/config?strategy=3

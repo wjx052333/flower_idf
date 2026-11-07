@@ -65,7 +65,7 @@ DEF_RAW_DRY, DEF_RAW_WET = 3110, 958
 STRATEGY_NAMES = ["中午12点", "浇表面", "干了再浇透", "关闭"]
 WATER_STRATEGY_NOON, WATER_STRATEGY_SURFACE, WATER_STRATEGY_DEEP, WATER_STRATEGY_OFF = range(4)
 DEFAULT_WATER_CFG = {
-    "strategy": WATER_STRATEGY_NOON,
+    "strategy": WATER_STRATEGY_OFF,
     "surface_thresh_pct": 50, "surface_dur_s": 60,
     "deep_thresh_pct": 10, "deep_dur_s": 1200,
     "raw_dry": DEF_RAW_DRY, "raw_wet": DEF_RAW_WET,
