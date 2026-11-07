@@ -17,11 +17,27 @@ python mock_device.py [--port 8080] [--device-id mock001] [--no-discovery]
 - 设备真实端口是 80，模拟器默认 8080（避免要管理员权限）。
 - 发现包会在局域网广播，App 会把模拟器当成一台真设备；不需要时加 `--no-discovery`。同机多开时只让一个实例开发现，其余加 `--no-discovery`。
 
+## 命令行注入调试数据
+
+`debug_inject.py` 调用模拟器的 `/debug/api/*`，需先启动 `mock_device.py`：
+
+```
+python debug_inject.py soil --pct 35      # 按湿度百分比注入（读取当前标定 raw_dry/raw_wet 换算成 AD）
+python debug_inject.py soil --raw 2500    # 直接注入 ADC 原始值 0-4095
+python debug_inject.py reed open          # 开门（干簧管断开），会打印触发/脉冲计数
+python debug_inject.py reed close         # 关门（干簧管闭合）
+```
+
+- 默认连 `http://127.0.0.1:8080`，模拟器换端口时加 `--url http://127.0.0.1:<端口>`（放在子命令前）。
+- 注入值和调试页一样会写入 `mock_state.json` 并保持。
+- 参数越界、连不上模拟器、模拟器返回 400 时打印原因并以非 0 退出。
+
 ## 文件
 
 - `mock_device.py`：全部逻辑（设备状态、HTTP、UDP 发现、定时任务）
 - `debug.html`：调试页，启动时读入；`/debug/api/*` 是模拟器专用接口，固件里不存在
-- `mock_state.json`：运行时生成，保存注入的传感器值和浇水配置（相当于 NVS），重启保留；删除即恢复默认
+- `debug_inject.py`：命令行注入土壤湿度、开关箱门（见上）
+- `mock_state.json`：运行时生成，保存注入的传感器值和浇水配置（相当于 NVS），重启保留；删除即恢复默认。已在 `.gitignore` 中，不要提交
 
 ## 与固件代码的关系
 
@@ -45,5 +61,8 @@ python mock_device.py [--port 8080] [--device-id mock001] [--no-discovery]
 - 板载 LED、ADC、I2C、NVS、OTA、MQTT 均未模拟。
 - 浇水时间判断用本机时间换算到 UTC+8。
 
-## 关闭自动浇花策略
-/api/water/config?strategy=3
+## 自动浇花策略
+
+固件和模拟器的默认策略都是 3（关闭，`WATER_STRATEGY_OFF`，见 `water_logic.c` 的 `s_cfg` / `water_config_reset()`）。
+- 已有 `mock_state.json` 或真机 NVS 里存过的策略会覆盖默认值；要关闭时请求 `/api/water/config?strategy=3`，或删除 `mock_state.json`。
+- 改默认策略时同时改 `water_logic.c`、`test/test_water.c` 的默认值断言、`mock_device.py` 的 `DEFAULT_WATER_CFG`。
