@@ -112,7 +112,7 @@ static char s_host_name[96];
 /* ── Firmware version ─────────────────────────────────────────────────────── */
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 0
+#define FW_VERSION_PATCH 1
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
@@ -182,7 +182,9 @@ static void relay_set_unlocked(int ch, bool on, uint32_t duration_ms)
     if (ch == 1 && on) {
         if (gpio_get_level(REED_PIN) != 0) {
             ESP_LOGW(TAG, "Reed switch open: rejected turning on MOS 2, triggering MOS 3 for 1s");
-            relay_set_unlocked(2, true, 1000);
+            if (!s_relays[2].on) {
+                relay_set_unlocked(2, true, 1000);
+            }
             return;
         }
     }
@@ -224,10 +226,15 @@ void relay_toggle(int ch)
 
 /* ── Reed switch interrupt & event task ─────────────────────────────────── */
 static TaskHandle_t s_reed_task_handle = NULL;
+static volatile uint32_t s_reed_isr_count = 0;
+static volatile uint32_t s_reed_open_count = 0;
+static volatile int64_t  s_reed_last_open_ts = 0;
+static volatile bool     s_reed_is_open = false;
 
 static void IRAM_ATTR reed_isr_handler(void *arg)
 {
     (void)arg;
+    s_reed_isr_count++;
     BaseType_t high_task_wakeup = pdFALSE;
     if (s_reed_task_handle != NULL) {
         vTaskNotifyGiveFromISR(s_reed_task_handle, &high_task_wakeup);
@@ -241,22 +248,39 @@ static void reed_task(void *arg)
     int64_t last_trigger_us = 0;
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        /* Debounce delay: 30 ms */
-        vTaskDelay(pdMS_TO_TICKS(30));
+        /* Drain any notifications queued during debouncing / task processing */
+        ulTaskNotifyTake(pdTRUE, 0);
 
-        /* Verify that REED_PIN is still open (level == 1) */
-        if (gpio_get_level(REED_PIN) == 0) {
-            continue; /* False trigger / bounce */
+        /* Debounce delay: 50 ms */
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        int level = gpio_get_level(REED_PIN);
+        if (level == 0) {
+            /* Switch is physically closed (level 0) */
+            s_reed_is_open = false;
+            continue;
         }
 
-        /* Cooldown: ignore triggers within 200 ms */
+        /* level != 0: switch is physically open (level 1) */
+        if (s_reed_is_open) {
+            /* Already handled open state; ignore noise or duplicate edge */
+            continue;
+        }
+        s_reed_is_open = true;
+
+        /* Cooldown: ignore triggers within 1.5 s */
         int64_t now_us = esp_timer_get_time();
-        if ((now_us - last_trigger_us) < 200000LL) {
+        if ((now_us - last_trigger_us) < 1500000LL) {
             continue;
         }
         last_trigger_us = now_us;
 
-        ESP_LOGI(TAG, "Reed switch opened (closed->open transition detected)");
+        s_reed_open_count++;
+        time_t _now; time(&_now);
+        s_reed_last_open_ts = (int64_t)_now;
+
+        ESP_LOGI(TAG, "Reed switch opened (closed->open transition detected, count=%lu)",
+                 (unsigned long)s_reed_open_count);
 
         if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
         /* If MOS 2 is currently ON, turn it OFF immediately */
@@ -264,8 +288,10 @@ static void reed_task(void *arg)
             ESP_LOGW(TAG, "Reed opened while MOS 2 was ON: forcing MOS 2 OFF immediately");
             relay_set_unlocked(1, false, 0);
         }
-        /* Trigger MOS 3 for 1 second */
-        relay_set_unlocked(2, true, 1000);
+        /* Trigger MOS 3 for 1 second only if not already ON */
+        if (!s_relays[2].on) {
+            relay_set_unlocked(2, true, 1000);
+        }
         if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
     }
 }
@@ -876,7 +902,7 @@ static const char STATUS_HTML[] =
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%) <span id=\"v-raw\">(AD: --)</span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14]</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14] <span id=\"v-reed-info\"></span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-humi\">--</div><div class=\"lbl\">AHT25湿度 (%)</div></div>\n"
     "</div>\n"
@@ -946,6 +972,8 @@ static const char STATUS_HTML[] =
     "    document.getElementById('v-lux').textContent=lv;\n"
     "    const rEl=document.getElementById('v-reed');\n"
     "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
+    "    const riEl=document.getElementById('v-reed-info');\n"
+    "    if(riEl&&d.reed_open_cnt!==undefined){riEl.textContent=`(${d.reed_open_cnt}触发/${d.reed_isr_cnt}脉冲)`;}\n"
     "    const atEl=document.getElementById('v-aht-temp');\n"
     "    if(atEl&&d.aht_temp!==undefined){atEl.textContent=d.aht_temp>-40?d.aht_temp.toFixed(1):'ERR';}\n"
     "    const ahEl=document.getElementById('v-aht-humi');\n"
@@ -1072,12 +1100,13 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
 
     int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
 
-    char json[1024];
+    static char json[1280];
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
         "\"version\":\"" FW_VERSION_STR "\","
         "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
+        "\"reed_isr_cnt\":%lu,\"reed_open_cnt\":%lu,\"reed_last_ts\":%lld,"
         "\"aht_temp\":%.2f,\"aht_humi\":%.1f,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
         "\"relays\":["
@@ -1095,6 +1124,9 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         (double)(temp > -273.0f ? temp : -273.0f),
         (double)(lux >= 0.0f ? lux : -1.0f),
         reed_closed,
+        (unsigned long)s_reed_isr_count,
+        (unsigned long)s_reed_open_count,
+        (long long)s_reed_last_open_ts,
         (double)(aht_err == ESP_OK ? aht_temp : -99.0f),
         (double)(aht_err == ESP_OK ? aht_humi : -99.0f),
         (long long)s_relays[0].last_on_utc_s,
@@ -1156,7 +1188,11 @@ static esp_err_t handle_change_relay_ch(httpd_req_t *req, int ch)
     } else {
         if (ch == 1 && gpio_get_level(REED_PIN) != 0) {
             ESP_LOGW(TAG, "HTTP request to open MOS 2 rejected: reed switch is open");
-            relay_set(2, true, 1000);
+            if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+            if (!s_relays[2].on) {
+                relay_set_unlocked(2, true, 1000);
+            }
+            if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
             httpd_resp_set_status(req, "403 Forbidden");
             httpd_resp_set_type(req, "text/plain; charset=utf-8");
             httpd_resp_sendstr(req, "干簧管处于断开状态，拒绝开启MOS 2（已触发MOS 3闭合1秒）");
@@ -1319,6 +1355,11 @@ static void app_timer_cb(void *arg)
         relay_toggle(0);
     s_last_btn = btn;
 
+    /* Sync reed state when physically closed */
+    if (gpio_get_level(REED_PIN) == 0 && s_reed_is_open) {
+        s_reed_is_open = false;
+    }
+
     /* Relays auto-off */
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
     int64_t now_us = esp_timer_get_time();
@@ -1448,6 +1489,9 @@ void app_main(void)
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.intr_type    = GPIO_INTR_POSEDGE;
     ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    /* Initialize reed state from current pin reading */
+    s_reed_is_open = (gpio_get_level(REED_PIN) != 0);
 
     /* Create reed switch background task */
     xTaskCreate(reed_task, "reed_task", 2048, NULL, 5, &s_reed_task_handle);

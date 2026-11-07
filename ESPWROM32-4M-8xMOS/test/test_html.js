@@ -113,7 +113,7 @@ scripts.forEach((s, idx) => {
 });
 
 // 4. Check JSON keys in handle_api_sensors
-const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity", "aht_temp", "aht_humi"];
+const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity", "aht_temp", "aht_humi", "reed_isr_cnt", "reed_open_cnt", "reed_last_ts"];
 for (const key of requiredJsonKeys) {
   if (!mainContent.includes(`"${key}"`) && !mainContent.includes(`\\"${key}\\"`)) {
     throw new Error(`FAIL: JSON response missing required key: ${key}`);
@@ -137,7 +137,8 @@ const requiredCodePatterns = [
   "aht_temp",
   "aht_humi",
   "v-aht-temp",
-  "v-aht-humi"
+  "v-aht-humi",
+  "v-reed-info"
 ];
 for (const pattern of requiredCodePatterns) {
   if (!mainContent.includes(pattern)) {
