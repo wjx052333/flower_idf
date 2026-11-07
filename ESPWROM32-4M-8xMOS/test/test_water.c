@@ -97,7 +97,7 @@ static void test_query_apply(void)
     CHECK(water_config_apply_query("", err, sizeof(err)), "empty query rejected");
 
     /* Out-of-range and malformed values are rejected */
-    CHECK(!water_config_apply_query("strategy=3", err, sizeof(err)), "strategy=3 accepted");
+    CHECK(!water_config_apply_query("strategy=4", err, sizeof(err)), "strategy=4 accepted");
     CHECK(!water_config_apply_query("surface_thresh_pct=101", err, sizeof(err)), "101%% accepted");
     CHECK(!water_config_apply_query("deep_dur_s=0", err, sizeof(err)), "0 s accepted");
     CHECK(!water_config_apply_query("nonsense=1", err, sizeof(err)), "unknown key accepted");
@@ -294,6 +294,34 @@ static void test_strategy_names(void)
     CHECK(strcmp(water_strategy_name(WATER_STRATEGY_NOON), "中午12点") == 0, "noon name");
     CHECK(strcmp(water_strategy_name(WATER_STRATEGY_SURFACE), "浇表面") == 0, "surface name");
     CHECK(strcmp(water_strategy_name(WATER_STRATEGY_DEEP), "干了再浇透") == 0, "deep name");
+    CHECK(strcmp(water_strategy_name(WATER_STRATEGY_OFF), "关闭") == 0, "off name");
+}
+
+static void test_off_strategy(void)
+{
+    char err[64];
+
+    /* strategy=3 is accepted and reported back */
+    water_config_reset();
+    CHECK(water_config_apply_query("strategy=3", err, sizeof(err)),
+          "strategy=3 rejected: %s", err);
+    CHECK(water_config()->strategy == WATER_STRATEGY_OFF, "strategy %u",
+          water_config()->strategy);
+    char json[320];
+    water_config_to_json(json, sizeof(json));
+    CHECK(strstr(json, "\"strategy\":3") != NULL, "json strategy: %s", json);
+
+    /* Never waters: not at noon, not inside the window with bone-dry soil,
+     * not even after the cooldown */
+    reset_all(WATER_STRATEGY_OFF);
+    CHECK(!water_strategy_eval(lt(2026, 6, 28, 12, 0), 0.0f).water, "OFF watered at noon");
+    CHECK(!water_strategy_eval(lt(2026, 6, 28, 10, 0), 0.0f).water, "OFF watered dry soil");
+    CHECK(!water_strategy_eval(lt(2026, 6, 28, 15, 0), 0.0f).water, "OFF watered later");
+
+    /* Switching back to SURFACE works straight away: OFF consumed no cooldown */
+    water_config()->strategy = WATER_STRATEGY_SURFACE;
+    CHECK(water_strategy_eval(lt(2026, 6, 28, 15, 1), 10.0f).water,
+          "SURFACE did not water after OFF");
 }
 
 static void test_humidity_validity(void)
@@ -348,6 +376,7 @@ int main(void)
     test_threshold_and_duration();
     test_cooldown();
     test_strategy_names();
+    test_off_strategy();
     test_humidity_validity();
 
     if (s_failures == 0) {

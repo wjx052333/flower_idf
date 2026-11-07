@@ -38,6 +38,7 @@ typedef enum {
     WATER_STRATEGY_NOON    = 0,  /* 12:00 ladder watering, fixed parameters */
     WATER_STRATEGY_SURFACE = 1,  /* humidity < thresh → short fixed duration */
     WATER_STRATEGY_DEEP    = 2,  /* humidity < thresh → long fixed duration */
+    WATER_STRATEGY_OFF     = 3,  /* never water automatically (demos) */
     WATER_STRATEGY_COUNT
 } water_strategy_t;
 

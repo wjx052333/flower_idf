@@ -113,7 +113,9 @@ scripts.forEach((s, idx) => {
 });
 
 // 4. Check JSON keys in handle_api_sensors
-const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity", "aht_temp", "aht_humi", "reed_isr_cnt", "reed_open_cnt", "reed_last_ts"];
+const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "humidity", "aht_temp", "aht_humi", "reed_isr_cnt", "reed_open_cnt", "reed_last_ts",
+  "soil_moisture", "soil_temp", "air_temp", "air_humi", "door_closed", "uvb_cut_by_door_ts", "uvb_cut_lit_ms", "heater_lock", "remaining_ms",
+  "requested_ms", "actual_ms", "clamped", "reason", "door_open", "over_temp", "soil_c", "air_c"];
 for (const key of requiredJsonKeys) {
   if (!mainContent.includes(`"${key}"`) && !mainContent.includes(`\\"${key}\\"`)) {
     throw new Error(`FAIL: JSON response missing required key: ${key}`);
@@ -138,7 +140,18 @@ const requiredCodePatterns = [
   "aht_humi",
   "v-aht-temp",
   "v-aht-humi",
-  "v-reed-info"
+  "v-reed-info",
+  "RELAY_MAX_MS",
+  "SAFETY CLAMP",
+  "SAFETY CUT",
+  "REFUSE_OVER_TEMP",
+  "REFUSE_DOOR_OPEN",
+  "strtoul",
+  "sensor_task",
+  "uvb_door_cut_unlocked",
+  "gpio_set_level(MOS2_PIN, 0)",
+  "application/json; charset=utf-8",
+  "data-s=\\\"3\\\""
 ];
 for (const pattern of requiredCodePatterns) {
   if (!mainContent.includes(pattern)) {

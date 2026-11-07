@@ -57,6 +57,7 @@ const char *water_strategy_name(uint8_t strategy)
     case WATER_STRATEGY_NOON:    return "中午12点";
     case WATER_STRATEGY_SURFACE: return "浇表面";
     case WATER_STRATEGY_DEEP:    return "干了再浇透";
+    case WATER_STRATEGY_OFF:     return "关闭";
     default:                     return "未知";
     }
 }
@@ -252,6 +253,9 @@ water_decision_t water_strategy_eval(time_t now, float humidity)
 
     if ((int64_t)now < WATER_TIME_VALID_MIN)
         return d;   /* clock not synced yet */
+
+    if (s_cfg.strategy == WATER_STRATEGY_OFF)
+        return d;
 
     struct tm t = {0};
     localtime_r(&now, &t);

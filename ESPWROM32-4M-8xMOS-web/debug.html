@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>模拟器调试 - 传感器注入</title>
+<style>
+body{font-family:sans-serif;margin:0;padding:16px;background:#111;color:#eee}
+h2{margin:0 0 10px;font-size:18px}
+h3{margin:0 0 8px;font-size:14px;color:#ccc}
+a{color:#4fc3f7}
+.box{margin-bottom:14px;padding:10px;background:#1e1e1e;border-radius:6px}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;font-size:13px;color:#aaa}
+.row .nm{width:150px;color:#ddd}
+input[type=number]{width:90px;padding:6px;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;text-align:center}
+button{padding:6px 12px;background:#2e7d32;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+button.red{background:#c62828}
+button.gray{background:#424242}
+.cur{font-size:12px;color:#81c784}
+.bad{color:#e57373}
+#msg{font-size:12px;color:#888;margin-left:8px}
+.relays{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.relay{padding:6px 8px;background:#2a2a2a;border-radius:4px;font-size:12px}
+.relay.on{background:#2e7d32}
+pre{font-size:11px;color:#aaa;white-space:pre-wrap;word-break:break-all;margin:0}
+</style>
+</head>
+<body>
+<h2>模拟器调试页 <span style="font-size:13px;font-weight:normal"><a href="/">← 设备控制面板</a></span></h2>
+
+<div class="box">
+<h3>传感器注入（注入后一直保持，重启模拟器也保留）</h3>
+<div class="row"><span class="nm">土壤湿度 ADC [IO34]</span>
+  <input type="number" id="raw_low" min="0" max="4095" step="1"> AD
+  &nbsp;或按湿度 <input type="number" id="hum_pct" min="0" max="100" step="0.1"> %
+  <button class="gray" onclick="pctToRaw()">换算成 AD</button>
+  <span class="cur" id="c-raw"></span></div>
+<div class="row"><span class="nm">DS18B20 土温</span>
+  <input type="number" id="soil_c" step="0.1"> °C
+  <label><input type="checkbox" id="soil_fail"> 读取失败</label>
+  <span class="cur" id="c-soil"></span></div>
+<div class="row"><span class="nm">BH1750 照度</span>
+  <input type="number" id="lux" min="0" step="1"> lx
+  <label><input type="checkbox" id="lux_fail"> 读取失败</label>
+  <span class="cur" id="c-lux"></span></div>
+<div class="row"><span class="nm">AHT25 箱温 / 湿度</span>
+  <input type="number" id="air_c" step="0.1"> °C
+  <input type="number" id="air_humi" min="0" max="100" step="0.1"> %
+  <label><input type="checkbox" id="aht_fail"> 读取失败</label>
+  <span class="cur" id="c-aht"></span></div>
+<div class="row"><button onclick="injectAll()">注入以上数值</button>
+  <button class="gray" onclick="loadForm()">恢复为当前值</button><span id="msg"></span></div>
+<div class="row" style="font-size:11px;color:#666">加热垫温控锁：土温 &gt; 32°C 或 箱温 &gt; 35°C 拒绝开启并自动关闭；两个温度都读不到也拒绝。</div>
+</div>
+
+<div class="box">
+<h3>箱门（干簧管 IO14）与板载按键</h3>
+<div class="row">当前：<b id="door">--</b>
+  <button onclick="inject({door_closed:true})">关门</button>
+  <button class="red" onclick="inject({door_closed:false})">开门</button>
+  <button class="gray" onclick="press()">按下 BOOT 键（切换 MOS1）</button></div>
+<div class="row" style="font-size:11px;color:#666">开门：脉冲计数 +1，1.5 秒内重复开门不再计入触发次数；UVB 正亮时立即断电并闪爆闪灯 1 秒。门开着时开 UVB 会被拒绝。</div>
+</div>
+
+<div class="box">
+<h3>MOS 状态</h3>
+<div class="relays" id="relays"></div>
+</div>
+
+<div class="box">
+<h3>/api/sensors</h3>
+<pre id="raw"></pre>
+</div>
+
+<script>
+let ST=null;
+const $=id=>document.getElementById(id);
+function show(t,bad){const m=$('msg');m.textContent=t;m.className=bad?'bad':'';}
+async function api(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
+async function inject(obj){
+  try{ST=await api('/debug/api/inject',obj);show('已注入 '+new Date().toLocaleTimeString());showCur();poll();}
+  catch(e){show('注入失败：'+e.message,true);}
+}
+async function press(){try{await api('/debug/api/button');poll();}catch(e){show('失败：'+e.message,true);}}
+function num(id){const v=$(id).value;if(v===''||isNaN(Number(v)))throw new Error(id+' 不是数字');return Number(v);}
+function injectAll(){
+  try{
+    inject({
+      raw_low:Math.round(num('raw_low')),
+      soil_c:num('soil_c'),soil_ok:!$('soil_fail').checked,
+      lux:num('lux'),lux_ok:!$('lux_fail').checked,
+      air_c:num('air_c'),air_humi:num('air_humi'),aht_ok:!$('aht_fail').checked,
+    });
+  }catch(e){show(e.message,true);}
+}
+function pctToRaw(){
+  if(!ST)return;
+  try{
+    const p=Math.max(0,Math.min(100,num('hum_pct')));
+    $('raw_low').value=Math.round(ST.raw_dry-p*(ST.raw_dry-ST.raw_wet)/100);
+  }catch(e){show(e.message,true);}
+}
+function showCur(){
+  const s=ST.sensors;
+  $('c-raw').textContent=`当前 AD ${s.raw_low} → ${ST.humidity}%（标定 干${ST.raw_dry}/湿${ST.raw_wet}）`;
+  $('c-soil').textContent='当前 '+(s.soil_ok?s.soil_c+' °C':'读取失败');
+  $('c-lux').textContent='当前 '+(s.lux_ok?s.lux+' lx':'读取失败');
+  $('c-aht').textContent='当前 '+(s.aht_ok?`${s.air_c} °C / ${s.air_humi} %`:'读取失败');
+  const d=$('door');d.textContent=s.door_closed?'闭合（门关）':'断开（门开）';
+  d.style.color=s.door_closed?'#81c784':'#e57373';
+}
+async function loadForm(){
+  ST=await (await fetch('/debug/api/state')).json();
+  const s=ST.sensors;
+  $('raw_low').value=s.raw_low;$('hum_pct').value=ST.humidity;
+  $('soil_c').value=s.soil_c;$('soil_fail').checked=!s.soil_ok;
+  $('lux').value=s.lux;$('lux_fail').checked=!s.lux_ok;
+  $('air_c').value=s.air_c;$('air_humi').value=s.air_humi;$('aht_fail').checked=!s.aht_ok;
+  showCur();show('');
+}
+async function poll(){
+  try{
+    const d=await (await fetch('/api/sensors')).json();
+    $('raw').textContent=JSON.stringify(d,null,1);
+    $('relays').innerHTML=d.relays.map(r=>`<div class="relay ${r.state?'on':''}">MOS${r.ch} ${r.device}<br>`+
+      (r.state?`开 剩余 ${(r.remaining_ms/1000).toFixed(1)}s`:'关')+
+      (r.device==='heater'&&d.heater_lock?' <span class="bad">[温控锁]</span>':'')+`</div>`).join('');
+  }catch(e){$('raw').textContent='错误：'+e.message;}
+}
+loadForm();poll();setInterval(poll,1000);
+</script>
+</body>
+</html>

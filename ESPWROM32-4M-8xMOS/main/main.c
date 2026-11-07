@@ -18,6 +18,9 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
@@ -83,14 +86,46 @@ static char s_host_name[96];
 
 /* ── Hardware (ESP32-WROOM-32E + 8x MOS) ─────────────────────────────────── */
 #define NUM_RELAYS            8
-#define MOS1_PIN              19
-#define MOS2_PIN              18
-#define MOS3_PIN              17
-#define MOS4_PIN              16
-#define MOS5_PIN              33
-#define MOS6_PIN              25
-#define MOS7_PIN              26
-#define MOS8_PIN              27
+#define MOS1_PIN              19  /* 蠕动泵 */
+#define MOS2_PIN              18  /* 4W UVB 紫外灯（门磁互锁） */
+#define MOS3_PIN              17  /* 爆闪灯（兼作拦截报警） */
+#define MOS4_PIN              16  /* 爬宠加热垫（温控锁） */
+#define MOS5_PIN              33  /* 风扇 */
+#define MOS6_PIN              25  /* 喷雾（暂不用） */
+#define MOS7_PIN              26  /* 备用 */
+#define MOS8_PIN              27  /* 备用 */
+
+#define CH_PUMP               0
+#define CH_UVB                1
+#define CH_STROBE             2
+#define CH_HEATER             3
+
+/* 单次最长运行时间（毫秒），所有开启路径都在 relay_set_unlocked() 里统一裁剪 */
+static const uint32_t RELAY_MAX_MS[NUM_RELAYS] = {
+    180000,   /* MOS1 蠕动泵 */
+    180000,   /* MOS2 UVB */
+    30000,    /* MOS3 爆闪灯 */
+    3600000,  /* MOS4 加热垫 */
+    3600000,  /* MOS5 风扇 */
+    60000,    /* MOS6 喷雾 */
+    60000,    /* MOS7 备用 */
+    60000,    /* MOS8 备用 */
+};
+#define HEATER_SOIL_MAX_C  32.0f   /* DS18B20 土温 */
+#define HEATER_AIR_MAX_C   35.0f   /* AHT25 箱温 */
+
+/* Device keys for JSON, plus the Chinese name / verb used in receipt messages */
+static const char *const RELAY_DEVICE[NUM_RELAYS] = {
+    "pump", "uvb", "strobe", "heater", "fan", "mist", "spare7", "spare8",
+};
+static const char *const RELAY_NAME_CN[NUM_RELAYS] = {
+    "水泵", "紫外灯", "爆闪灯", "加热垫", "风扇", "喷雾", "7号备用通道", "8号备用通道",
+};
+static const char *const RELAY_VERB_CN[NUM_RELAYS] = {
+    "抽", "照", "闪", "开", "吹", "喷", "开", "开",
+};
+
+#define STROBE_ALARM_MS       1000
 
 /* Relay 1 is MOS1 (also default for auto watering / board button) */
 #define RELAY_PIN             MOS1_PIN
@@ -111,8 +146,8 @@ static char s_host_name[96];
 
 /* ── Firmware version ─────────────────────────────────────────────────────── */
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_MINOR 4
+#define FW_VERSION_PATCH 0
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
@@ -161,6 +196,13 @@ typedef struct {
     uint32_t         last_on_dur_ms;
 } relay_channel_t;
 
+typedef enum {
+    REFUSE_NONE = 0,
+    REFUSE_DOOR_OPEN,    /* MOS2 UVB: door open */
+    REFUSE_OVER_TEMP,    /* MOS4 heater: soil or air over its limit */
+    REFUSE_NO_TEMP,      /* MOS4 heater: neither temperature readable */
+} relay_refuse_t;
+
 static SemaphoreHandle_t s_relay_mutex = NULL;
 
 static relay_channel_t s_relays[NUM_RELAYS] = {
@@ -174,22 +216,92 @@ static relay_channel_t s_relays[NUM_RELAYS] = {
     { .relay_gpio = MOS8_PIN, .on = false, .duration_ms = RELAY_DEFAULT_DURATION_MS },
 };
 
-static void relay_set_unlocked(int ch, bool on, uint32_t duration_ms)
-{
-    if (ch < 0 || ch >= NUM_RELAYS) return;
+static uint32_t s_last_requested_ms[NUM_RELAYS];  /* 给回执用 */
 
-    /* Interlock: if reed switch is open (level != 0), forbid turning on MOS 2 and trigger MOS 3 for 1s */
-    if (ch == 1 && on) {
-        if (gpio_get_level(REED_PIN) != 0) {
-            ESP_LOGW(TAG, "Reed switch open: rejected turning on MOS 2, triggering MOS 3 for 1s");
-            if (!s_relays[2].on) {
-                relay_set_unlocked(2, true, 1000);
-            }
-            return;
-        }
-    }
+/* ── Sensor cache ────────────────────────────────────────────────────────── */
+/* Written by sensor_task every SENSOR_TASK_PERIOD_MS; everything else (HTTP,
+ * MQTT status, auto watering, heater lock) reads this copy instead of touching
+ * the bus, so /api/sensors never waits for the 750 ms DS18B20 conversion. */
+#define SENSOR_TASK_PERIOD_MS 2000
+
+typedef struct {
+    bool  valid;        /* at least one sample taken */
+    int   raw_low;      /* ADC counts, GPIO34 */
+    float humidity;     /* calibrated ADC soil moisture, % */
+    float soil_c;       /* DS18B20, -273 = read failed */
+    float lux;          /* BH1750, -1 = read failed */
+    bool  aht_ok;
+    float air_c;        /* AHT25, only meaningful when aht_ok */
+    float air_humi;
+} sensor_cache_t;
+
+static portMUX_TYPE   s_cache_lock = portMUX_INITIALIZER_UNLOCKED;
+static sensor_cache_t s_cache = { .soil_c = -273.0f, .lux = -1.0f };
+static volatile bool  s_heater_lock = true;   /* heater would be refused right now */
+
+static sensor_cache_t sensor_cache_get(void)
+{
+    taskENTER_CRITICAL(&s_cache_lock);
+    sensor_cache_t c = s_cache;
+    taskEXIT_CRITICAL(&s_cache_lock);
+    return c;
+}
+
+static bool soil_temp_valid(const sensor_cache_t *c)
+{
+    return c->soil_c > -273.0f;
+}
+
+/* Heater lock: any readable temperature over its limit refuses, and so does
+ * having no readable temperature at all (宁可不加热). */
+static relay_refuse_t heater_check(const sensor_cache_t *c)
+{
+    if ((soil_temp_valid(c) && c->soil_c > HEATER_SOIL_MAX_C) ||
+        (c->aht_ok && c->air_c > HEATER_AIR_MAX_C))
+        return REFUSE_OVER_TEMP;
+    if (!soil_temp_valid(c) && !c->aht_ok)
+        return REFUSE_NO_TEMP;
+    return REFUSE_NONE;
+}
+
+/* ── Relays ──────────────────────────────────────────────────────────────── */
+static void strobe_alarm_unlocked(void);
+
+/* Every way of switching a channel (HTTP, button, MQTT, auto watering, alarm
+ * flash) ends up here, so the safety rules live here too. Returns whether the
+ * channel was actually switched; on refusal *why (if given) says why. */
+static bool relay_set_unlocked(int ch, bool on, uint32_t duration_ms, relay_refuse_t *why)
+{
+    if (why) *why = REFUSE_NONE;
+    if (ch < 0 || ch >= NUM_RELAYS) return false;
 
     if (on) {
+        /* Interlock: the UVB may only light with the door closed */
+        if (ch == CH_UVB && gpio_get_level(REED_PIN) != 0) {
+            ESP_LOGW(TAG, "[SAFETY LOCK] door open: refused MOS2 (UVB)");
+            if (why) *why = REFUSE_DOOR_OPEN;
+            strobe_alarm_unlocked();
+            return false;
+        }
+        if (ch == CH_HEATER) {
+            sensor_cache_t c = sensor_cache_get();
+            relay_refuse_t r = heater_check(&c);
+            if (r != REFUSE_NONE) {
+                ESP_LOGW(TAG, "[SAFETY LOCK] heater refused (%s): soil=%.2f air=%.2f",
+                         r == REFUSE_OVER_TEMP ? "over temp" : "no temp",
+                         (double)c.soil_c, (double)(c.aht_ok ? c.air_c : -99.0f));
+                if (why) *why = r;
+                return false;
+            }
+        }
+
+        s_last_requested_ms[ch] = duration_ms;
+        if (duration_ms == 0 || duration_ms > RELAY_MAX_MS[ch]) {
+            ESP_LOGW(TAG, "[SAFETY CLAMP] MOS%d requested %lu ms -> %lu ms",
+                     ch + 1, (unsigned long)duration_ms, (unsigned long)RELAY_MAX_MS[ch]);
+            duration_ms = RELAY_MAX_MS[ch];
+        }
+
         s_relays[ch].on_us = esp_timer_get_time();
         s_relays[ch].duration_ms = duration_ms;
         time_t _now; time(&_now);
@@ -198,22 +310,31 @@ static void relay_set_unlocked(int ch, bool on, uint32_t duration_ms)
     }
     s_relays[ch].on = on;
     gpio_set_level(s_relays[ch].relay_gpio, on ? 1 : 0);
+    return true;
 }
 
-void relay_set(int ch, bool on, uint32_t duration_ms)
+/* Flash the strobe for 1 s — only when the interlock really stopped something */
+static void strobe_alarm_unlocked(void)
+{
+    if (!s_relays[CH_STROBE].on)
+        relay_set_unlocked(CH_STROBE, true, STROBE_ALARM_MS, NULL);
+}
+
+bool relay_set(int ch, bool on, uint32_t duration_ms)
 {
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
-    relay_set_unlocked(ch, on, duration_ms);
+    bool ok = relay_set_unlocked(ch, on, duration_ms, NULL);
     if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+    return ok;
 }
 
 static void relay_toggle_unlocked(int ch)
 {
     if (ch < 0 || ch >= NUM_RELAYS) return;
     if (s_relays[ch].on) {
-        relay_set_unlocked(ch, false, 0);
+        relay_set_unlocked(ch, false, 0, NULL);
     } else {
-        relay_set_unlocked(ch, true, s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS);
+        relay_set_unlocked(ch, true, s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS, NULL);
     }
 }
 
@@ -231,15 +352,44 @@ static volatile uint32_t s_reed_open_count = 0;
 static volatile int64_t  s_reed_last_open_ts = 0;
 static volatile bool     s_reed_is_open = false;
 
+static volatile int64_t  s_uvb_isr_cut_us = 0;      /* esp_timer time the ISR pulled MOS2 low */
+static int64_t           s_uvb_cut_by_door_ts = 0;  /* UTC s of the last door cut, 0 = never */
+static uint32_t          s_uvb_cut_lit_ms = 0;      /* how long the UVB had been lit by then */
+
 static void IRAM_ATTR reed_isr_handler(void *arg)
 {
     (void)arg;
     s_reed_isr_count++;
+    if (gpio_get_level(REED_PIN) != 0) {
+        /* 先断电，宁可误断，不可漏断。s_relays[] is reconciled by reed_task. */
+        if (gpio_get_level(MOS2_PIN) != 0)
+            s_uvb_isr_cut_us = esp_timer_get_time();
+        gpio_set_level(MOS2_PIN, 0);
+    }
     BaseType_t high_task_wakeup = pdFALSE;
     if (s_reed_task_handle != NULL) {
         vTaskNotifyGiveFromISR(s_reed_task_handle, &high_task_wakeup);
         portYIELD_FROM_ISR(high_task_wakeup);
     }
+}
+
+/* Called with s_relay_mutex held while s_relays[CH_UVB].on but the door has
+ * opened (the ISR may already have pulled the pin low): turns the UVB off for
+ * good, records how long it had been lit, and flashes the strobe. */
+static void uvb_door_cut_unlocked(void)
+{
+    int64_t cut_us = s_uvb_isr_cut_us;
+    if (cut_us < s_relays[CH_UVB].on_us)
+        cut_us = esp_timer_get_time();   /* the ISR did not cut this one */
+    int64_t lit_us = cut_us - s_relays[CH_UVB].on_us;
+    s_uvb_cut_lit_ms = lit_us > 0 ? (uint32_t)(lit_us / 1000LL) : 0;
+    time_t _now; time(&_now);
+    s_uvb_cut_by_door_ts = (int64_t)_now;
+
+    relay_set_unlocked(CH_UVB, false, 0, NULL);
+    ESP_LOGW(TAG, "[SAFETY CUT] door opened while UVB was on (lit %lu ms)",
+             (unsigned long)s_uvb_cut_lit_ms);
+    strobe_alarm_unlocked();
 }
 
 static void reed_task(void *arg)
@@ -253,6 +403,16 @@ static void reed_task(void *arg)
 
         /* Debounce delay: 50 ms */
         vTaskDelay(pdMS_TO_TICKS(50));
+
+        /* The ISR has already pulled MOS2 low. Whether the debounce below
+         * confirms the opening or finds a bounce, the UVB stays off — it is
+         * never re-lit automatically (fail safe). */
+        if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+        if (s_relays[CH_UVB].on &&
+            (gpio_get_level(MOS2_PIN) == 0 || gpio_get_level(REED_PIN) != 0)) {
+            uvb_door_cut_unlocked();
+        }
+        if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
 
         int level = gpio_get_level(REED_PIN);
         if (level == 0) {
@@ -279,20 +439,54 @@ static void reed_task(void *arg)
         time_t _now; time(&_now);
         s_reed_last_open_ts = (int64_t)_now;
 
+        /* No strobe here: judges open the door often; it only flashes when
+         * the interlock actually stopped the UVB. */
         ESP_LOGI(TAG, "Reed switch opened (closed->open transition detected, count=%lu)",
                  (unsigned long)s_reed_open_count);
+    }
+}
 
-        if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
-        /* If MOS 2 is currently ON, turn it OFF immediately */
-        if (s_relays[1].on) {
-            ESP_LOGW(TAG, "Reed opened while MOS 2 was ON: forcing MOS 2 OFF immediately");
-            relay_set_unlocked(1, false, 0);
+/* ── Sensor task: refresh the cache, enforce the heater lock ─────────────── */
+static int   adc_read_raw(adc_channel_t channel);
+static float bh1750_read_illuminance(void);
+
+static void sensor_task(void *arg)
+{
+    (void)arg;
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;) {
+        if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+            sensor_cache_t c = { .valid = true };
+            const water_config_t *cfg = water_config();
+            c.raw_low  = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
+            c.humidity = water_calc_humidity(c.raw_low, cfg->raw_dry, cfg->raw_wet);
+            c.soil_c   = ds18b20_read_temperature();
+            c.lux      = bh1750_read_illuminance();
+            c.aht_ok   = (aht25_read(&c.air_c, &c.air_humi) == ESP_OK);
+            xSemaphoreGive(g_sensor_mutex);
+
+            taskENTER_CRITICAL(&s_cache_lock);
+            s_cache = c;
+            taskEXIT_CRITICAL(&s_cache_lock);
+        } else {
+            ESP_LOGW(TAG, "Sensor task: sensor busy, keeping previous sample");
         }
-        /* Trigger MOS 3 for 1 second only if not already ON */
-        if (!s_relays[2].on) {
-            relay_set_unlocked(2, true, 1000);
+
+        sensor_cache_t c = sensor_cache_get();
+        relay_refuse_t r = heater_check(&c);
+        s_heater_lock = (r != REFUSE_NONE);
+        if (r != REFUSE_NONE) {
+            if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+            if (s_relays[CH_HEATER].on) {
+                relay_set_unlocked(CH_HEATER, false, 0, NULL);
+                ESP_LOGW(TAG, "[SAFETY CUT] heater %s: soil=%.2f air=%.2f",
+                         r == REFUSE_OVER_TEMP ? "over temp" : "no temp reading",
+                         (double)c.soil_c, (double)(c.aht_ok ? c.air_c : -99.0f));
+            }
+            if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
         }
-        if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_TASK_PERIOD_MS));
     }
 }
 
@@ -532,12 +726,13 @@ static void handle_mqtt_data(const char *data, int data_len)
     switch (s_cmd.which_payload) {
     case FLOWER_COMMAND_RELAY_CONTROL_TAG: {
         flower_relay_control_t *rc = &s_cmd.payload.relay_control;
+        bool ok;
         if (rc->on) {
-            relay_set(0, true, rc->duration_ms > 0 ? rc->duration_ms : RELAY_DEFAULT_DURATION_MS);
+            ok = relay_set(CH_PUMP, true, rc->duration_ms > 0 ? rc->duration_ms : RELAY_DEFAULT_DURATION_MS);
         } else {
-            relay_set(0, false, 0);
+            ok = relay_set(CH_PUMP, false, 0);
         }
-        send_relay_resp(true);
+        send_relay_resp(ok);
         ESP_LOGI(TAG, "Relay 1 %s via MQTT (duration=%u ms)",
                  rc->on ? "ON" : "OFF", (unsigned)rc->duration_ms);
         break;
@@ -579,47 +774,20 @@ static bool encode_metrics(pb_ostream_t *stream, const pb_field_t *field, void *
     return true;
 }
 
-static float calculate_humidity_from_raw(int raw_low)
-{
-    const water_config_t *cfg = water_config();
-    float humidity = water_calc_humidity(raw_low, cfg->raw_dry, cfg->raw_wet);
-    ESP_LOGI(TAG, "ADC humidity(GPIO34)=%d, calibrated=%.1f%% (dry=%u, wet=%u)",
-             raw_low, humidity, (unsigned)cfg->raw_dry, (unsigned)cfg->raw_wet);
-
-    return humidity;
-}
-
-float get_humidity(void) {
-    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    return calculate_humidity_from_raw(raw_low);
-}
-
 static void publish_status_report(void)
 {
-    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGW(TAG, "Status report: sensor busy, skipping this tick");
+    if (!s_mqtt_connected) return;
+
+    sensor_cache_t c = sensor_cache_get();
+    if (!c.valid) {
+        ESP_LOGW(TAG, "Status report: no sensor sample yet, skipping this tick");
         return;
     }
-    float humidity = get_humidity();
-
-    float temp = ds18b20_read_temperature();
-    if (temp > -273.0f)
-        ESP_LOGI(TAG, "Temperature(GPIO1)=%.2f°C", temp);
-
-    float lux = bh1750_read_illuminance();
-    if (lux >= 0)
-        ESP_LOGI(TAG, "Illuminance=%.3f Lux", lux);
-
-    float aht_temp = 0.0f, aht_humi = 0.0f;
-    esp_err_t aht_err = aht25_read(&aht_temp, &aht_humi);
-    if (aht_err == ESP_OK)
-        ESP_LOGI(TAG, "AHT25 temp=%.2f°C, humi=%.1f%%", aht_temp, aht_humi);
-    else
-        ESP_LOGW(TAG, "AHT25 read failed: %s", esp_err_to_name(aht_err));
-
-    xSemaphoreGive(g_sensor_mutex);
-
-    if (!s_mqtt_connected) return;
+    float humidity = c.humidity;
+    float temp     = c.soil_c;
+    float lux      = c.lux;
+    float aht_temp = c.air_c, aht_humi = c.air_humi;
+    esp_err_t aht_err = c.aht_ok ? ESP_OK : ESP_FAIL;
 
     /* Current and previous 8x MOS status bitmap */
     uint32_t mos_current = 0;
@@ -706,12 +874,15 @@ static void check_auto_water(void)
 
     water_strategy_tick(now);
 
-    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGW(TAG, "Auto watering: sensor busy, skipping this tick");
+    if (water_config()->strategy == WATER_STRATEGY_OFF)
+        return;
+
+    sensor_cache_t c = sensor_cache_get();
+    if (!c.valid) {
+        ESP_LOGW(TAG, "Auto watering: no sensor sample yet, skipping this tick");
         return;
     }
-    float humidity = get_humidity();
-    xSemaphoreGive(g_sensor_mutex);
+    float humidity = c.humidity;
 
     if (!water_humidity_valid(humidity)) {
         ESP_LOGW(TAG, "Auto watering: humidity %.1f%% out of range, skipping",
@@ -874,14 +1045,14 @@ static const char STATUS_HTML[] =
     "<body>\n"
     "<h2>8路MOS输出控制面板<span id=\"fw-ver\" style=\"font-size:13px;color:#888;font-weight:normal;margin-left:8px\"></span></h2>\n"
     "<div class=\"grid\">\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 1 [GPIO 19]</span><span class=\"badge off\" id=\"b-1\">关</span></div><div class=\"inf\" id=\"i-1\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-1\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(1,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(1,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 2 [GPIO 18]</span><span class=\"badge off\" id=\"b-2\">关</span></div><div class=\"inf\" id=\"i-2\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-2\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(2,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(2,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 3 [GPIO 17]</span><span class=\"badge off\" id=\"b-3\">关</span></div><div class=\"inf\" id=\"i-3\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-3\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(3,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(3,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 4 [GPIO 16]</span><span class=\"badge off\" id=\"b-4\">关</span></div><div class=\"inf\" id=\"i-4\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-4\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(4,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(4,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 5 [GPIO 33]</span><span class=\"badge off\" id=\"b-5\">关</span></div><div class=\"inf\" id=\"i-5\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-5\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(5,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(5,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 6 [GPIO 25]</span><span class=\"badge off\" id=\"b-6\">关</span></div><div class=\"inf\" id=\"i-6\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-6\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(6,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(6,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 7 [GPIO 26]</span><span class=\"badge off\" id=\"b-7\">关</span></div><div class=\"inf\" id=\"i-7\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-7\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(7,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(7,'off')\">关</button></div></div>\n"
-    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 8 [GPIO 27]</span><span class=\"badge off\" id=\"b-8\">关</span></div><div class=\"inf\" id=\"i-8\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-8\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(8,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(8,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 1 蠕动泵 [GPIO 19]</span><span class=\"badge off\" id=\"b-1\">关</span></div><div class=\"inf\" id=\"i-1\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-1\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(1,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(1,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 2 UVB紫外灯 [GPIO 18]</span><span class=\"badge off\" id=\"b-2\">关</span></div><div class=\"inf\" id=\"i-2\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-2\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(2,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(2,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 3 爆闪灯 [GPIO 17]</span><span class=\"badge off\" id=\"b-3\">关</span></div><div class=\"inf\" id=\"i-3\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-3\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(3,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(3,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 4 加热垫 [GPIO 16]</span><span class=\"badge off\" id=\"b-4\">关</span></div><div class=\"inf\" id=\"i-4\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-4\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(4,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(4,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 5 风扇 [GPIO 33]</span><span class=\"badge off\" id=\"b-5\">关</span></div><div class=\"inf\" id=\"i-5\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-5\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(5,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(5,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 6 喷雾 [GPIO 25]</span><span class=\"badge off\" id=\"b-6\">关</span></div><div class=\"inf\" id=\"i-6\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-6\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(6,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(6,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 7 备用 [GPIO 26]</span><span class=\"badge off\" id=\"b-7\">关</span></div><div class=\"inf\" id=\"i-7\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-7\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(7,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(7,'off')\">关</button></div></div>\n"
+    "  <div class=\"card\"><div class=\"ch-hd\"><span>MOS 8 备用 [GPIO 27]</span><span class=\"badge off\" id=\"b-8\">关</span></div><div class=\"inf\" id=\"i-8\">从未触发</div><div class=\"crow\"><input type=\"number\" id=\"d-8\" value=\"10\" min=\"1\" max=\"3600\"><span>秒</span><button class=\"btn on\" onclick=\"ctrl(8,'on')\">开</button><button class=\"btn off\" onclick=\"ctrl(8,'off')\">关</button></div></div>\n"
     "</div>\n"
     "<h2>传感器实时数据</h2>\n"
     "<div class=\"strat\">\n"
@@ -891,12 +1062,13 @@ static const char STATUS_HTML[] =
     "  <label data-s=\"0\"><input type=\"radio\" name=\"strat\" value=\"0\">中午12点</label>\n"
     "  <label data-s=\"1\"><input type=\"radio\" name=\"strat\" value=\"1\">浇表面</label>\n"
     "  <label data-s=\"2\"><input type=\"radio\" name=\"strat\" value=\"2\">干了再浇透</label>\n"
+    "  <label data-s=\"3\"><input type=\"radio\" name=\"strat\" value=\"3\">关闭</label>\n"
     "</div>\n"
     "<div class=\"row\"><span class=\"nm\">浇表面</span>湿度 &lt; <input type=\"number\" id=\"s-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"s-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
     "<div class=\"row\"><span class=\"nm\">干了再浇透</span>湿度 &lt; <input type=\"number\" id=\"d-thresh\" min=\"0\" max=\"100\"> % → 浇 <input type=\"number\" id=\"d-dur\" min=\"1\" max=\"65535\"> 秒</div>\n"
     "<div class=\"row\" style=\"border-top:1px solid #333;padding-top:8px;margin-top:6px\"><span class=\"nm\">湿度标定</span>空气干燥(0%): <input type=\"number\" id=\"cal-dry\" min=\"0\" max=\"4095\"><button class=\"btn on\" style=\"margin-left:0;padding:4px 8px;font-size:11px\" onclick=\"setCal('dry')\">取当前AD</button>&nbsp;水中湿润(100%): <input type=\"number\" id=\"cal-wet\" min=\"0\" max=\"4095\"><button class=\"btn on\" style=\"margin-left:0;padding:4px 8px;font-size:11px\" onclick=\"setCal('wet')\">取当前AD</button></div>\n"
     "<div class=\"row\"><button onclick=\"saveWater()\">保存配置</button><span class=\"msg\" id=\"strat-msg\"></span></div>\n"
-    "<div class=\"hint\">「中午12点」：每天 12:00 检查一次，阶梯式浇水 &gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min（参数固定）<br>「浇表面」「干了再浇透」：<span id=\"hint-window\">08:00-16:00</span> 之间每 30 秒检查，触发后 <span id=\"hint-cooldown\">30</span> 分钟内不再自动浇水<br>「土壤湿度标定」：空气干燥值对应 0% 湿度（默认 3110），完全浸水值对应 100% 湿度（默认 958）。置于对应介质后点“取当前AD”再点击保存配置写入 Flash。</div>\n"
+    "<div class=\"hint\">「中午12点」：每天 12:00 检查一次，阶梯式浇水 &gt;80%→6min，70-80%→8min，60-70%→10min，50-60%→15min，&lt;50%→20min（参数固定）<br>「浇表面」「干了再浇透」：<span id=\"hint-window\">08:00-16:00</span> 之间每 30 秒检查，触发后 <span id=\"hint-cooldown\">30</span> 分钟内不再自动浇水<br>「关闭」：不自动浇水，演示和拍摄前请选它<br>水泵单次最多开 180 秒，更长的时长会被控制板裁剪<br>「土壤湿度标定」：空气干燥值对应 0% 湿度（默认 3110），完全浸水值对应 100% 湿度（默认 958）。置于对应介质后点“取当前AD”再点击保存配置写入 Flash。</div>\n"
     "</div>\n"
     "<div class=\"vals\">\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%) <span id=\"v-raw\">(AD: --)</span></div></div>\n"
@@ -941,11 +1113,13 @@ static const char STATUS_HTML[] =
     "  const url=urls[ch-1]+(act==='off'?'?action=off':('?duration='+(sec*1000)));\n"
     "  try{\n"
     "    const r=await fetch(url);\n"
-    "    if(!r.ok){\n"
-    "      const msg=await r.text();\n"
-    "      throw new Error(msg||('HTTP '+r.status));\n"
+    "    const txt=await r.text();\n"
+    "    let j=null;try{j=JSON.parse(txt)}catch(_){}\n"
+    "    if(!r.ok||(j&&j.ok===false)){\n"
+    "      throw new Error((j&&j.message)||txt||('HTTP '+r.status));\n"
     "    }\n"
-    "    poll();\n"
+    "    await poll();\n"
+    "    if(j&&j.clamped)document.getElementById('status').textContent='已裁剪：'+j.message;\n"
     "  }catch(e){\n"
     "    document.getElementById('status').textContent='控制失败: '+e.message;\n"
     "  }\n"
@@ -1017,6 +1191,7 @@ static const char STATUS_HTML[] =
     "function stratDesc(c){\n"
     "  if(c.strategy===1)return `湿度 < ${c.surface_thresh_pct}% → 浇 ${c.surface_dur_s} 秒`;\n"
     "  if(c.strategy===2)return `湿度 < ${c.deep_thresh_pct}% → 浇 ${c.deep_dur_s} 秒`;\n"
+    "  if(c.strategy===3)return '不自动浇水';\n"
     "  return '每天 12:00 阶梯浇水';\n"
     "}\n"
     "function markStrat(id){\n"
@@ -1077,75 +1252,92 @@ static const char STATUS_HTML[] =
     "</body>\n"
     "</html>\n";
 
+static esp_err_t send_json(httpd_req_t *req, const char *status, const char *json)
+{
+    if (status) httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    return httpd_resp_sendstr(req, json);
+}
+
+/* Appends to json[]/n inside handle_api_sensors; jumps to overflow when full */
+#define JSON_APPEND(...)                                                    \
+    do {                                                                    \
+        int _w = snprintf(json + n, sizeof(json) - n, __VA_ARGS__);         \
+        if (_w < 0 || (size_t)_w >= sizeof(json) - n) goto overflow;        \
+        n += (size_t)_w;                                                    \
+    } while (0)
+
+/* Serves the cached sample from sensor_task, so it never touches the bus and
+ * answers well inside the App's 1 s demo poll. */
 static esp_err_t handle_api_sensors(httpd_req_t *req)
 {
-    if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) != pdTRUE) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"sensor busy\"}");
-        return ESP_OK;
-    }
-
-    int raw_low = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
-    float humidity = calculate_humidity_from_raw(raw_low);
-
-    float temp = ds18b20_read_temperature();
-
-    float lux = bh1750_read_illuminance();
-
-    float aht_temp = 0.0f, aht_humi = 0.0f;
-    esp_err_t aht_err = aht25_read(&aht_temp, &aht_humi);
-
-    xSemaphoreGive(g_sensor_mutex);
-
+    sensor_cache_t c = sensor_cache_get();
     int reed_closed = (gpio_get_level(REED_PIN) == 0) ? 1 : 0;
 
-    static char json[1280];
+    relay_channel_t relays[NUM_RELAYS];
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
-    snprintf(json, sizeof(json),
+    memcpy(relays, s_relays, sizeof(relays));
+    int64_t  uvb_cut_ts     = s_uvb_cut_by_door_ts;
+    uint32_t uvb_cut_lit_ms = s_uvb_cut_lit_ms;
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+    int64_t now_us = esp_timer_get_time();
+
+    double soil_c   = soil_temp_valid(&c) ? (double)c.soil_c : -273.0;
+    double lux      = c.lux >= 0.0f ? (double)c.lux : -1.0;
+    double air_c    = c.aht_ok ? (double)c.air_c : -99.0;
+    double air_humi = c.aht_ok ? (double)c.air_humi : -99.0;
+
+    /* Static: httpd runs every handler on its single task */
+    static char json[2048];
+    size_t n = 0;
+    JSON_APPEND(
         "{"
         "\"version\":\"" FW_VERSION_STR "\","
         "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
         "\"reed_isr_cnt\":%lu,\"reed_open_cnt\":%lu,\"reed_last_ts\":%lld,"
         "\"aht_temp\":%.2f,\"aht_humi\":%.1f,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
-        "\"relays\":["
-        "{\"ch\":1,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":2,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":3,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":4,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":5,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":6,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":7,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu},"
-        "{\"ch\":8,\"gpio\":%d,\"state\":%d,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu}"
-        "]}",
-        humidity,
-        raw_low,
-        (double)(temp > -273.0f ? temp : -273.0f),
-        (double)(lux >= 0.0f ? lux : -1.0f),
-        reed_closed,
+        "\"soil_moisture\":%.1f,\"soil_temp\":%.2f,\"air_temp\":%.2f,\"air_humi\":%.1f,"
+        "\"door_closed\":%s,\"uvb_cut_by_door_ts\":%lld,\"uvb_cut_lit_ms\":%lu,"
+        "\"heater_lock\":%s,",
+        (double)c.humidity, c.raw_low, soil_c, lux, reed_closed,
         (unsigned long)s_reed_isr_count,
         (unsigned long)s_reed_open_count,
         (long long)s_reed_last_open_ts,
-        (double)(aht_err == ESP_OK ? aht_temp : -99.0f),
-        (double)(aht_err == ESP_OK ? aht_humi : -99.0f),
-        (long long)s_relays[0].last_on_utc_s,
-        (unsigned long)s_relays[0].last_on_dur_ms,
+        air_c, air_humi,
+        (long long)relays[CH_PUMP].last_on_utc_s,
+        (unsigned long)relays[CH_PUMP].last_on_dur_ms,
         (unsigned)water_config()->strategy,
-        s_relays[0].relay_gpio, s_relays[0].on ? 1 : 0, (long long)s_relays[0].last_on_utc_s, (unsigned long)s_relays[0].last_on_dur_ms,
-        s_relays[1].relay_gpio, s_relays[1].on ? 1 : 0, (long long)s_relays[1].last_on_utc_s, (unsigned long)s_relays[1].last_on_dur_ms,
-        s_relays[2].relay_gpio, s_relays[2].on ? 1 : 0, (long long)s_relays[2].last_on_utc_s, (unsigned long)s_relays[2].last_on_dur_ms,
-        s_relays[3].relay_gpio, s_relays[3].on ? 1 : 0, (long long)s_relays[3].last_on_utc_s, (unsigned long)s_relays[3].last_on_dur_ms,
-        s_relays[4].relay_gpio, s_relays[4].on ? 1 : 0, (long long)s_relays[4].last_on_utc_s, (unsigned long)s_relays[4].last_on_dur_ms,
-        s_relays[5].relay_gpio, s_relays[5].on ? 1 : 0, (long long)s_relays[5].last_on_utc_s, (unsigned long)s_relays[5].last_on_dur_ms,
-        s_relays[6].relay_gpio, s_relays[6].on ? 1 : 0, (long long)s_relays[6].last_on_utc_s, (unsigned long)s_relays[6].last_on_dur_ms,
-        s_relays[7].relay_gpio, s_relays[7].on ? 1 : 0, (long long)s_relays[7].last_on_utc_s, (unsigned long)s_relays[7].last_on_dur_ms);
-    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+        (double)c.humidity, soil_c, air_c, air_humi,
+        reed_closed ? "true" : "false",
+        (long long)uvb_cut_ts, (unsigned long)uvb_cut_lit_ms,
+        s_heater_lock ? "true" : "false");
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
+    JSON_APPEND("\"relays\":[");
+    for (int i = 0; i < NUM_RELAYS; i++) {
+        const relay_channel_t *r = &relays[i];
+        uint32_t remaining_ms = 0;
+        if (r->on) {
+            int64_t left = (int64_t)r->duration_ms - (now_us - r->on_us) / 1000LL;
+            remaining_ms = left > 0 ? (uint32_t)left : 0;
+        }
+        JSON_APPEND(
+            "%s{\"ch\":%d,\"device\":\"%s\",\"gpio\":%d,\"state\":%d,\"remaining_ms\":%lu,"
+            "\"max_ms\":%lu,\"last_on_ts\":%lld,\"last_on_dur_ms\":%lu}",
+            i ? "," : "", i + 1, RELAY_DEVICE[i], r->relay_gpio, r->on ? 1 : 0,
+            (unsigned long)remaining_ms, (unsigned long)RELAY_MAX_MS[i],
+            (long long)r->last_on_utc_s, (unsigned long)r->last_on_dur_ms);
+    }
+    JSON_APPEND("]}");
+
+    return send_json(req, NULL, json);
+
+overflow:
+    ESP_LOGE(TAG, "/api/sensors: JSON buffer too small (%u bytes)", (unsigned)sizeof(json));
+    return send_json(req, "500 Internal Server Error", "{\"error\":\"json overflow\"}");
 }
+
+#undef JSON_APPEND
 
 static esp_err_t handle_root(httpd_req_t *req)
 {
@@ -1154,6 +1346,33 @@ static esp_err_t handle_root(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Parse a decimal duration in ms. Values beyond uint32 saturate so they get
+ * clamped like any other over-long request instead of wrapping around. */
+static bool parse_duration_ms(const char *s, uint32_t *out)
+{
+    if (*s < '0' || *s > '9') return false;   /* strtoul would accept "-1" */
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (*end != '\0') return false;
+    if (errno == ERANGE) v = ULONG_MAX;
+#if ULONG_MAX > UINT32_MAX
+    if (v > UINT32_MAX) v = UINT32_MAX;
+#endif
+    *out = (uint32_t)v;
+    return true;
+}
+
+static void json_temp(char *buf, size_t n, bool valid, float v)
+{
+    if (valid) snprintf(buf, n, "%.1f", (double)v);
+    else       snprintf(buf, n, "null");
+}
+
+/* GET /change_relayN[?duration=ms | ?action=off]
+ * Always answers with a JSON receipt (App forwards it to the LLM verbatim):
+ *   200 {"ok":true,...,"requested_ms":..,"actual_ms":..,"clamped":..}
+ *   403 {"ok":false,...,"reason":"door_open|over_temp|no_temp","message":"..."} */
 static esp_err_t handle_change_relay_ch(httpd_req_t *req, int ch)
 {
     if (ch < 0 || ch >= NUM_RELAYS) {
@@ -1161,48 +1380,111 @@ static esp_err_t handle_change_relay_ch(httpd_req_t *req, int ch)
         return ESP_FAIL;
     }
 
-    char query[64] = {};
-    uint32_t dur = RELAY_DEFAULT_DURATION_MS;
-    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
-    if (s_relays[ch].duration_ms > 0) {
-        dur = s_relays[ch].duration_ms;
-    }
-    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+    char json[384];
+    char query[128] = {};
     bool is_off = false;
+    uint32_t dur = 0;   /* 0 = use last / default duration */
 
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char val[16] = {};
-        if (httpd_query_key_value(query, "action", val, sizeof(val)) == ESP_OK) {
-            if (strcmp(val, "off") == 0) {
-                is_off = true;
-            }
+    esp_err_t qerr = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (qerr == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        snprintf(json, sizeof(json),
+                 "{\"ok\":false,\"ch\":%d,\"device\":\"%s\",\"reason\":\"bad_request\","
+                 "\"message\":\"请求参数太长\"}", ch + 1, RELAY_DEVICE[ch]);
+        return send_json(req, "400 Bad Request", json);
+    }
+    if (qerr == ESP_OK) {
+        char val[24] = {};
+        if (httpd_query_key_value(query, "action", val, sizeof(val)) == ESP_OK &&
+            strcmp(val, "off") == 0) {
+            is_off = true;
         }
-        if (!is_off && httpd_query_key_value(query, "duration", val, sizeof(val)) == ESP_OK) {
-            uint32_t d = (uint32_t)atoi(val);
-            if (d > 0) dur = d;
+        if (!is_off) {
+            esp_err_t verr = httpd_query_key_value(query, "duration", val, sizeof(val));
+            if (verr == ESP_ERR_HTTPD_RESULT_TRUNC ||
+                (verr == ESP_OK && !parse_duration_ms(val, &dur))) {
+                snprintf(json, sizeof(json),
+                         "{\"ok\":false,\"ch\":%d,\"device\":\"%s\",\"reason\":\"bad_duration\","
+                         "\"message\":\"时长参数不对，要用毫秒整数\"}", ch + 1, RELAY_DEVICE[ch]);
+                return send_json(req, "400 Bad Request", json);
+            }
         }
     }
 
     if (is_off) {
         relay_set(ch, false, 0);
-    } else {
-        if (ch == 1 && gpio_get_level(REED_PIN) != 0) {
-            ESP_LOGW(TAG, "HTTP request to open MOS 2 rejected: reed switch is open");
-            if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
-            if (!s_relays[2].on) {
-                relay_set_unlocked(2, true, 1000);
-            }
-            if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
-            httpd_resp_set_status(req, "403 Forbidden");
-            httpd_resp_set_type(req, "text/plain; charset=utf-8");
-            httpd_resp_sendstr(req, "干簧管处于断开状态，拒绝开启MOS 2（已触发MOS 3闭合1秒）");
-            return ESP_OK;
-        }
-        relay_set(ch, true, dur);
+        snprintf(json, sizeof(json),
+                 "{\"ok\":true,\"ch\":%d,\"device\":\"%s\",\"action\":\"off\"}",
+                 ch + 1, RELAY_DEVICE[ch]);
+        return send_json(req, NULL, json);
     }
 
-    httpd_resp_send(req, "0", 1);
-    return ESP_OK;
+    relay_refuse_t why = REFUSE_NONE;
+    if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    if (dur == 0) {
+        dur = s_relays[ch].duration_ms > 0 ? s_relays[ch].duration_ms : RELAY_DEFAULT_DURATION_MS;
+    }
+    bool ok = relay_set_unlocked(ch, true, dur, &why);
+    uint32_t requested_ms = s_last_requested_ms[ch];
+    uint32_t actual_ms    = s_relays[ch].duration_ms;
+    if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
+
+    if (!ok) {
+        sensor_cache_t c = sensor_cache_get();
+        const char *reason = "refused";
+        char msg[128];
+        switch (why) {
+        case REFUSE_DOOR_OPEN:
+            reason = "door_open";
+            snprintf(msg, sizeof(msg), "箱门开着，控制板拒绝开%s", RELAY_NAME_CN[ch]);
+            break;
+        case REFUSE_OVER_TEMP:
+            reason = "over_temp";
+            if (soil_temp_valid(&c) && c.soil_c > HEATER_SOIL_MAX_C)
+                snprintf(msg, sizeof(msg), "土温超过%.0f度，控制板拒绝开%s",
+                         (double)HEATER_SOIL_MAX_C, RELAY_NAME_CN[ch]);
+            else
+                snprintf(msg, sizeof(msg), "箱温超过%.0f度，控制板拒绝开%s",
+                         (double)HEATER_AIR_MAX_C, RELAY_NAME_CN[ch]);
+            break;
+        case REFUSE_NO_TEMP:
+            reason = "no_temp";
+            snprintf(msg, sizeof(msg), "读不到土温和箱温，控制板拒绝开%s", RELAY_NAME_CN[ch]);
+            break;
+        default:
+            snprintf(msg, sizeof(msg), "控制板拒绝开%s", RELAY_NAME_CN[ch]);
+            break;
+        }
+
+        if (ch == CH_HEATER) {
+            char soil[12], air[12];
+            json_temp(soil, sizeof(soil), soil_temp_valid(&c), c.soil_c);
+            json_temp(air,  sizeof(air),  c.aht_ok,            c.air_c);
+            snprintf(json, sizeof(json),
+                     "{\"ok\":false,\"ch\":%d,\"device\":\"%s\",\"reason\":\"%s\","
+                     "\"soil_c\":%s,\"air_c\":%s,\"message\":\"%s\"}",
+                     ch + 1, RELAY_DEVICE[ch], reason, soil, air, msg);
+        } else {
+            snprintf(json, sizeof(json),
+                     "{\"ok\":false,\"ch\":%d,\"device\":\"%s\",\"reason\":\"%s\","
+                     "\"message\":\"%s\"}",
+                     ch + 1, RELAY_DEVICE[ch], reason, msg);
+        }
+        return send_json(req, "403 Forbidden", json);
+    }
+
+    if (actual_ms != requested_ms) {
+        snprintf(json, sizeof(json),
+                 "{\"ok\":true,\"ch\":%d,\"device\":\"%s\",\"requested_ms\":%lu,"
+                 "\"actual_ms\":%lu,\"clamped\":true,\"message\":\"%s一次最多%s%lu秒\"}",
+                 ch + 1, RELAY_DEVICE[ch], (unsigned long)requested_ms, (unsigned long)actual_ms,
+                 RELAY_NAME_CN[ch], RELAY_VERB_CN[ch], (unsigned long)(actual_ms / 1000));
+    } else {
+        snprintf(json, sizeof(json),
+                 "{\"ok\":true,\"ch\":%d,\"device\":\"%s\",\"requested_ms\":%lu,"
+                 "\"actual_ms\":%lu,\"clamped\":false}",
+                 ch + 1, RELAY_DEVICE[ch], (unsigned long)requested_ms, (unsigned long)actual_ms);
+    }
+    return send_json(req, NULL, json);
 }
 
 static esp_err_t handle_change_relay1(httpd_req_t *req) { return handle_change_relay_ch(req, 0); }
@@ -1249,9 +1531,7 @@ static esp_err_t handle_api_water_config(httpd_req_t *req)
 
     char json[320];
     water_config_to_json(json, sizeof(json));
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
+    return send_json(req, NULL, json);   /* strategy_name is Chinese: needs charset */
 }
 
 static void http_server_start(void)
@@ -1362,12 +1642,17 @@ static void app_timer_cb(void *arg)
 
     /* Relays auto-off */
     if (s_relay_mutex) xSemaphoreTake(s_relay_mutex, portMAX_DELAY);
+    /* Backstop for the door interlock: an opening the ISR missed, or a UVB
+     * request that raced the door between its check and the pin write */
+    if (s_relays[CH_UVB].on && gpio_get_level(REED_PIN) != 0) {
+        uvb_door_cut_unlocked();
+    }
     int64_t now_us = esp_timer_get_time();
     for (int ch = 0; ch < NUM_RELAYS; ch++) {
         if (s_relays[ch].on && s_relays[ch].duration_ms > 0) {
             int64_t elapsed_ms = (now_us - s_relays[ch].on_us) / 1000LL;
             if (elapsed_ms >= (int64_t)s_relays[ch].duration_ms) {
-                relay_set_unlocked(ch, false, 0);
+                relay_set_unlocked(ch, false, 0, NULL);
             }
         }
     }
@@ -1502,6 +1787,9 @@ void app_main(void)
         ESP_ERROR_CHECK(isr_err);
     }
     ESP_ERROR_CHECK(gpio_isr_handler_add(REED_PIN, reed_isr_handler, NULL));
+
+    /* Sensor task: 2 s cache refresh + heater over-temp lock */
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 4, NULL);
 
     /* LEDC: breathing LED */
     ledc_timer_config_t ledc_timer = {
