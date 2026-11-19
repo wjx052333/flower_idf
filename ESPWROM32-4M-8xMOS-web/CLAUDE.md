@@ -9,6 +9,7 @@ ESPWROM32-4M-8xMOS 固件对外接口（HTTP + UDP 设备发现）的 Python 模
 ```
 cd ESPWROM32-4M-8xMOS-web
 python mock_device.py [--port 8080] [--device-id mock001] [--no-discovery]
+python mock_device.py --port 8080 --device-id flr007 --advertise-ip 192.168.1.8
 ```
 
 - 设备页：`http://localhost:8080/`（固件自带控制面板）
