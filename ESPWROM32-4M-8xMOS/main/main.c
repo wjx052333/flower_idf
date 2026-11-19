@@ -134,6 +134,7 @@ static const char *const RELAY_VERB_CN[NUM_RELAYS] = {
 #define LED_PIN               23  /* Board User LED */
 #define REED_PIN              GPIO_NUM_14 /* Reed switch input (internal pull-up) */
 #define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_6   /* GPIO34 (ADC1_CH6) */
+#define ADC_PIN_HALL_AO       ADC_CHANNEL_0   /* GPIO36 (SENSOR_VP / ADC1_CH0) */
 #define DS18B20_PIN           GPIO_NUM_4      /* GPIO4 */
 
 #define STATUS_INTERVAL_MS        30000
@@ -233,6 +234,7 @@ typedef struct {
     bool  aht_ok;
     float air_c;        /* AHT25, only meaningful when aht_ok */
     float air_humi;
+    int   hall_raw;     /* 49E Linear Hall AO raw counts, GPIO36 (ADC1_CH0) */
 } sensor_cache_t;
 
 static portMUX_TYPE   s_cache_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -460,6 +462,7 @@ static void sensor_task(void *arg)
             const water_config_t *cfg = water_config();
             c.raw_low  = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
             c.humidity = water_calc_humidity(c.raw_low, cfg->raw_dry, cfg->raw_wet);
+            c.hall_raw = adc_read_raw(ADC_PIN_HALL_AO);
             c.soil_c   = ds18b20_read_temperature();
             c.lux      = bh1750_read_illuminance();
             c.aht_ok   = (aht25_read(&c.air_c, &c.air_humi) == ESP_OK);
@@ -511,6 +514,7 @@ static void adc_init(void)
         .atten    = ADC_ATTEN_DB_12,   /* 0 ~ 3.3 V */
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_LOW_HUMIDITY, &chan_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC_PIN_HALL_AO, &chan_cfg));
 }
 
 static int adc_read_raw(adc_channel_t channel)
@@ -1075,12 +1079,14 @@ static const char STATUS_HTML[] =
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14] <span id=\"v-reed-info\"></span></div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-hall\">--</div><div class=\"lbl\">霍尔AO [IO36]</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-humi\">--</div><div class=\"lbl\">AHT25湿度 (%)</div></div>\n"
     "</div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-temp\" height=\"100\"></canvas></div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-lux\"  height=\"100\"></canvas></div>\n"
+    "<div class=\"chart-wrap\"><canvas id=\"c-hall\" height=\"100\"></canvas></div>\n"
     "<div id=\"status\">正在连接...</div>\n"
     "<script>\n"
     "const p=new URLSearchParams(location.search);\n"
@@ -1103,7 +1109,8 @@ static const char STATUS_HTML[] =
     "      plugins:{legend:{labels:{color:'#ccc'}}}}})}\n"
     "const C={h:mk('c-humi','湿度','%','#4fc3f7'),\n"
     "         t:mk('c-temp','温度','°C','#ef9a9a'),\n"
-    "         l:mk('c-lux','照度','lx','#fff176')};\n"
+    "         l:mk('c-lux','照度','lx','#fff176'),\n"
+    "         ha:mk('c-hall','霍尔AO','AD','#b388ff')};\n"
     "function push(c,x,y){c.data.labels.push(x);c.data.datasets[0].data.push(y);\n"
     "  if(c.data.labels.length>MX){c.data.labels.shift();c.data.datasets[0].data.shift()}\n"
     "  c.update('none')}\n"
@@ -1148,6 +1155,9 @@ static const char STATUS_HTML[] =
     "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
     "    const riEl=document.getElementById('v-reed-info');\n"
     "    if(riEl&&d.reed_open_cnt!==undefined){riEl.textContent=`(${d.reed_open_cnt}触发/${d.reed_isr_cnt}脉冲)`;}\n"
+    "    const hl=d.hall_raw!==undefined?d.hall_raw:0;\n"
+    "    const hlEl=document.getElementById('v-hall');\n"
+    "    if(hlEl)hlEl.textContent=hl;\n"
     "    const atEl=document.getElementById('v-aht-temp');\n"
     "    if(atEl&&d.aht_temp!==undefined){atEl.textContent=d.aht_temp>-40?d.aht_temp.toFixed(1):'ERR';}\n"
     "    const ahEl=document.getElementById('v-aht-humi');\n"
@@ -1155,6 +1165,7 @@ static const char STATUS_HTML[] =
     "    push(C.h,t,parseFloat(hv));\n"
     "    push(C.t,t,parseFloat(tv));\n"
     "    push(C.l,t,parseFloat(lv));\n"
+    "    push(C.ha,t,hl);\n"
     "    if(d.relays&&Array.isArray(d.relays)){\n"
     "      for(let i=0;i<d.relays.length;i++){\n"
     "        const item=d.relays[i];\n"
@@ -1293,14 +1304,14 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
     JSON_APPEND(
         "{"
         "\"version\":\"" FW_VERSION_STR "\","
-        "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
+        "\"humidity\":%.1f,\"raw_low\":%d,\"hall_raw\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
         "\"reed_isr_cnt\":%lu,\"reed_open_cnt\":%lu,\"reed_last_ts\":%lld,"
         "\"aht_temp\":%.2f,\"aht_humi\":%.1f,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
         "\"soil_moisture\":%.1f,\"soil_temp\":%.2f,\"air_temp\":%.2f,\"air_humi\":%.1f,"
         "\"door_closed\":%s,\"uvb_cut_by_door_ts\":%lld,\"uvb_cut_lit_ms\":%lu,"
         "\"heater_lock\":%s,",
-        (double)c.humidity, c.raw_low, soil_c, lux, reed_closed,
+        (double)c.humidity, c.raw_low, c.hall_raw, soil_c, lux, reed_closed,
         (unsigned long)s_reed_isr_count,
         (unsigned long)s_reed_open_count,
         (long long)s_reed_last_open_ts,
