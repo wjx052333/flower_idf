@@ -53,7 +53,7 @@ python debug_inject.py reed close         # 关门（干簧管闭合）
 | 继电器安全逻辑（UVB 门磁互锁、开门断电+爆闪、加热垫温控锁、最长时长裁剪） | `main.c`：`relay_set_unlocked`、`reed_*`、`sensor_task`、`app_timer_cb` |
 
 固件改动后需要手工同步的常量（在 `mock_device.py` 顶部）：`FW_VERSION`、`RELAY_MAX_MS`、`RELAY_DEVICE`/`RELAY_NAME_CN`/`RELAY_VERB_CN`、`HEATER_*_MAX_C`、`WATER_*`、`DEF_RAW_*`、`STRATEGY_NAMES`、`DEFAULT_WATER_CFG`。
-新增/修改 HTTP 接口或 JSON 字段时，同步改对应 handler，并保持 JSON 字段名、状态码、错误文案与固件一致。
+新增/修改 HTTP 接口或 JSON 字段时，同步改对应 handler，并保持 JSON 字段名、状态码、错误文案与固件一致。字段含义以 `../ESPWROM32-4M-8xMOS/docs/api.md` 为准，接口变动时一并更新该文档。
 
 ## 与真机的差异
 

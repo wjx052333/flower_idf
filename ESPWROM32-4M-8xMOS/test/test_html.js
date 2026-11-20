@@ -113,8 +113,9 @@ scripts.forEach((s, idx) => {
 });
 
 // 4. Check JSON keys in handle_api_sensors
-const requiredJsonKeys = ["relays", "relay_last_on_ts", "relay_last_on_dur_ms", "raw_low", "reed_isr_cnt", "reed_open_cnt", "reed_last_ts",
-  "soil_moisture", "soil_temp", "air_temp", "air_humi", "door_closed", "uvb_cut_by_door_ts", "uvb_cut_lit_ms", "heater_lock", "remaining_ms",
+const requiredJsonKeys = ["version", "soil", "moisture", "raw", "temp", "air", "humi", "lux",
+  "door", "closed", "open_cnt", "last_open_ts", "uvb_cut_ts", "uvb_cut_lit_ms", "heater_lock", "strategy", "db", "isr",
+  "relays", "last_on_ts", "last_on_dur_ms", "remaining_ms",
   "requested_ms", "actual_ms", "clamped", "reason", "door_open", "over_temp", "soil_c", "air_c"];
 for (const key of requiredJsonKeys) {
   if (!mainContent.includes(`"${key}"`) && !mainContent.includes(`\\"${key}\\"`)) {

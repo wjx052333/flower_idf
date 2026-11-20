@@ -241,6 +241,13 @@ static portMUX_TYPE   s_cache_lock = portMUX_INITIALIZER_UNLOCKED;
 static sensor_cache_t s_cache = { .soil_c = -273.0f, .lux = -1.0f };
 static volatile bool  s_heater_lock = true;   /* heater would be refused right now */
 
+/* Failure counters for the I2C sensors, since boot. Single writer
+ * (sensor_task); /api/sensors reads them as aligned 32-bit words. */
+typedef struct { uint32_t n, err, zero; } bh1750_stats_t;  /* zero = spurious 0 lx rescued by re-read */
+typedef struct { uint32_t n, fail; }      aht25_stats_t;
+static bh1750_stats_t s_bh_stats;
+static aht25_stats_t  s_aht_stats;
+
 static sensor_cache_t sensor_cache_get(void)
 {
     taskENTER_CRITICAL(&s_cache_lock);
@@ -484,6 +491,8 @@ static void sensor_task(void *arg)
             c.soil_fail_streak = soil_fail_streak;
             c.lux      = bh1750_read_illuminance();
             c.aht_ok   = (aht25_read(&c.air_c, &c.air_humi) == ESP_OK);
+            s_aht_stats.n++;
+            if (!c.aht_ok) s_aht_stats.fail++;
             xSemaphoreGive(g_sensor_mutex);
 
             taskENTER_CRITICAL(&s_cache_lock);
@@ -546,6 +555,7 @@ static int adc_read_raw(adc_channel_t channel)
 #define BH1750_SDA_IO   GPIO_NUM_21
 #define BH1750_ADDR     0x23
 #define BH1750_CONT_H   0x10   /* Continuous H-Resolution Mode (~120 ms/sample) */
+#define BH1750_MEAS_WAIT_MS 180 /* max H-res measurement time is 180 ms */
 
 static i2c_master_bus_handle_t s_i2c_bus    = NULL;
 static i2c_master_dev_handle_t s_bh1750_dev = NULL;
@@ -588,17 +598,47 @@ static void i2c_sensors_init(void)
     }
 }
 
-static float bh1750_read_illuminance(void)
+static esp_err_t bh1750_read_raw(uint16_t *raw)
 {
-    if (!s_bh1750_dev) return -1.0f;
     uint8_t buf[2];
     esp_err_t err = i2c_master_receive(s_bh1750_dev, buf, 2, 200);
+    if (err == ESP_OK) *raw = ((uint16_t)buf[0] << 8) | buf[1];
+    return err;
+}
+
+/* The BH1750 has no CRC, and a bare 0 is also a legitimate "dark" reading, so
+ * a 0 is only suspect when the previous sample was lit. A suspect 0 is
+ * confirmed before it is believed: restart continuous mode (also recovers a
+ * chip that reset and is sitting in power-down returning 0), wait one full
+ * measurement, read again. Still 0 -> it really is dark. */
+static float bh1750_read_illuminance(void)
+{
+    static float s_prev_lux = 0.0f;
+
+    if (!s_bh1750_dev) return -1.0f;
+    s_bh_stats.n++;
+    uint16_t raw;
+    esp_err_t err = bh1750_read_raw(&raw);
     if (err != ESP_OK) {
+        s_bh_stats.err++;
         ESP_LOGW(TAG, "BH1750 read error: %s", esp_err_to_name(err));
         return -1.0f;
     }
-    uint16_t raw = ((uint16_t)buf[0] << 8) | buf[1];
-    return (float)raw / 1.2f;
+
+    if (raw == 0 && s_prev_lux > 0.0f) {
+        uint8_t cmd = BH1750_CONT_H;
+        i2c_master_transmit(s_bh1750_dev, &cmd, 1, 100);
+        vTaskDelay(pdMS_TO_TICKS(BH1750_MEAS_WAIT_MS));
+        uint16_t raw2;
+        if (bh1750_read_raw(&raw2) == ESP_OK && raw2 != 0) {
+            s_bh_stats.zero++;
+            ESP_LOGW(TAG, "BH1750 spurious 0 lx (prev=%.1f), re-read=%.1f, glitches=%lu",
+                     (double)s_prev_lux, (double)raw2 / 1.2, (unsigned long)s_bh_stats.zero);
+            raw = raw2;
+        }
+    }
+    s_prev_lux = (float)raw / 1.2f;
+    return s_prev_lux;
 }
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
@@ -1094,9 +1134,9 @@ static const char STATUS_HTML[] =
     "<div class=\"vals\">\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%) <span id=\"v-raw\">(AD: --)</span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C) <span id=\"v-ds\"></span></div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx) <span id=\"v-bh\"></span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14] <span id=\"v-reed-info\"></span></div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C) <span id=\"v-aht\"></span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-humi\">--</div><div class=\"lbl\">AHT25湿度 (%)</div></div>\n"
     "</div>\n"
     "<div class=\"chart-wrap\"><canvas id=\"c-humi\" height=\"100\"></canvas></div>\n"
@@ -1156,32 +1196,47 @@ static const char STATUS_HTML[] =
     "      const vEl=document.getElementById('fw-ver');\n"
     "      if(vEl)vEl.textContent='v'+d.version;\n"
     "    }\n"
-    "    const hv=d.soil_moisture.toFixed(1),tv=d.soil_temp.toFixed(1),lv=d.lux.toFixed(0);\n"
+    "    const so=d.soil||{},ai=d.air||{},dr=d.door||{};\n"
+    "    const hv=so.moisture.toFixed(1);\n"
+    "    const tv=so.temp==null?null:so.temp.toFixed(1),lv=d.lux==null?null:d.lux.toFixed(0);\n"
     "    document.getElementById('v-humi').textContent=hv;\n"
     "    const rawEl=document.getElementById('v-raw');\n"
-    "    if(rawEl&&d.raw_low!==undefined){\n"
-    "      latestRaw=d.raw_low;\n"
-    "      rawEl.textContent=`(AD: ${d.raw_low})`;\n"
+    "    if(rawEl&&so.raw!==undefined){\n"
+    "      latestRaw=so.raw;\n"
+    "      rawEl.textContent=`(AD: ${so.raw})`;\n"
     "    }\n"
-    "    document.getElementById('v-temp').textContent=tv;\n"
-    "    document.getElementById('v-lux').textContent=lv;\n"
+    "    document.getElementById('v-temp').textContent=tv===null?'ERR':tv;\n"
+    "    document.getElementById('v-lux').textContent=lv===null?'ERR':lv;\n"
     "    const rEl=document.getElementById('v-reed');\n"
-    "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
+    "    if(rEl){rEl.textContent=dr.closed===1?'闭合':'断开';rEl.style.color=dr.closed===1?'#81c784':'#e57373';}\n"
     "    const riEl=document.getElementById('v-reed-info');\n"
+    "    const db=d.db||{};\n"
     "    const dsEl=document.getElementById('v-ds');\n"
-    "    if(dsEl&&d.ds){\n"
-    "      const s=d.ds;\n"
+    "    if(dsEl&&db.ds){\n"
+    "      const s=db.ds;\n"
     "      dsEl.textContent=`(读${s.n}/败${s.fail}/CRC${s.crc}`+(s.nop?`/无应答${s.nop}`:'')+(s.p85?`/85°C ${s.p85}`:'')+')'+(s.streak?` 连续失败${s.streak}`:'');\n"
     "      dsEl.style.color=s.streak?'#e57373':(s.crc||s.fail?'#ffb74d':'');\n"
     "    }\n"
-    "    if(riEl&&d.reed_open_cnt!==undefined){riEl.textContent=`(${d.reed_open_cnt}触发/${d.reed_isr_cnt}脉冲)`;}\n"
+    "    const bhEl=document.getElementById('v-bh');\n"
+    "    if(bhEl&&db.bh){\n"
+    "      const s=db.bh;\n"
+    "      bhEl.textContent=`(读${s.n}/错${s.err}/误0 ${s.zero})`;\n"
+    "      bhEl.style.color=s.err||s.zero?'#ffb74d':'';\n"
+    "    }\n"
+    "    const ahtEl=document.getElementById('v-aht');\n"
+    "    if(ahtEl&&db.aht){\n"
+    "      const s=db.aht;\n"
+    "      ahtEl.textContent=`(读${s.n}/败${s.fail})`;\n"
+    "      ahtEl.style.color=s.fail?'#ffb74d':'';\n"
+    "    }\n"
+    "    if(riEl&&dr.open_cnt!==undefined){riEl.textContent=`(${dr.open_cnt}触发/${db.door?db.door.isr:'-'}脉冲)`;}\n"
     "    const atEl=document.getElementById('v-aht-temp');\n"
-    "    if(atEl&&d.air_temp!==undefined){atEl.textContent=d.air_temp>-40?d.air_temp.toFixed(1):'ERR';}\n"
+    "    if(atEl){atEl.textContent=ai.temp==null?'ERR':ai.temp.toFixed(1);}\n"
     "    const ahEl=document.getElementById('v-aht-humi');\n"
-    "    if(ahEl&&d.air_humi!==undefined){ahEl.textContent=d.air_humi>=0?d.air_humi.toFixed(1):'ERR';}\n"
+    "    if(ahEl){ahEl.textContent=ai.humi==null?'ERR':ai.humi.toFixed(1);}\n"
     "    push(C.h,t,parseFloat(hv));\n"
-    "    push(C.t,t,parseFloat(tv));\n"
-    "    push(C.l,t,parseFloat(lv));\n"
+    "    push(C.t,t,tv===null?null:parseFloat(tv));\n"
+    "    push(C.l,t,lv===null?null:parseFloat(lv));\n"
     "    if(d.relays&&Array.isArray(d.relays)){\n"
     "      for(let i=0;i<d.relays.length;i++){\n"
     "        const item=d.relays[i];\n"
@@ -1294,6 +1349,13 @@ static esp_err_t send_json(httpd_req_t *req, const char *status, const char *jso
         n += (size_t)_w;                                                    \
     } while (0)
 
+/* A number, or JSON null when the sensor read failed */
+static void json_num(char *buf, size_t n, bool valid, int decimals, double v)
+{
+    if (valid) snprintf(buf, n, "%.*f", decimals, v);
+    else       snprintf(buf, n, "null");
+}
+
 /* Serves the cached sample from sensor_task, so it never touches the bus and
  * answers well inside the App's 1 s demo poll. */
 static esp_err_t handle_api_sensors(httpd_req_t *req)
@@ -1309,41 +1371,47 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
     if (s_relay_mutex) xSemaphoreGive(s_relay_mutex);
     int64_t now_us = esp_timer_get_time();
 
-    double soil_c   = soil_temp_valid(&c) ? (double)c.soil_c : -273.0;
-    double lux      = c.lux >= 0.0f ? (double)c.lux : -1.0;
-    double air_c    = c.aht_ok ? (double)c.air_c : -99.0;
-    double air_humi = c.aht_ok ? (double)c.air_humi : -99.0;
+    char soil_t[16], air_t[16], air_h[16], lux_s[16];
+    json_num(soil_t, sizeof(soil_t), soil_temp_valid(&c), 2, (double)c.soil_c);
+    json_num(air_t,  sizeof(air_t),  c.aht_ok,            2, (double)c.air_c);
+    json_num(air_h,  sizeof(air_h),  c.aht_ok,            1, (double)c.air_humi);
+    json_num(lux_s,  sizeof(lux_s),  c.lux >= 0.0f,       1, (double)c.lux);
     ds18b20_stats_t ds;
     ds18b20_get_stats(&ds);
 
     /* Static: httpd runs every handler on its single task */
-    static char json[2048];
+    static char json[2560];
     size_t n = 0;
+    /* Field meanings: docs/api.md. A sensor that failed reads as null. */
     JSON_APPEND(
         "{"
         "\"version\":\"" FW_VERSION_STR "\","
-        "\"soil_moisture\":%.1f,\"raw_low\":%d,\"soil_temp\":%.2f,\"lux\":%.1f,\"reed\":%d,"
-        "\"reed_isr_cnt\":%lu,\"reed_open_cnt\":%lu,\"reed_last_ts\":%lld,"
-        "\"air_temp\":%.2f,\"air_humi\":%.1f,"
-        "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
-        "\"door_closed\":%s,\"uvb_cut_by_door_ts\":%lld,\"uvb_cut_lit_ms\":%lu,"
-        "\"heater_lock\":%s,"
-        "\"ds\":{\"streak\":%d,\"n\":%lu,\"fail\":%lu,\"crc\":%lu,\"nop\":%lu,\"p85\":%lu},",
-        (double)c.humidity, c.raw_low, soil_c, lux, reed_closed,
-        (unsigned long)s_reed_isr_count,
+        "\"soil\":{\"moisture\":%.1f,\"raw\":%d,\"temp\":%s},"
+        "\"air\":{\"temp\":%s,\"humi\":%s},"
+        "\"lux\":%s,"
+        "\"door\":{\"closed\":%d,\"open_cnt\":%lu,\"last_open_ts\":%lld,"
+        "\"uvb_cut_ts\":%lld,\"uvb_cut_lit_ms\":%lu},"
+        "\"heater_lock\":%d,\"strategy\":%u,"
+        "\"db\":{\"ds\":{\"streak\":%d,\"n\":%lu,\"fail\":%lu,\"crc\":%lu,\"nop\":%lu,\"p85\":%lu},"
+        "\"bh\":{\"n\":%lu,\"err\":%lu,\"zero\":%lu},"
+        "\"aht\":{\"n\":%lu,\"fail\":%lu},"
+        "\"door\":{\"isr\":%lu}},",
+        (double)c.humidity, c.raw_low, soil_t,
+        air_t, air_h,
+        lux_s,
+        reed_closed,
         (unsigned long)s_reed_open_count,
         (long long)s_reed_last_open_ts,
-        air_c, air_humi,
-        (long long)relays[CH_PUMP].last_on_utc_s,
-        (unsigned long)relays[CH_PUMP].last_on_dur_ms,
-        (unsigned)water_config()->strategy,
-        reed_closed ? "true" : "false",
         (long long)uvb_cut_ts, (unsigned long)uvb_cut_lit_ms,
-        s_heater_lock ? "true" : "false",
+        s_heater_lock ? 1 : 0,
+        (unsigned)water_config()->strategy,
         c.soil_fail_streak,
         (unsigned long)ds.reads, (unsigned long)ds.failed,
         (unsigned long)ds.crc_errors, (unsigned long)ds.no_presence,
-        (unsigned long)ds.power_on_85);
+        (unsigned long)ds.power_on_85,
+        (unsigned long)s_bh_stats.n, (unsigned long)s_bh_stats.err, (unsigned long)s_bh_stats.zero,
+        (unsigned long)s_aht_stats.n, (unsigned long)s_aht_stats.fail,
+        (unsigned long)s_reed_isr_count);
 
     JSON_APPEND("\"relays\":[");
     for (int i = 0; i < NUM_RELAYS; i++) {

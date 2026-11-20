@@ -46,8 +46,8 @@ def cmd_reed(args):
     closed = args.state == "close"
     call(args.url, "/debug/api/inject", {"door_closed": closed})
     d = call(args.url, "/api/sensors")
-    print(f"干簧管：{'闭合（门关）' if d['door_closed'] else '断开（门开）'}，"
-          f"触发 {d['reed_open_cnt']} 次 / 脉冲 {d['reed_isr_cnt']} 次")
+    print(f"干簧管：{'闭合（门关）' if d['door']['closed'] else '断开（门开）'}，"
+          f"触发 {d['door']['open_cnt']} 次 / 脉冲 {d['db']['door']['isr']} 次")
 
 
 def pct(s):

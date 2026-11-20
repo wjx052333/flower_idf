@@ -318,13 +318,12 @@ class Device:
         with self.lock:
             s = self.sensors
             now = time.monotonic()
-            soil_c = round(s["soil_c"], 2) if s["soil_ok"] else -273.0
-            lux = round(s["lux"], 1) if s["lux_ok"] and s["lux"] >= 0 else -1.0
-            air_c = round(s["air_c"], 2) if s["aht_ok"] else -99.0
-            air_humi = round(s["air_humi"], 1) if s["aht_ok"] else -99.0
+            soil_c = round(s["soil_c"], 2) if s["soil_ok"] else None
+            lux = round(s["lux"], 1) if s["lux_ok"] and s["lux"] >= 0 else None
+            air_c = round(s["air_c"], 2) if s["aht_ok"] else None
+            air_humi = round(s["air_humi"], 1) if s["aht_ok"] else None
             hum = round(self.humidity(), 1)
             reed = 1 if s["door_closed"] else 0
-            pump = self.relays[CH_PUMP]
             relays = []
             for i, r in enumerate(self.relays):
                 remaining = 0
@@ -338,18 +337,25 @@ class Device:
                 })
             return {
                 "version": FW_VERSION,
-                "soil_moisture": hum, "raw_low": s["raw_low"], "soil_temp": soil_c,
-                "lux": lux, "reed": reed,
-                "reed_isr_cnt": self.reed_isr_count, "reed_open_cnt": self.reed_open_count,
-                "reed_last_ts": self.reed_last_open_ts,
-                "air_temp": air_c, "air_humi": air_humi,
-                "relay_last_on_ts": pump.last_on_utc_s,
-                "relay_last_on_dur_ms": pump.last_on_dur_ms,
+                "soil": {"moisture": hum, "raw": s["raw_low"], "temp": soil_c},
+                "air": {"temp": air_c, "humi": air_humi},
+                "lux": lux,
+                "door": {
+                    "closed": reed,
+                    "open_cnt": self.reed_open_count,
+                    "last_open_ts": self.reed_last_open_ts,
+                    "uvb_cut_ts": self.uvb_cut_by_door_ts,
+                    "uvb_cut_lit_ms": self.uvb_cut_lit_ms,
+                },
+                "heater_lock": 1 if self.heater_lock else 0,
                 "strategy": self.water["strategy"],
-                "door_closed": bool(reed),
-                "uvb_cut_by_door_ts": self.uvb_cut_by_door_ts,
-                "uvb_cut_lit_ms": self.uvb_cut_lit_ms,
-                "heater_lock": self.heater_lock,
+                # debug counters: the mock has no real buses, so they stay at 0
+                "db": {
+                    "ds": {"streak": 0, "n": 0, "fail": 0, "crc": 0, "nop": 0, "p85": 0},
+                    "bh": {"n": 0, "err": 0, "zero": 0},
+                    "aht": {"n": 0, "fail": 0},
+                    "door": {"isr": self.reed_isr_count},
+                },
                 "relays": relays,
             }
 
