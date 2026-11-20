@@ -146,7 +146,7 @@ static const char *const RELAY_VERB_CN[NUM_RELAYS] = {
 
 /* ── Firmware version ─────────────────────────────────────────────────────── */
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 4
+#define FW_VERSION_MINOR 5
 #define FW_VERSION_PATCH 0
 
 #define _STR(x) #x
@@ -223,12 +223,14 @@ static uint32_t s_last_requested_ms[NUM_RELAYS];  /* 给回执用 */
  * MQTT status, auto watering, heater lock) reads this copy instead of touching
  * the bus, so /api/sensors never waits for the 750 ms DS18B20 conversion. */
 #define SENSOR_TASK_PERIOD_MS 2000
+#define SOIL_HOLD_MAX_FAILS   3   /* keep last good soil temp for up to 3 failed cycles (~6 s) */
 
 typedef struct {
     bool  valid;        /* at least one sample taken */
     int   raw_low;      /* ADC counts, GPIO34 */
     float humidity;     /* calibrated ADC soil moisture, % */
     float soil_c;       /* DS18B20, -273 = read failed */
+    int   soil_fail_streak; /* consecutive failed DS18B20 cycles; >0 with a valid soil_c = held old value */
     float lux;          /* BH1750, -1 = read failed */
     bool  aht_ok;
     float air_c;        /* AHT25, only meaningful when aht_ok */
@@ -454,6 +456,7 @@ static void sensor_task(void *arg)
 {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
+    int soil_fail_streak = 0;
     for (;;) {
         if (xSemaphoreTake(g_sensor_mutex, pdMS_TO_TICKS(SENSOR_MUTEX_TIMEOUT_MS)) == pdTRUE) {
             sensor_cache_t c = { .valid = true };
@@ -461,6 +464,24 @@ static void sensor_task(void *arg)
             c.raw_low  = adc_read_raw(ADC_PIN_LOW_HUMIDITY);
             c.humidity = water_calc_humidity(c.raw_low, cfg->raw_dry, cfg->raw_wet);
             c.soil_c   = ds18b20_read_temperature();
+            if (c.soil_c > -273.0f) {
+                if (soil_fail_streak > 0)
+                    ESP_LOGI(TAG, "DS18B20 recovered after %d failed cycle(s)", soil_fail_streak);
+                soil_fail_streak = 0;
+            } else {
+                soil_fail_streak++;
+                ESP_LOGW(TAG, "DS18B20 read failed (streak=%d) - check wiring/pull-up/supply%s",
+                         soil_fail_streak,
+                         soil_fail_streak <= SOIL_HOLD_MAX_FAILS ? ", holding last value" : ", value dropped");
+                if (soil_fail_streak <= SOIL_HOLD_MAX_FAILS) {
+                    /* A CRC-rejected sample is dropped, not shown as "no reading":
+                     * soil temperature moves slowly, so keep the last good value
+                     * for a few cycles before declaring the sensor lost. */
+                    sensor_cache_t prev = sensor_cache_get();
+                    c.soil_c = prev.soil_c;
+                }
+            }
+            c.soil_fail_streak = soil_fail_streak;
             c.lux      = bh1750_read_illuminance();
             c.aht_ok   = (aht25_read(&c.air_c, &c.air_humi) == ESP_OK);
             xSemaphoreGive(g_sensor_mutex);
@@ -1072,7 +1093,7 @@ static const char STATUS_HTML[] =
     "</div>\n"
     "<div class=\"vals\">\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-humi\">--</div><div class=\"lbl\">湿度 (%) <span id=\"v-raw\">(AD: --)</span></div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C) <span id=\"v-ds\"></span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14] <span id=\"v-reed-info\"></span></div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C)</div></div>\n"
@@ -1135,7 +1156,7 @@ static const char STATUS_HTML[] =
     "      const vEl=document.getElementById('fw-ver');\n"
     "      if(vEl)vEl.textContent='v'+d.version;\n"
     "    }\n"
-    "    const hv=d.humidity.toFixed(1),tv=d.temperature.toFixed(1),lv=d.lux.toFixed(0);\n"
+    "    const hv=d.soil_moisture.toFixed(1),tv=d.soil_temp.toFixed(1),lv=d.lux.toFixed(0);\n"
     "    document.getElementById('v-humi').textContent=hv;\n"
     "    const rawEl=document.getElementById('v-raw');\n"
     "    if(rawEl&&d.raw_low!==undefined){\n"
@@ -1147,11 +1168,17 @@ static const char STATUS_HTML[] =
     "    const rEl=document.getElementById('v-reed');\n"
     "    if(rEl){rEl.textContent=d.reed===1?'闭合':'断开';rEl.style.color=d.reed===1?'#81c784':'#e57373';}\n"
     "    const riEl=document.getElementById('v-reed-info');\n"
+    "    const dsEl=document.getElementById('v-ds');\n"
+    "    if(dsEl&&d.ds){\n"
+    "      const s=d.ds;\n"
+    "      dsEl.textContent=`(读${s.n}/败${s.fail}/CRC${s.crc}`+(s.nop?`/无应答${s.nop}`:'')+(s.p85?`/85°C ${s.p85}`:'')+')'+(s.streak?` 连续失败${s.streak}`:'');\n"
+    "      dsEl.style.color=s.streak?'#e57373':(s.crc||s.fail?'#ffb74d':'');\n"
+    "    }\n"
     "    if(riEl&&d.reed_open_cnt!==undefined){riEl.textContent=`(${d.reed_open_cnt}触发/${d.reed_isr_cnt}脉冲)`;}\n"
     "    const atEl=document.getElementById('v-aht-temp');\n"
-    "    if(atEl&&d.aht_temp!==undefined){atEl.textContent=d.aht_temp>-40?d.aht_temp.toFixed(1):'ERR';}\n"
+    "    if(atEl&&d.air_temp!==undefined){atEl.textContent=d.air_temp>-40?d.air_temp.toFixed(1):'ERR';}\n"
     "    const ahEl=document.getElementById('v-aht-humi');\n"
-    "    if(ahEl&&d.aht_humi!==undefined){ahEl.textContent=d.aht_humi>=0?d.aht_humi.toFixed(1):'ERR';}\n"
+    "    if(ahEl&&d.air_humi!==undefined){ahEl.textContent=d.air_humi>=0?d.air_humi.toFixed(1):'ERR';}\n"
     "    push(C.h,t,parseFloat(hv));\n"
     "    push(C.t,t,parseFloat(tv));\n"
     "    push(C.l,t,parseFloat(lv));\n"
@@ -1286,6 +1313,8 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
     double lux      = c.lux >= 0.0f ? (double)c.lux : -1.0;
     double air_c    = c.aht_ok ? (double)c.air_c : -99.0;
     double air_humi = c.aht_ok ? (double)c.air_humi : -99.0;
+    ds18b20_stats_t ds;
+    ds18b20_get_stats(&ds);
 
     /* Static: httpd runs every handler on its single task */
     static char json[2048];
@@ -1293,13 +1322,13 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
     JSON_APPEND(
         "{"
         "\"version\":\"" FW_VERSION_STR "\","
-        "\"humidity\":%.1f,\"raw_low\":%d,\"temperature\":%.2f,\"lux\":%.1f,\"reed\":%d,"
+        "\"soil_moisture\":%.1f,\"raw_low\":%d,\"soil_temp\":%.2f,\"lux\":%.1f,\"reed\":%d,"
         "\"reed_isr_cnt\":%lu,\"reed_open_cnt\":%lu,\"reed_last_ts\":%lld,"
-        "\"aht_temp\":%.2f,\"aht_humi\":%.1f,"
+        "\"air_temp\":%.2f,\"air_humi\":%.1f,"
         "\"relay_last_on_ts\":%lld,\"relay_last_on_dur_ms\":%lu,\"strategy\":%u,"
-        "\"soil_moisture\":%.1f,\"soil_temp\":%.2f,\"air_temp\":%.2f,\"air_humi\":%.1f,"
         "\"door_closed\":%s,\"uvb_cut_by_door_ts\":%lld,\"uvb_cut_lit_ms\":%lu,"
-        "\"heater_lock\":%s,",
+        "\"heater_lock\":%s,"
+        "\"ds\":{\"streak\":%d,\"n\":%lu,\"fail\":%lu,\"crc\":%lu,\"nop\":%lu,\"p85\":%lu},",
         (double)c.humidity, c.raw_low, soil_c, lux, reed_closed,
         (unsigned long)s_reed_isr_count,
         (unsigned long)s_reed_open_count,
@@ -1308,10 +1337,13 @@ static esp_err_t handle_api_sensors(httpd_req_t *req)
         (long long)relays[CH_PUMP].last_on_utc_s,
         (unsigned long)relays[CH_PUMP].last_on_dur_ms,
         (unsigned)water_config()->strategy,
-        (double)c.humidity, soil_c, air_c, air_humi,
         reed_closed ? "true" : "false",
         (long long)uvb_cut_ts, (unsigned long)uvb_cut_lit_ms,
-        s_heater_lock ? "true" : "false");
+        s_heater_lock ? "true" : "false",
+        c.soil_fail_streak,
+        (unsigned long)ds.reads, (unsigned long)ds.failed,
+        (unsigned long)ds.crc_errors, (unsigned long)ds.no_presence,
+        (unsigned long)ds.power_on_85);
 
     JSON_APPEND("\"relays\":[");
     for (int i = 0; i < NUM_RELAYS; i++) {

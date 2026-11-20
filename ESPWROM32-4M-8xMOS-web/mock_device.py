@@ -39,7 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_FW_SRC = os.path.join(HERE, "..", "ESPWROM32-4M-8xMOS", "main", "main.c")
 
 # ── Firmware constants (main.c) ──────────────────────────────────────────────
-FW_VERSION = "1.4.0"
+FW_VERSION = "1.5.0"
 NUM_RELAYS = 8
 CH_PUMP, CH_UVB, CH_STROBE, CH_HEATER = 0, 1, 2, 3
 RELAY_GPIO = [19, 18, 17, 16, 33, 25, 26, 27]
@@ -338,15 +338,14 @@ class Device:
                 })
             return {
                 "version": FW_VERSION,
-                "humidity": hum, "raw_low": s["raw_low"], "temperature": soil_c,
+                "soil_moisture": hum, "raw_low": s["raw_low"], "soil_temp": soil_c,
                 "lux": lux, "reed": reed,
                 "reed_isr_cnt": self.reed_isr_count, "reed_open_cnt": self.reed_open_count,
                 "reed_last_ts": self.reed_last_open_ts,
-                "aht_temp": air_c, "aht_humi": air_humi,
+                "air_temp": air_c, "air_humi": air_humi,
                 "relay_last_on_ts": pump.last_on_utc_s,
                 "relay_last_on_dur_ms": pump.last_on_dur_ms,
                 "strategy": self.water["strategy"],
-                "soil_moisture": hum, "soil_temp": soil_c, "air_temp": air_c, "air_humi": air_humi,
                 "door_closed": bool(reed),
                 "uvb_cut_by_door_ts": self.uvb_cut_by_door_ts,
                 "uvb_cut_lit_ms": self.uvb_cut_lit_ms,

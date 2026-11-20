@@ -11,7 +11,25 @@
 #define CMD_READ_SCRATCHPAD 0xBE
 #define CMD_SKIP_ROM        0xCC
 
+#define SCRATCHPAD_READ_TRIES 3
+#define POWER_ON_RESET_RAW    0x0550   /* 85.0 C */
+
 static gpio_num_t s_gpio = GPIO_NUM_NC;
+
+/* Dallas/Maxim CRC8, poly x^8+x^5+x^4+1 (reflected 0x8C) */
+static uint8_t ow_crc8(const uint8_t *d, int n) {
+    uint8_t crc = 0;
+    while (n--) {
+        uint8_t b = *d++;
+        for (int i = 0; i < 8; i++) {
+            uint8_t mix = (crc ^ b) & 0x01;
+            crc >>= 1;
+            if (mix) crc ^= 0x8C;
+            b >>= 1;
+        }
+    }
+    return crc;
+}
 
 /* ── OneWire bit-banging ──────────────────────────────────────────────────── */
 
@@ -101,10 +119,17 @@ esp_err_t ds18b20_init(gpio_num_t gpio) {
     return ESP_OK;
 }
 
-float ds18b20_read_temperature(void) {
+static ds18b20_stats_t s_stats;   /* single writer (sensor task); aligned 32-bit reads elsewhere */
+
+void ds18b20_get_stats(ds18b20_stats_t *out) {
+    *out = s_stats;
+}
+
+static float ds18b20_read_once(void) {
     if (s_gpio == GPIO_NUM_NC) return -273.0f;
 
     if (!ow_reset()) {
+        s_stats.no_presence++;
         ESP_LOGW(TAG, "Reset failed (start conversion)");
         return -273.0f;
     }
@@ -112,18 +137,42 @@ float ds18b20_read_temperature(void) {
     ow_write_byte(CMD_CONVERT_T);
     vTaskDelay(pdMS_TO_TICKS(750));
 
-    if (!ow_reset()) {
-        ESP_LOGW(TAG, "Reset failed (read scratchpad)");
-        return -273.0f;
+    /* The conversion result stays in the scratchpad, so a corrupted read only
+     * needs the (~1 ms) scratchpad read repeated, not another 750 ms convert. */
+    for (int attempt = 1; attempt <= SCRATCHPAD_READ_TRIES; attempt++) {
+        if (!ow_reset()) {
+            s_stats.no_presence++;
+            ESP_LOGW(TAG, "Reset failed (read scratchpad)");
+            return -273.0f;
+        }
+        ow_write_byte(CMD_SKIP_ROM);
+        ow_write_byte(CMD_READ_SCRATCHPAD);
+
+        uint8_t sp[9];
+        for (int i = 0; i < 9; i++) sp[i] = ow_read_byte();
+
+        if (ow_crc8(sp, 8) != sp[8]) {
+            s_stats.crc_errors++;
+            ESP_LOGW(TAG, "Scratchpad CRC mismatch (try %d/%d)", attempt, SCRATCHPAD_READ_TRIES);
+            continue;
+        }
+
+        int16_t raw = ((int16_t)sp[1] << 8) | sp[0];
+        if (raw == POWER_ON_RESET_RAW) {
+            /* 85 C is the power-on value: conversion did not actually run
+             * (e.g. weak supply). Not a real soil temperature. */
+            s_stats.power_on_85++;
+            ESP_LOGW(TAG, "Got power-on value 85 C, discarding");
+            return -273.0f;
+        }
+        return raw / 16.0f;
     }
-    ow_write_byte(CMD_SKIP_ROM);
-    ow_write_byte(CMD_READ_SCRATCHPAD);
+    return -273.0f;
+}
 
-    uint8_t lo = ow_read_byte();
-    uint8_t hi = ow_read_byte();
-    /* read remaining 7 bytes to complete the transaction */
-    for (int i = 0; i < 7; i++) ow_read_byte();
-
-    int16_t raw = ((int16_t)hi << 8) | lo;
-    return raw / 16.0f;
+float ds18b20_read_temperature(void) {
+    float t = ds18b20_read_once();
+    s_stats.reads++;
+    if (t <= -273.0f) s_stats.failed++;
+    return t;
 }
