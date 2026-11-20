@@ -2,7 +2,7 @@
 """
 mock_device.py — ESPWROM32-4M-8xMOS 固件对外接口模拟器（仅标准库）
 
-模拟的接口（行为对齐 ../ESPWROM32-4M-8xMOS/main/main.c、water_logic.c）：
+模拟的接口（行为对齐 ../main/main.c、water_logic.c）：
   HTTP
     GET /                              固件自带控制面板（启动时从 main.c 的 STATUS_HTML 提取）
     GET /change_relay1..8[?duration=ms | ?action=off]
@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_FW_SRC = os.path.join(HERE, "..", "ESPWROM32-4M-8xMOS", "main", "main.c")
+DEFAULT_FW_SRC = os.path.join(HERE, "..", "main", "main.c")
 
 # ── Firmware constants (main.c) ──────────────────────────────────────────────
 FW_VERSION = "1.5.0"
