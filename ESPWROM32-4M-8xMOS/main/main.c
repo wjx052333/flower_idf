@@ -134,7 +134,7 @@ static const char *const RELAY_VERB_CN[NUM_RELAYS] = {
 #define LED_PIN               23  /* Board User LED */
 #define REED_PIN              GPIO_NUM_14 /* Reed switch input (internal pull-up) */
 #define ADC_PIN_LOW_HUMIDITY  ADC_CHANNEL_6   /* GPIO34 (ADC1_CH6) */
-#define ADC_PIN_HALL_AO       ADC_CHANNEL_0   /* GPIO36 (SENSOR_VP / ADC1_CH0) */
+#define ADC_PIN_HALL_AO       ADC_CHANNEL_7   /* GPIO35 (ADC1_CH7) */
 #define DS18B20_PIN           GPIO_NUM_4      /* GPIO4 */
 
 #define STATUS_INTERVAL_MS        30000
@@ -234,7 +234,7 @@ typedef struct {
     bool  aht_ok;
     float air_c;        /* AHT25, only meaningful when aht_ok */
     float air_humi;
-    int   hall_raw;     /* 49E Linear Hall AO raw counts, GPIO36 (ADC1_CH0) */
+    int   hall_raw;     /* 49E Linear Hall AO raw counts, GPIO35 (ADC1_CH7) */
 } sensor_cache_t;
 
 static portMUX_TYPE   s_cache_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -1079,7 +1079,7 @@ static const char STATUS_HTML[] =
     "  <div class=\"val\"><div class=\"num\" id=\"v-temp\">--</div><div class=\"lbl\">温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-lux\">--</div><div class=\"lbl\">照度 (lx)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-reed\">--</div><div class=\"lbl\">干簧管 [IO14] <span id=\"v-reed-info\"></span></div></div>\n"
-    "  <div class=\"val\"><div class=\"num\" id=\"v-hall\">--</div><div class=\"lbl\">霍尔AO [IO36]</div></div>\n"
+    "  <div class=\"val\"><div class=\"num\" id=\"v-hall\">--</div><div class=\"lbl\">霍尔AO [IO35]</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-temp\">--</div><div class=\"lbl\">AHT25温度 (°C)</div></div>\n"
     "  <div class=\"val\"><div class=\"num\" id=\"v-aht-humi\">--</div><div class=\"lbl\">AHT25湿度 (%)</div></div>\n"
     "</div>\n"
